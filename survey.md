@@ -46,7 +46,7 @@ Open answers give us real quotes for the deck; tagging them afterwards gives us 
 
 ## Target
 
-- 20-30 people in 2 days (Oct 14-16).
+- 20-30 people; results are needed before the deck is written.
 - Mix: students and working people; include Chinese respondents via WeChat (send in Chinese if easier).
 - Known bias: our network skews young and tech-savvy; state this in the deck.
 

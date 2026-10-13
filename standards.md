@@ -167,7 +167,7 @@ Our design maps one-to-one, which lets us say "APOP-compatible".
 
 | Item | Why not now |
 |---|---|
-| Full SD-JWT / Verifiable Credential encoding of mandates | Heavy for 7 days; we keep the same fields and hash bindings in plain signed JSON and note AP2 compatibility as future work |
+| Full SD-JWT / Verifiable Credential encoding of mandates | Heavy for hackathon scope; we keep the same fields and hash bindings in plain signed JSON and note AP2 compatibility as future work |
 | OpenID4VP credential presentation | Only needed when many external verifiers are involved |
 | Card network tokens | Our rail is e-CNY simulated on-chain |
 | Agent-to-agent delegation | Out of scope in AP2 too |

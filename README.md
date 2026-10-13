@@ -15,6 +15,8 @@ Deadline: Oct 20, 2026, 23:59 Beijing time.
 | survey.md | Market survey: AI use, AI in shopping, trust in agent payments; user segments |
 | journey.md | Before vs after: the Researcher's shopping today and with the Agent Wallet; Delegator and Treasurer journeys |
 | demo.md | Supported agents (Claude first, Doubao stretch), five demo flows, mock shop requirements |
+| tasks.md | Every task rated by priority, workload and autonomy (agent-autonomous / agent + human review / human-led), in waves |
+| spike-fisco-brief.md | Ready-to-dispatch agent brief to test FISCO BCOS compatibility |
 | techstack.md | Stack choices, repo layout, AI components, decisions to confirm |
 | api-contracts.md | Every interface between components: objects, endpoints, internal calls, MCP tools, contracts, events, errors |
 | standards.md | Review of AP2, ACP, Visa/Mastercard, MCP auth, OWASP, APOP, PCAC; every adopted feature with its purpose |
