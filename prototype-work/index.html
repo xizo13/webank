@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" content="#101a36" />
+    <title>WeBank Agent Wallet | Interactive prototype</title>
+    <link rel="stylesheet" href="./styles.css" />
+    <link rel="stylesheet" href="./theme.css" />
+    <script src="./app.js" defer></script>
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></span>
+          <div><strong>WeBank</strong><small>AGENT WALLET / DEMO LAB</small></div>
+        </div>
+        <div class="topbar-right"><span class="environment-pill"><span class="pulse-dot"></span> LOCAL PROTOTYPE</span><span class="topbar-date">13 OCT 2026</span></div>
+      </header>
+
+      <main>
+        <section class="intro">
+          <div>
+            <div class="eyebrow">INTERACTIVE PRODUCT PROTOTYPE <span class="eyebrow-line"></span> NO REAL FUNDS</div>
+            <h1>Let the agent shop.<br /><em>You set the rules.</em></h1>
+            <p class="intro-copy">Follow a payment request from a mock shop through an agent to WeBank. The bank checks the request, records its reason, and keeps you in control.</p>
+          </div>
+          <aside class="intro-note"><span class="note-icon">✳</span><div><strong>Five flows, one shared wallet</strong><p>Pick a scenario, create a checkout, then ask the agent to request payment. Decisions and balances carry across the demo.</p></div></aside>
+        </section>
+
+        <section class="scenario-section" aria-labelledby="scenario-title">
+          <div class="section-heading"><div><span class="section-kicker">01 / CHOOSE A STORY</span><h2 id="scenario-title">Demo scenarios</h2></div><button id="reset-button" type="button" class="reset-button">↻ Reset demo</button></div>
+          <div class="scenario-list" id="scenario-list" role="group" aria-label="Demo scenarios"></div>
+        </section>
+
+        <section class="workspace" aria-label="Shared payment workspace">
+          <div class="section-heading workspace-heading"><div><span class="section-kicker">02 / FOLLOW THE REQUEST</span><h2>One checkout, three views</h2></div><span class="shared-state">● Shared local state</span></div>
+          <div class="panels">
+            <article class="panel shop-panel" aria-labelledby="shop-title">
+              <div class="panel-top"><div class="panel-ident"><span class="panel-icon shop-icon">◈</span><div><span class="panel-label">MOCK MERCHANT</span><h3 id="shop-title">Northstar Market</h3></div></div><span class="panel-count">01</span></div>
+              <div id="shop-content" class="panel-body"></div>
+            </article>
+            <article class="panel agent-panel" aria-labelledby="agent-title">
+              <div class="panel-top"><div class="panel-ident"><span class="panel-icon agent-icon">✦</span><div><span class="panel-label">SCRIPTED AGENT SIMULATION</span><h3 id="agent-title">Claude shopping view</h3></div></div><span class="panel-count">02</span></div>
+              <div id="agent-content" class="panel-body"></div>
+            </article>
+            <article class="panel bank-panel" aria-labelledby="bank-title">
+              <div class="panel-top"><div class="panel-ident"><span class="panel-icon bank-icon">W</span><div><span class="panel-label">WE BANK / CONTROL PANEL</span><h3 id="bank-title">Agent Wallet</h3></div></div><span class="panel-count">03</span></div>
+              <div id="bank-content" class="panel-body"></div>
+            </article>
+          </div>
+        </section>
+
+        <section class="history-section" aria-labelledby="history-title">
+          <div class="section-heading"><div><span class="section-kicker">03 / AUDIT TRAIL</span><h2 id="history-title">Every attempt has a reason</h2></div><span id="history-count" class="history-count">0 attempts</span></div>
+          <div id="history-content" class="history-content"></div>
+        </section>
+      </main>
+
+      <footer><strong>Prototype boundaries</strong><span>Agent, merchant registry, Face ID, e-CNY payment rail, receipts, and audit records are simulated in this browser. No external services, funds, or chain are used.</span></footer>
+    </div>
+  </body>
+</html>
