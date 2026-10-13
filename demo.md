@@ -77,7 +77,37 @@ Human not present.
 2. Demerit points; agent demoted from P-plate to L-plate live.
 3. User taps "Freeze"; Claude's next request fails instantly.
 
-## 3. What the mock shop needs
+### Demo 6 - Treasurer (Task completion + Security)
+
+1. Setup: Treasurer scans mock transaction history, finds the Claude subscription, proposes a schedule; user approves with Face ID.
+2. Fast-forward to the night before renewal: $30 moves into the reserved pot, locked to that payee.
+3. Renewal is paid from the reserved pot.
+4. Rogue Treasurer test: a poisoned "recurring" charge tries to pull ¥2,000 in; the invariant monitor blocks it and freezes the Treasurer.
+
+## 3. Intended pipeline (all pieces together)
+
+```
+                 WeBank app (non-AI approval screens + chat that only proposes)
+                                     |
+                               user Face ID
+                                     |
+ Main account --(Treasurer: one-way, capped, scheduled)--> Agent wallet [Reserved | Buffer]
+                                                                 |
+ Shopping agent --request_payment--> Agent Gateway: 7 checks + Guardian + licence
+                                                                 |
+                                       APPROVE / STEP_UP (to app) / DENY
+                                                                 |
+                                         Rail (sub-wallet contract) --> Merchant
+                                                                 |
+                                  Signed receipt + audit hash on-chain + app notification
+```
+
+Two AIs on our side, both untrusted by design:
+
+- Guardian: reviews payments; can only tighten.
+- Treasurer: proposes funding; cannot execute or pay; watched by a deterministic invariant monitor.
+
+## 4. What the mock shop needs
 
 - Product catalog with specs, sizes, reviews (enough for real back-and-forth research).
 - Cart and checkout in the shop.

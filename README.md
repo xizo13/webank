@@ -13,7 +13,10 @@ Deadline: Oct 20, 2026, 23:59 Beijing time.
 | brainstorm.md | Hackathon facts, decision trail, market research, concept, licence rules, open questions |
 | protocol.md | End-to-end protocol for one purchase, data schemas, threat table, on-chain design |
 | survey.md | Market survey: AI use, AI in shopping, trust in agent payments; user segments |
+| journey.md | Before vs after: the Researcher's shopping today and with the Agent Wallet; Delegator and Treasurer journeys |
 | demo.md | Supported agents (Claude first, Doubao stretch), five demo flows, mock shop requirements |
+| techstack.md | Stack choices, repo layout, AI components, decisions to confirm |
+| api-contracts.md | Every interface between components: objects, endpoints, internal calls, MCP tools, contracts, events, errors |
 | standards.md | Review of AP2, ACP, Visa/Mastercard, MCP auth, OWASP, APOP, PCAC; every adopted feature with its purpose |
 
 ## Target user
@@ -82,13 +85,14 @@ The rules are enforced by the bank, not by the AI.
 | Smart contracts (sub-wallet, licence registry, audit anchors) | | |
 | Agent Wallet screens in the app (setup, limits, approvals, history, chat, freeze) | | |
 
-## Demo in five flows (details in demo.md)
+## Demo in six flows (details in demo.md)
 
 1. Setup: WeBank app, create a separate agent wallet, set limits, scan QR in Claude, Face ID; starts on L-plates.
 2. Research then "buy it for me": back-and-forth on specs and sizing; L-plate means a Face ID tap; receipts in Claude, shop and app.
 3. Autonomous: "buy when it drops below ¥250"; auto-approved within the mandate.
 4. Attack: malicious listing tricks Claude; WeBank blocks it and the Guardian explains.
 5. Fire drill + kill switch: agent demoted live, then one-tap freeze.
+6. Treasurer: subscription funded the night before; a rogue top-up is blocked by the invariant monitor.
 
 Primary agent: Claude. Stretch: Doubao via its Open API and our wrapper.
 
@@ -99,6 +103,7 @@ Primary agent: Claude. Stretch: Doubao via its Open API and our wrapper.
 - QR-code authorization (redirect on mobile).
 - Standing mandates via recurrence + budget (AP2 style).
 - Approval screens contain no AI; chat only proposes.
+- Treasurer: just-in-time funding into Reserved and Buffer pots; our own AI is treated as untrusted too (brainstorm.md section 13).
 
 ## Still to decide
 

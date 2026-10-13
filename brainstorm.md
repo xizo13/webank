@@ -282,9 +282,9 @@ The bank red-teams the user's agent with harmless fake attacks.
 - How often to run drills without annoying the user or wasting agent time.
 - Should licence be per agent, or per agent provider + model (so a known-bad model starts lower)?
 
-## 13. Proposal: Treasurer (just-in-time funding)
+## 13. Treasurer (just-in-time funding)
 
-Status: proposal, not yet decided.
+Status: decided 2026-10-13.
 
 Idea: instead of the user pre-loading a fixed amount, a WeBank-side Treasurer funds the agent wallet just in time.
 This is the "asset management" part of the Topic F brief.
@@ -327,3 +327,23 @@ The most a compromised shopping agent can ever reach is tomorrow's commitments p
 - Buffer refill to a target level.
 - Emergency top-up as a STEP_UP.
 - Treasurer AI: detect recurring payments from mock history and propose the schedule.
+
+### Rogue Treasurer (our own AI goes wrong)
+
+The Treasurer itself can be wrong, manipulated, or compromised: poisoned transaction history, model error, or a hacked service.
+We treat it as untrusted too, exactly like the shopping agent.
+
+| Threat | Control | Purpose |
+|---|---|---|
+| Treasurer moves too much money in | Top-up ceilings and protected main balance enforced in core banking / the smart contract, outside the Treasurer's reach | A rogue Treasurer cannot exceed limits it does not control |
+| Treasurer invents a fake commitment | Schedule changes and new commitments need user Face ID on the non-AI approval screen | The Treasurer can only propose |
+| Poisoned history (fake "recurring" charges) | Recurring detection uses only bank-settled transactions, never agent or merchant text; new recurring payee needs user confirmation | Inputs the attacker controls are never trusted |
+| Treasurer pays someone | Treasurer's account can only transfer main account -> same user's agent wallet | It has no payment path at all |
+| Treasurer and Guardian collude or share a failure | Separation of duties: Treasurer funds, Guardian + policy approve payments; neither can change limits | One compromised AI is not enough |
+| Silent accumulation in the agent wallet | Invariant monitor: agent wallet balance must stay <= upcoming reserved + buffer target; violation freezes the Treasurer and alerts the user | Deterministic watchdog over the AI |
+| Unspent money lingers | Reserved funds not used by their due date sweep back to the main account | Exposure stays minimal |
+| User loses trust | Treasurer off switch: falls back to manual funding | User stays in control |
+| Hidden behavior | Every proposal and transfer is logged on the audit chain and shown in a daily digest | Full visibility |
+
+Principle: we license our own AI too.
+No AI in the system, ours or the user's, can move money on its own authority.
