@@ -281,3 +281,49 @@ The bank red-teams the user's agent with harmless fake attacks.
 - Exact thresholds and point values (tune for the demo so progression is visible).
 - How often to run drills without annoying the user or wasting agent time.
 - Should licence be per agent, or per agent provider + model (so a known-bad model starts lower)?
+
+## 13. Proposal: Treasurer (just-in-time funding)
+
+Status: proposal, not yet decided.
+
+Idea: instead of the user pre-loading a fixed amount, a WeBank-side Treasurer funds the agent wallet just in time.
+This is the "asset management" part of the Topic F brief.
+
+### Three pots inside the agent wallet
+
+| Pot | What it holds | Funded when | Spendable on |
+|---|---|---|---|
+| Reserved | Money for known commitments (e.g. Claude subscription $30 on the 28th) | The day before it is due | Only that payee and amount |
+| Buffer | Small float for ad-hoc tasks (e.g. ¥200) | Topped back up to target after spending | Anything within the mandate and policy |
+| Emergency top-up | Extra funds for an unexpected need | On request | Only after the user approves |
+
+### Who does what
+
+- Treasurer AI (ours, WeBank-side): learns recurring payments, payday and spending patterns; proposes a funding schedule and buffer size.
+- Deterministic executor: moves money only according to the user-approved schedule and rules.
+- User: approves the schedule once; approves emergency top-ups.
+
+### Security property
+
+The agent wallet only holds what is needed for the next day plus a small buffer.
+The most a compromised shopping agent can ever reach is tomorrow's commitments plus the buffer, which is smaller than a static pre-loaded wallet.
+
+### Extra risk layers required
+
+| Risk | Control | Purpose |
+|---|---|---|
+| Shopping agent claims an "emergency" to get funds | Funding is never triggered by agent text; an agent "emergency" is only a STEP_UP to the user | The untrusted agent cannot move money from the main account |
+| Treasurer AI misjudges or is manipulated | Treasurer only proposes; executor follows approved rules; Treasurer can tighten, never loosen | Same monotonic rule as the Guardian |
+| Top-ups drain the main account | Daily and monthly top-up ceilings; protected minimum balance in the main account (e.g. rent) | Limits move from "wallet size" to "funding policy"; they never disappear |
+| Money leaves to third parties | Treasurer transfers are one-way: main account to agent wallet only | Treasurer cannot be used to pay anyone |
+| New or growing commitment sneaks in | New recurring payee or amount increase requires user confirmation | Stop slow escalation |
+| Reserved funds misused | Reserved pot locked to a specific payee, amount and date | Bills money cannot be spent on anything else |
+| Privacy | Treasurer reads transaction history only with explicit consent | PIPL compliance |
+| No visibility | Every top-up notified and logged on the audit chain | User always knows what moved and why |
+
+### Hackathon scope (minimum)
+
+- Scheduled top-up for one standing mandate (deterministic).
+- Buffer refill to a target level.
+- Emergency top-up as a STEP_UP.
+- Treasurer AI: detect recurring payments from mock history and propose the schedule.

@@ -201,7 +201,7 @@ Any DENY stops the pipeline.
 | 3 | Mandate | Active, not expired, amount within reserved budget, category in scope, payment count left | DENY if outside |
 | 4 | Account policy + licence | User's caps, blocked categories, new-merchant rule; then the agent's licence level lowers caps further (see brainstorm.md section 12) | DENY or STEP_UP |
 | 5 | Risk signals | Velocity, duplicate payments, price far above evidence, unusual agent behavior | STEP_UP or DENY |
-| 6 | Guardian AI | Does the merchant and cart match the mandate's intent? Explain why | STEP_UP or DENY |
+| 6 | Guardian AI | Does the rail-verified merchant (and merchant-signed cart, if any) match the mandate's intent? The agent's own cart description is treated as an unverified claim. Explain why | STEP_UP or DENY |
 | 7 | Decide | Combine results into one decision + plain-language reason; update licence points | APPROVE / STEP_UP / DENY |
 
 Key rules:
@@ -299,3 +299,28 @@ Recommendation: Option B, falling back to Option A if time runs short.
 4. How does the agent capture the payment request in a real checkout that redirects to the WeChat app? (Demo: mock merchants expose a machine-readable payment request.)
 5. Refunds: return to the agent sub-wallet or to the main account?
 6. Should the guardian see the user's original wording of the task, or only the mandate?
+
+## 15. Changes adopted from the standards review
+
+Full reasoning and sources in standards.md (section 4B).
+
+| Change | Purpose |
+|---|---|
+| Approval screens and limit changes contain no AI; in-app chat can only propose, a deterministic screen + Face ID confirms | An injected LLM in the approval path could fake consent |
+| Agent private key lives in the wallet connector code, never in the LLM context | The LLM cannot leak or misuse a key it never sees |
+| Mandate bound to the agent's public key | A mandate stolen by another agent is useless |
+| One in-flight payment per mandate | An injected agent cannot fire many payments at once |
+| Agent-reported cart is an unverified claim; only merchant-signed or rail-verified data is trusted | The agent can lie about what it is buying |
+| Request signatures follow RFC 9421 with `created`, `expires`, `nonce` | Standard replay protection |
+| Separate scopes for browsing and paying | An agent that only browses cannot pay |
+| Tokens audience-bound to the Gateway; no token passthrough; short-lived with rotating refresh | Prevent confused-deputy attacks; shrink leaked-token window |
+| WeBank-signed receipt for every decision; dispute bundle (mandate + payment request + decision + receipt + chain hash) | Non-repudiable dispute evidence |
+| Selective disclosure: merchants never see user limits; Guardian sees only what it needs | Data minimization (PIPL) |
+| Standing mandates via recurrence + budget (e.g. weekly, max 4 times, ¥800 total) | Real autonomy for repeat tasks without unlimited power |
+| Mandate expiry set to the shortest time that completes the task | Shrink the attack window |
+| Risk signal object (`type`, `score`, `action`) on every decision | Machine-readable reasons for merchants, rails, audits |
+| Versioned schemas (`mandate.v1`) | Safe upgrades |
+| User responsibility agreement at enrollment | Required by the PCAC convention |
+| WeBank refund guarantee for auto-approved (L3) payments later proven fraudulent | If the bank approved it alone, the bank carries the risk |
+
+Resolved by this review: open question 2 (standing mandates) is answered by recurrence + budget.

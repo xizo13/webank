@@ -13,6 +13,7 @@ Deadline: Oct 20, 2026, 23:59 Beijing time.
 | brainstorm.md | Hackathon facts, decision trail, market research, concept, licence rules, open questions |
 | protocol.md | End-to-end protocol for one purchase, data schemas, threat table, on-chain design |
 | survey.md | Market survey: AI use, AI in shopping, trust in agent payments; user segments |
+| demo.md | Supported agents (Claude first, Doubao stretch), five demo flows, mock shop requirements |
 | standards.md | Review of AP2, ACP, Visa/Mastercard, MCP auth, OWASP, APOP, PCAC; every adopted feature with its purpose |
 
 ## Target user
@@ -23,6 +24,10 @@ Casual chatbot users ("Searchers") face high friction and come later.
 Onboarding is "as easy as `gh auth login`": set up once in the WeBank app, authorize each agent once with a code or a "Connect WeBank" button.
 Making that one step painless is how we also capture "Researchers" who already bank with WeBank.
 Segment sizes to be validated by the survey.
+
+Hero persona: Lin, 28, product manager in Shenzhen, a Delegator.
+Lin already lets an AI assistant handle email and calendar and uses it to research every purchase, but still checks out by hand because they do not trust it with money.
+Pitch ending: "Next month, Lin sets up the same wallet for their parents."
 
 ## The problem
 
@@ -77,19 +82,29 @@ The rules are enforced by the bank, not by the AI.
 | Smart contracts (sub-wallet, licence registry, audit anchors) | | |
 | Agent Wallet screens in the app (setup, limits, approvals, history, chat, freeze) | | |
 
-## Demo in five beats
+## Demo in five flows (details in demo.md)
 
-1. Setup: connect Claude; it starts on L-plates.
-2. Happy path: it earns P-plates and buys headphones silently; tx hash appears.
-3. Attack: a malicious shop tries a payment swap; WeBank blocks it and the Guardian explains why.
-4. Fire drill: the agent falls for a decoy scam and is demoted on stage.
-5. Kill switch: freeze with one tap; the next request fails.
+1. Setup: WeBank app, create a separate agent wallet, set limits, scan QR in Claude, Face ID; starts on L-plates.
+2. Research then "buy it for me": back-and-forth on specs and sizing; L-plate means a Face ID tap; receipts in Claude, shop and app.
+3. Autonomous: "buy when it drops below ¥250"; auto-approved within the mandate.
+4. Attack: malicious listing tricks Claude; WeBank blocks it and the Guardian explains.
+5. Fire drill + kill switch: agent demoted live, then one-tap freeze.
+
+Primary agent: Claude. Stretch: Doubao via its Open API and our wrapper.
+
+## Decided
+
+- Topic F; bonus open to all topics; no chain restriction.
+- Separate agent wallet (not limits on the main account).
+- QR-code authorization (redirect on mobile).
+- Standing mandates via recurrence + budget (AP2 style).
+- Approval screens contain no AI; chat only proposes.
 
 ## Still to decide
 
-- Hero persona and scenario.
-- Auto-approve threshold for small mandates; standing mandates for recurring tasks.
+- Auto-approve threshold for small mandates.
 - What the Guardian sees (user's original words or only the mandate).
 - Licence thresholds and fire-drill frequency.
 - FISCO BCOS vs. Ethereum testnet.
+- Live demo, recorded video, or both.
 - Work split across 4 people.
