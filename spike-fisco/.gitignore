@@ -1,0 +1,8 @@
+vendor/
+node_modules/
+.env
+.env.*
+*.key
+*.pem
+*.log
+run-output*.txt
