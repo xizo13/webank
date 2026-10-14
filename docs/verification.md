@@ -15,9 +15,9 @@ The final local gate passed on 2026-10-14:
 | Gate | Recorded result |
 | --- | --- |
 | Biome lint | 103 files checked, no fixes needed. |
+| Build | Workspace packages, optimized Next shop, and five Solidity contracts built; Solidity used solc 0.8.11 with the `london` target. |
 | TypeScript | All 11 workspace projects with a typecheck script passed. |
 | Vitest | 84 tests passed in 15 files; the opt-in live FISCO payment test was skipped. |
-| Build | Workspace packages, optimized Next shop, and five Solidity contracts built; Solidity used solc 0.8.11 with the `london` target. |
 
 The monitor regression test confirms that a malformed restored snapshot emits `invalid_snapshot` and calls the Treasurer freeze callback without throwing.
 The default tests cover shop signatures and price snapshots, connector MCP calls and signed requests, Gateway pairing and decisions, local-demo composition, red-team denial cases, and Treasurer and monitor simulation rules.

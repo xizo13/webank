@@ -29,7 +29,7 @@ corepack pnpm install --frozen-lockfile
 corepack pnpm check
 ```
 
-`check` runs Biome, TypeScript checks, the default Vitest suite, and builds.
+`check` runs Biome, builds workspace packages in dependency order, then runs TypeScript checks and the default Vitest suite.
 The local FISCO integration test is opt-in and is skipped by the default test command.
 See [verification and known limits](docs/verification.md) for the latest recorded checks and acceptance gaps.
 

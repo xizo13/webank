@@ -13,7 +13,7 @@
     "lint": "biome check .",
     "format": "biome format --write .",
     "format:check": "biome format .",
-    "check": "corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build"
+    "check": "corepack pnpm lint && corepack pnpm build && corepack pnpm typecheck && corepack pnpm test"
   },
   "devDependencies": {
     "@biomejs/biome": "2.5.15",
