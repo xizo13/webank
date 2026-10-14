@@ -16,7 +16,8 @@
       "!**/scripts/chain/addresses.json",
       "!**/scripts/chain/merchants.json",
       "!**/scripts/chain/test-signer.json",
-      "!**/scripts/local-demo-runtime"
+      "!**/scripts/local-demo-runtime",
+      "!**/spike-fisco"
     ]
   },
   "formatter": {
