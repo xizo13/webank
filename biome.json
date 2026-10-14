@@ -1,0 +1,31 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.15/schema.json",
+  "vcs": {
+    "enabled": false
+  },
+  "files": {
+    "includes": [
+      "**",
+      "!**/dist",
+      "!**/.next",
+      "!**/node_modules",
+      "!**/coverage",
+      "!**/onchain/artifacts",
+      "!**/.shop-local",
+      "!**/scripts/chain/runtime",
+      "!**/scripts/chain/addresses.json",
+      "!**/scripts/chain/merchants.json",
+      "!**/scripts/chain/test-signer.json",
+      "!**/scripts/local-demo-runtime"
+    ]
+  },
+  "formatter": {
+    "indentStyle": "space",
+    "indentWidth": 2
+  },
+  "javascript": {
+    "formatter": {
+      "quoteStyle": "double"
+    }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "name": "@webank/guardian",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "corepack pnpm --dir ../.. exec vitest run redteam/guardian.redteam.test.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.133.0",
+    "@webank/contracts": "workspace:*",
+    "zod": "^3.25.76"
+  }
+}

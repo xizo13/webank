@@ -1,0 +1,29 @@
+{
+  "expo": {
+    "name": "WeBank Agent Wallet Demo",
+    "slug": "webank-agent-wallet-demo",
+    "scheme": "webankagentwallet",
+    "version": "0.1.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.xizo.webankagentwalletdemo",
+      "infoPlist": {
+        "NSFaceIDUsageDescription": "Confirm a specific Agent Wallet action with Face ID."
+      }
+    },
+    "web": {
+      "bundler": "metro",
+      "name": "WeBank Agent Wallet Demo"
+    },
+    "plugins": [
+      [
+        "expo-local-authentication",
+        {
+          "faceIDPermission": "Confirm a specific Agent Wallet action with Face ID."
+        }
+      ]
+    ]
+  }
+}

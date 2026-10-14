@@ -1,0 +1,25 @@
+{
+  "name": "@webank/gateway",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "demo": "tsx src/demo-server.ts",
+    "local-demo": "tsx src/local-demo-server.ts"
+  },
+  "dependencies": {
+    "@webank/chain": "workspace:*",
+    "@webank/contracts": "workspace:*",
+    "@webank/guardian": "workspace:*",
+    "fastify": "5.12.7",
+    "viem": "2.57.5"
+  },
+  "devDependencies": {
+    "tsx": "4.20.6",
+    "vitest": "^3.2.4"
+  }
+}

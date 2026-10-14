@@ -1,0 +1,24 @@
+{
+  "name": "webank-agent-wallet",
+  "private": true,
+  "version": "0.0.0",
+  "packageManager": "pnpm@10.18.0",
+  "engines": {
+    "node": ">=22 <23"
+  },
+  "scripts": {
+    "build": "corepack pnpm -r --if-present build",
+    "typecheck": "corepack pnpm -r --if-present typecheck",
+    "test": "vitest run --passWithNoTests",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "format:check": "biome format .",
+    "check": "corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.5.15",
+    "@types/node": "^22.0.0",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}

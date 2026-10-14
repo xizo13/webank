@@ -1,0 +1,24 @@
+{
+  "name": "@webank/onchain",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "compile": "node scripts/compile.mjs",
+    "build": "node scripts/compile.mjs",
+    "typecheck": "corepack pnpm --filter @webank/chain build && tsc -p tsconfig.json",
+    "deploy": "node scripts/compile.mjs && tsx scripts/deploy.ts",
+    "seed:merchants": "node scripts/compile.mjs && corepack pnpm --filter @webank/chain build && tsx scripts/seed-merchants.ts",
+    "smoke": "node scripts/compile.mjs && corepack pnpm --filter @webank/chain build && tsx test/smoke.ts"
+  },
+  "dependencies": {
+    "solc": "0.8.11",
+    "viem": "2.57.5"
+  },
+  "devDependencies": {
+    "@webank/chain": "workspace:*",
+    "@types/node": "^22.0.0",
+    "tsx": "4.23.15",
+    "typescript": "5.9.3"
+  }
+}

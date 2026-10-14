@@ -1,0 +1,80 @@
+import { randomUUID } from "node:crypto";
+import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
+
+export interface PendingPairing {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  qrPayload: string;
+  requestNumber: string;
+  expiresAt: number;
+  interval: number;
+}
+
+export interface Credentials {
+  privateKeyPem: string;
+  publicKey: string;
+  agentId?: string;
+  accessToken?: string;
+  refreshToken?: string;
+  tokenExpiresAt?: number;
+  pending?: PendingPairing;
+}
+
+export interface CredentialStore {
+  load(): Promise<Credentials | null>;
+  save(credentials: Credentials): Promise<void>;
+}
+
+export class FileCredentialStore implements CredentialStore {
+  constructor(
+    readonly path = join(
+      homedir(),
+      ".config",
+      "webank-agent-wallet",
+      "connector.json",
+    ),
+  ) {}
+
+  async load(): Promise<Credentials | null> {
+    try {
+      const stat = await lstat(this.path);
+      if (!stat.isFile() || stat.mode & 0o077) {
+        throw new Error("Connector credential file has unsafe permissions");
+      }
+      const value: unknown = JSON.parse(await readFile(this.path, "utf8"));
+      if (
+        !value ||
+        typeof value !== "object" ||
+        typeof (value as Credentials).privateKeyPem !== "string" ||
+        typeof (value as Credentials).publicKey !== "string"
+      ) {
+        throw new Error("Connector credential file is invalid");
+      }
+      return value as Credentials;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw error;
+    }
+  }
+
+  async save(credentials: Credentials): Promise<void> {
+    const directory = dirname(this.path);
+    await mkdir(directory, { recursive: true, mode: 0o700 });
+    const temp = join(directory, `.connector-${randomUUID()}.tmp`);
+    try {
+      await writeFile(temp, JSON.stringify(credentials), {
+        encoding: "utf8",
+        mode: 0o600,
+        flag: "wx",
+      });
+      await rename(temp, this.path);
+    } catch (error) {
+      const { unlink } = await import("node:fs/promises");
+      await unlink(temp).catch(() => undefined);
+      throw error;
+    }
+  }
+}
