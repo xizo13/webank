@@ -18,7 +18,7 @@ The bank signer controls policy changes and must be distinct from the Gateway si
 
 ## Compile and verify
 
-From `product-work/`, run:
+From the repository root, run:
 
 ```sh
 corepack pnpm install
@@ -31,7 +31,7 @@ The compiler is pinned to solc 0.8.11 with EVM target `london`.
 It writes contract artifacts under `onchain/artifacts/` and the matching TypeScript ABI under `packages/chain/src/generated/`.
 Do not edit generated files manually.
 
-With a local chain running on `127.0.0.1:8545`, run `corepack pnpm --filter @webank/onchain smoke` for deployment, payment, denial audit, cap, freeze, and receipt checks.
+With a local chain running on `127.0.0.1:8545`, run `corepack pnpm --filter @webank/onchain smoke` for isolated deployment, one-time funding, payment, denial audit, cap, freeze, sweep, and receipt checks.
 The smoke test creates fresh in-memory local signers and does not write private keys.
 Run `FISCO_TEST_WINDOW_ROLLOVER=1 corepack pnpm --filter @webank/onchain smoke` to test a second payment after the former false 86.4-second day boundary.
 That test can take about 90 seconds because it waits for the boundary and creates a fresh FISCO block.
@@ -39,14 +39,19 @@ That test can take about 90 seconds because it waits for the boundary and create
 ## Deploy
 
 Set `FISCO_BANK_PRIVATE_KEY` to a fresh local test key and `FISCO_GATEWAY_ADDRESS` to a distinct local test signer address.
-Set `FISCO_DEPLOY_OUTPUT` to an ignored local JSON path such as `scripts/chain/addresses.json` if a later script needs the addresses.
+Set `FISCO_DEPLOY_OUTPUT` to an ignored test path outside the active `scripts/chain/addresses.json` manifest if a later script needs the addresses.
 `FISCO_RPC_URL` defaults to `http://127.0.0.1:8545`.
-Run `corepack pnpm --filter @webank/onchain run deploy` from `product-work/`.
-The CLI validates chain ID 20200, deploys all five contracts, and mints demo funds into the agent wallet.
+Run `corepack pnpm --filter @webank/onchain run deploy` from the repository root.
+The CLI validates chain ID 20200, deploys all five contracts, mints the opening simulated balance into the bank-controlled main account, and leaves the Agent Wallet empty.
 It prints addresses and transaction hashes without printing any signer key.
 The FISCO deployment sets `AgentWallet.timestampIsMilliseconds` to true.
 Solidity sees millisecond `block.timestamp` on FISCO v3.17.1 even though its Web3 RPC block response exposes seconds.
 Other EVM deployments must pass false to the wallet constructor when Solidity receives seconds.
+
+The controlled `./scripts/chain/manage.py stage-funding` command stages a new token and empty Agent Wallet on the existing chain, reuses verified registries, and writes only an ignored `runtime/funding-stage.json` file.
+It does not change the active address manifest or Gateway state.
+The optional `--prior-receipt-hash` must identify a successful `Paid` event from the old Agent Wallet.
+Staging alone does not enable the app funding route or cut over the running demo.
 
 ## Seed mock merchants
 

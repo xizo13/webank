@@ -1,38 +1,42 @@
-# Implemented MVP architecture
+# Implemented prototype architecture
 
-This document describes the code in this repository as of 2026-10-14.
-It describes a hackathon prototype with simulated merchants and currency, not a deployed bank payment system.
+This document describes the source in this repository as of 2026-10-19.
+It is a local hackathon prototype with simulated merchants and currency, not a deployed bank payment system.
 
 ## Components and boundaries
 
 | Component | Implemented role | State or trust boundary |
 | --- | --- | --- |
-| `apps/webank-app` | Expo app walkthrough and explicit loopback Gateway mode for agent, approval, pairing, payment, and freeze views. | Default wallet and local Gateway approval are simulations; no production action-bound device signer. |
-| `apps/shops` | Next.js mock storefront, Shop MCP tools, cart, checkout, order status, and signed `payreq.v1`. | Products, merchant identities, orders, and payments are demo data; local operator controls are unauthenticated. |
-| `agents/connector-mcp` | Five local MCP tools, device-code pairing, scoped token handling, and P-256 request signatures. | Its software key is stored on the user's filesystem and is readable by a same-user process. |
-| `services/gateway` | Fastify pairing and payment decision routes, agent signature and replay checks, mandate and policy enforcement, approval state, receipts, and audit records. | State is in memory; the opt-in local composition uses simulated approval, reservation, and risk adapters. |
-| `services/guardian` | Optional structured Claude verdict that can make a decision stricter. | Missing key, timeout, refusal, or invalid result requests human review; no live model result is claimed by the default tests. |
-| `packages/chain` and `onchain` | Viem adapter and five Solidity contracts for local FISCO BCOS demo settlement and audit anchors. | Uses a local non-SM chain and simulated CNY units, not e-CNY. |
-| `services/treasurer` and `services/monitor` | In-memory recurring-payment proposal, funding rules, and invariant alerts. | Not connected to core banking, the app, or on-chain settlement. |
+| `apps/webank-app` | Expo source for the browser wallet, pairing, mandates, approvals, funding, payments, and agent controls. | The tested interactive target is a web export with visibly simulated owner approval; an iOS build has not been verified. |
+| `apps/shops` | Next.js mock storefront and Shop MCP tools for products, carts, checkout, order status, and signed payment requests. | Merchant identities, inventory, orders, and payments are demo data; local operator controls have no authentication. |
+| `agents/connector-mcp` | Nine local MCP tools for pairing, wallet status, mandates, payments, approval waits, and own history. | Its P-256 software key is stored on the user's filesystem and is readable by a process with the same user's access. |
+| `services/gateway` | Pairing, scoped agent authentication, mandate and payment checks, owner approval state, receipts, and audit records. | The limited fixture is in memory; the separate loopback FISCO demo stores private state on disk for one local process. |
+| `services/guardian` | Optional structured Claude verdict that can make a decision stricter. | The local demo uses the fail-closed unavailable mode, not a demonstrated live model verdict. |
+| `packages/chain` and `onchain` | Viem adapter and five Solidity contracts for local FISCO settlement and audit anchors. | The chain uses simulated CNY units, not e-CNY. |
+| `services/treasurer` and `services/monitor` | Proposal, funding-rule, and invariant-alert simulations. | They do not connect to core banking or the local payment settlement path. |
 
-`packages/contracts` holds the Zod wire schemas used by the components.
-`packages/crypto` holds shared deterministic signing and verification helpers.
+`packages/contracts` holds the shared Zod wire schemas.
+`packages/crypto` holds deterministic signing and verification helpers.
 
-## Payment path exercised in tests
+## Pairing and payment flow
 
-1. A mock shop creates a payment request containing merchant ID, order ID, amount in CNY fen, line items, expiry, nonce, and an Ed25519 signature.
-2. The connector can send that request to the Gateway with an agent token, a P-256 signed HTTP request, an idempotency key, and a fresh nonce.
-3. The Gateway validates identity, merchant signature, mandate, policy, licence, risk, and Guardian result through its configured dependencies.
-4. A payment may be denied, held for user approval, or passed to the chain adapter according to the strictest result.
-5. The local FISCO adapter verifies successful `Paid` and `Anchored` events before returning transaction hashes for a signed demo receipt.
-6. The loopback Gateway then calls the mock shop's authenticated payment confirmation route and records whether the order became paid.
+1. The connector creates a P-256 key and requests a device pairing with its app name, provider, and scopes.
+2. The browser app shows the owner a consent card and a countdown without showing the connector's six-digit request number.
+3. The owner enters that number and uses the explicitly simulated local approval step.
+4. Each approved pairing creates a new independent L-plate agent identity, while old agent and audit records remain.
+5. The connector proposes a bounded mandate from the user's request before shopping.
+6. The owner funds the simulated Agent Wallet and approves the mandate in the browser demo.
+7. A mock shop signs a checkout request with the merchant, order, amount, lines, expiry, and nonce.
+8. The connector submits that unchanged request with an agent token, P-256 signed HTTP request, idempotency key, and fresh nonce.
+9. The Gateway checks the merchant signature, agent identity, mandate, policy, licence, risk, and Guardian result.
+10. A payment may be denied, held for owner approval, or passed to the chain adapter according to the strictest result.
+11. The FISCO adapter verifies matching `Paid` and `Anchored` events before returning transaction hashes for a signed demo receipt.
+12. The loopback Gateway confirms the mock shop order after settlement and holds uncertain callback results for operator reconciliation.
 
-The complete path above has been exercised by the CLI driver against a live local shop, connector client, loopback Gateway, and FISCO chain with simulated app approval, reservation, and risk.
-The CLI driver is not a live Claude session or a phone approval.
-The default Expo walkthrough does not call the local FISCO chain.
-The explicit loopback web mode can display Gateway payment detail and submit a visibly simulated proof.
-The separate limited Gateway fixture seeds read, reject, and freeze examples and cannot complete a payment.
-If the shop confirmation callback fails after an on-chain payment, the Gateway retains the transaction hash, returns `reconciliation_required`, and does not claim the shop order is paid.
+The CLI integration driver exercised a simulated-currency purchase across the shop, connector client, loopback Gateway, and local FISCO chain.
+That run used simulated app approval, reservation, and risk inputs.
+A separate owner browser session completed fresh agent pairing and anchored its audit record on the local chain.
+A live Claude shopping session with a bank-verifiable phone approval has not been demonstrated.
 
 ## Local chain roles
 
@@ -40,14 +44,16 @@ If the shop confirmation callback fails after an on-chain payment, the Gateway r
 `MerchantRegistry` stores mock merchant identity, payout address, and public key.
 `LicenceRegistry` stores agent licence data.
 `AgentWallet` enforces per-payment, UTC daily, and calendar-month caps, duplicate prevention, and bank freeze on the local chain.
-`AuditAnchor` records hashes for decision evidence, including a successful anchor transaction for a denied request.
+`AuditAnchor` records hashes for decision evidence.
 The bank signer and Gateway signer are separate local test keys.
 The local chain's transaction hashes are not publicly resolvable without access to that chain.
 
-## Current security limits
+## Current limits
 
-The Gateway's state, tokens, nonces, mandates, approvals, and audit records do not survive a restart.
-The app has no bank-verifiable biometric signing key, and the connector's local software key is not protected from a same-user AI with filesystem access.
-The mock shop's admin controls must remain on loopback and must not be exposed to an untrusted network.
-Guardian output can only tighten a decision, but no live model resistance to prompt injection has been demonstrated by the deterministic suite.
-Treasurer and monitor results are simulation outputs and do not move real money.
+The browser approval proof is a demo marker, not a biometric or Secure Enclave signature.
+The iOS source has not been built and tested on an iPhone for this release.
+The connector's local software key is readable by a same-user process with filesystem access.
+The loopback Gateway persists private state across an ordinary restart but supports only one process and no replicas.
+The mock shop's admin controls must remain on loopback.
+The local Gateway does not have an automatic recovery worker for uncertain chain or shop callback results.
+The Treasurer and monitor are separate simulations and do not move real money.

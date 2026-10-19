@@ -1,3 +1,6 @@
+import { CameraView, useCameraPermissions } from "expo-camera";
+import * as DocumentPicker from "expo-document-picker";
+import * as ImagePicker from "expo-image-picker";
 import { LinearGradient } from "expo-linear-gradient";
 import * as LocalAuthentication from "expo-local-authentication";
 import {
@@ -5,6 +8,7 @@ import {
   useCallback,
   useEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 import {
@@ -20,7 +24,12 @@ import {
   useWindowDimensions,
   View,
 } from "react-native";
-import { presentApproval } from "./src/approvalPresentation";
+import {
+  pairingCountdown,
+  presentApproval,
+  secondsRemaining,
+  withPairingConsent,
+} from "./src/approvalPresentation";
 import {
   type Approval,
   applyDemoBiometricApproval,
@@ -39,25 +48,49 @@ import {
   rejectApproval,
   simulateBlockedAttack,
 } from "./src/flow";
+import { parseYuanToFen } from "./src/funding";
 import {
   approveLocalDemo,
+  completeSimulatedGatewayAgentAction,
+  confirmSimulatedHumanPayment,
+  deleteGatewayAgent,
   denyGatewayPairing,
+  type FundingChallenge,
+  type FundingRecord,
   freezeGatewayAgent,
   GatewayRequestError,
+  gatewaySnapshotErrorMessage,
   gatewayUrl,
+  type LiveHome,
   type LivePayment,
   type LivePaymentDetail,
+  loadGatewayAgentHistory,
+  loadGatewayFunding,
+  loadGatewayFundingHistory,
+  loadGatewayHome,
   loadGatewayPayment,
   loadGatewaySnapshot,
+  loadGatewaySweep,
+  loadGatewaySweepHistory,
+  loadHumanPayment,
   loadPairingConsent,
   localDemoConfigured,
   loginLocalDemo,
   type PairingConsent,
+  type PairingSummary,
+  prepareGatewayAgentAction,
+  prepareGatewayFunding,
   rejectGatewayApproval,
+  type ScanResult,
+  type SweepRecord,
+  scanGatewayQrPayload,
+  submitSimulatedGatewayFunding,
+  sweepGatewayWallet,
 } from "./src/gateway";
+import { decodeQrImageBlob, decodeQrImageUri } from "./src/qr";
 
 type Tab = "home" | "wallet" | "approvals" | "agents" | "history";
-type Detail = "pair" | "demo" | null;
+type Detail = "pair" | "demo" | "scan" | null;
 type PendingSimulation = { label: string; run: () => void } | null;
 
 const colors = {
@@ -73,6 +106,8 @@ const colors = {
   redLight: "#FFF0F0",
   green: "#18785E",
   greenLight: "#ECF8F1",
+  yellow: "#8A5A08",
+  yellowLight: "#FFF3D1",
 };
 
 function Button({
@@ -158,13 +193,14 @@ function Badge({
   tone = "purple",
 }: {
   children: ReactNode;
-  tone?: "purple" | "green" | "red" | "dark";
+  tone?: "purple" | "green" | "yellow" | "red" | "dark";
 }) {
   return (
     <View
       style={[
         styles.badge,
         tone === "green" && styles.badgeGreen,
+        tone === "yellow" && styles.badgeYellow,
         tone === "red" && styles.badgeRed,
         tone === "dark" && styles.badgeDark,
       ]}
@@ -173,6 +209,7 @@ function Badge({
         style={[
           styles.badgeText,
           tone === "green" && { color: colors.green },
+          tone === "yellow" && { color: colors.yellow },
           tone === "red" && { color: colors.red },
           tone === "dark" && { color: colors.white },
         ]}
@@ -188,10 +225,6 @@ function showError(message: string) {
   else Alert.alert("Agent Wallet", message);
 }
 
-function secondsRemaining(expiresAt: string, now: number): number {
-  return Math.max(0, Math.ceil((Date.parse(expiresAt) - now) / 1000));
-}
-
 function wrapHash(hash: string): string {
   return hash.match(/.{1,16}/g)?.join("\n") ?? hash;
 }
@@ -203,6 +236,18 @@ function wrapApprovalLine(line: string): string {
   );
 }
 
+function licenceExplanation(
+  level: DemoState["agents"][number]["licence"]["level"],
+): string {
+  if (level === "L")
+    return "L plate: zero autonomous spend. Every payment needs your approval; the first also needs the connector's six-digit number.";
+  if (level === "P")
+    return "P plate: limited autonomous payments within your mandate and policy. Larger payments still need your approval.";
+  if (level === "FULL")
+    return "Full licence: autonomous payments remain bound by your mandate and policy. Some payments still need your approval.";
+  return "Suspended licence: this agent cannot spend until you re-license it.";
+}
+
 export default function App() {
   const { width } = useWindowDimensions();
   const [tab, setTab] = useState<Tab>("home");
@@ -211,14 +256,54 @@ export default function App() {
   const [liveAgents, setLiveAgents] = useState<DemoState["agents"]>([]);
   const [liveApprovals, setLiveApprovals] = useState<Approval[]>([]);
   const [livePayments, setLivePayments] = useState<LivePayment[]>([]);
+  const [liveHome, setLiveHome] = useState<LiveHome | null>(null);
+  const [homeError, setHomeError] = useState("");
+  const [homeSyncedAt, setHomeSyncedAt] = useState<number | null>(null);
+  const [homeLoading, setHomeLoading] = useState(false);
+  const [fundingHistory, setFundingHistory] = useState<FundingRecord[]>([]);
+  const [fundingInput, setFundingInput] = useState("1000.00");
+  const [fundingReview, setFundingReview] = useState<{
+    amountFen: number;
+    challenge: FundingChallenge;
+  } | null>(null);
+  const [fundingInFlight, setFundingInFlight] = useState<string | null>(null);
+  const [fundingBusy, setFundingBusy] = useState(false);
+  const [fundingMessage, setFundingMessage] = useState("");
+  const [sweepReviewFen, setSweepReviewFen] = useState<number | null>(null);
+  const [sweepResult, setSweepResult] = useState<SweepRecord | null>(null);
+  const [sweepHistory, setSweepHistory] = useState<SweepRecord[]>([]);
+  const [sweepInFlight, setSweepInFlight] = useState<string | null>(null);
+  const [sweepAttemptAt, setSweepAttemptAt] = useState<number | null>(null);
+  const [expandedLicenceId, setExpandedLicenceId] = useState<string | null>(
+    null,
+  );
   const [livePaymentDetail, setLivePaymentDetail] =
     useState<LivePaymentDetail | null>(null);
   const [livePaymentError, setLivePaymentError] = useState("");
   const [livePairing, setLivePairing] = useState<PairingConsent | null>(null);
+  const [livePairings, setLivePairings] = useState<PairingSummary[]>([]);
   const [livePairingCode, setLivePairingCode] = useState("");
+  const [scanReview, setScanReview] = useState<Extract<
+    ScanResult,
+    { kind: "payment" }
+  > | null>(null);
+  const [scanStatus, setScanStatus] = useState("");
+  const [scanReceipt, setScanReceipt] = useState<Awaited<
+    ReturnType<typeof loadHumanPayment>
+  > | null>(null);
+  const [scanBusy, setScanBusy] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
+  const dropZoneRef = useRef<View | null>(null);
+  const scanInProgress = useRef(false);
+  const scanPayloadHandler = useRef<(payload: string) => Promise<void>>(
+    async () => {},
+  );
   const [gatewayError, setGatewayError] = useState("");
   const [demoLoginToken, setDemoLoginToken] = useState("");
   const [demoAuthenticated, setDemoAuthenticated] = useState(false);
+  const hadDemoSession = useRef(false);
+  const hasSyncedGateway = useRef(false);
   const [localNumberFailures, setLocalNumberFailures] = useState<
     Record<string, number>
   >({});
@@ -233,6 +318,8 @@ export default function App() {
   const [pairingCodeInput, setPairingCodeInput] = useState("");
   const [numberInput, setNumberInput] = useState("");
   const [numberMessage, setNumberMessage] = useState("");
+  const approvalSubmissionInFlight = useRef(false);
+  const [approvalBusy, setApprovalBusy] = useState(false);
   const [pendingSimulation, setPendingSimulation] =
     useState<PendingSimulation>(null);
   const [clock, setClock] = useState(Date.now());
@@ -247,14 +334,19 @@ export default function App() {
 
   const refreshGateway = useCallback(async () => {
     if (!isLive) return;
-    if (!lastSyncedAt) setLoading(true);
+    if (!hasSyncedGateway.current) setLoading(true);
     try {
       const snapshot = await loadGatewaySnapshot();
       setLiveAgents(snapshot.agents);
       setLiveApprovals(snapshot.approvals);
       setLivePayments(snapshot.payments);
+      setLivePairings(snapshot.pairings);
       setGatewayError("");
-      if (isLocalDemo) setDemoAuthenticated(true);
+      if (isLocalDemo) {
+        hadDemoSession.current = true;
+        setDemoAuthenticated(true);
+      }
+      hasSyncedGateway.current = true;
       setLastSyncedAt(Date.now());
     } catch (error) {
       if (
@@ -263,25 +355,159 @@ export default function App() {
         error.status === 401
       )
         setDemoAuthenticated(false);
-      setGatewayError(
-        error instanceof Error ? error.message : "Gateway unavailable",
+      const message = gatewaySnapshotErrorMessage(
+        error,
+        isLocalDemo,
+        hadDemoSession.current,
       );
+      if (message) setGatewayError(message);
     } finally {
       setLoading(false);
     }
-  }, [isLive, isLocalDemo, lastSyncedAt]);
+  }, [isLive, isLocalDemo]);
+
+  const refreshWallet = useCallback(async () => {
+    if (!isLive) return;
+    setHomeLoading(true);
+    try {
+      const home = await loadGatewayHome();
+      if (home.schema !== "home.v1" || home.simulated !== true)
+        throw new Error("Gateway did not return a confirmed wallet balance.");
+      setLiveHome(home);
+      setHomeSyncedAt(Date.now());
+      setHomeError("");
+    } catch (error) {
+      setHomeError(
+        error instanceof Error ? error.message : "Balance unavailable.",
+      );
+    } finally {
+      setHomeLoading(false);
+    }
+    try {
+      const items = await loadGatewayFundingHistory();
+      setFundingHistory(items);
+      const unresolved = items.find(
+        (item) =>
+          item.status === "settling" ||
+          item.status === "reconciliation_required",
+      );
+      if (unresolved) setFundingInFlight(unresolved.funding_id);
+    } catch {
+      // Balance errors are shown separately; retain the last confirmed history.
+    }
+    try {
+      const items = await loadGatewaySweepHistory();
+      setSweepHistory(items);
+      const unresolved = items.find(
+        (item) =>
+          item.status === "settling" ||
+          item.status === "reconciliation_required",
+      );
+      if (unresolved) setSweepInFlight(unresolved.sweep_id);
+      else if (sweepInFlight) {
+        const settled = items.find(
+          (item) =>
+            item.status === "completed" &&
+            (item.sweep_id === sweepInFlight ||
+              (sweepInFlight === "unknown" &&
+                sweepAttemptAt !== null &&
+                Date.parse(item.created_at) >= sweepAttemptAt - 1000)),
+        );
+        if (settled) {
+          setSweepInFlight(null);
+          setSweepResult(settled);
+        }
+      }
+    } catch {
+      // Keep uncertain sweep state until a successful history read.
+    }
+  }, [isLive, sweepAttemptAt, sweepInFlight]);
+
+  useEffect(() => {
+    const timer = setInterval(() => setClock(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, []);
 
   useEffect(() => {
     void refreshGateway();
-    const timer = setInterval(() => setClock(Date.now()), 1000);
     const poller = isLive
       ? setInterval(() => void refreshGateway(), 3000)
       : null;
     return () => {
-      clearInterval(timer);
       if (poller) clearInterval(poller);
     };
   }, [refreshGateway, isLive]);
+
+  useEffect(() => {
+    void refreshWallet();
+    const poller = isLive
+      ? setInterval(() => void refreshWallet(), 3000)
+      : null;
+    return () => {
+      if (poller) clearInterval(poller);
+    };
+  }, [refreshWallet, isLive]);
+
+  useEffect(() => {
+    if (!isLive || !fundingInFlight) return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const record = await loadGatewayFunding(fundingInFlight);
+        if (!active) return;
+        setFundingHistory((items) => [
+          record,
+          ...items.filter((item) => item.funding_id !== record.funding_id),
+        ]);
+        if (record.status === "completed" || record.status === "failed") {
+          setFundingInFlight(null);
+          setFundingMessage(
+            record.status === "completed"
+              ? "Transfer confirmed on the simulated chain."
+              : "Transfer failed without moving funds.",
+          );
+          await refreshWallet();
+        }
+      } catch {
+        // Keep the intent visible for reconciliation; never submit it again.
+      }
+    };
+    void poll();
+    const poller = setInterval(() => void poll(), 3000);
+    return () => {
+      active = false;
+      clearInterval(poller);
+    };
+  }, [fundingInFlight, isLive, refreshWallet]);
+
+  useEffect(() => {
+    if (!isLive || !sweepInFlight || sweepInFlight === "unknown") return;
+    let active = true;
+    const poll = async () => {
+      try {
+        const record = await loadGatewaySweep(sweepInFlight);
+        if (!active) return;
+        setSweepResult(record);
+        setSweepHistory((items) => [
+          record,
+          ...items.filter((item) => item.sweep_id !== record.sweep_id),
+        ]);
+        if (record.status === "completed") {
+          setSweepInFlight(null);
+          setFundingMessage("Return confirmed on the simulated chain.");
+          await refreshWallet();
+        }
+      } catch {
+        // Do not submit another return while chain evidence is uncertain.
+      }
+    };
+    void poll();
+    const poller = setInterval(() => void poll(), 3000);
+    return () => {
+      active = false;
+      clearInterval(poller);
+    };
+  }, [isLive, sweepInFlight, refreshWallet]);
 
   useEffect(() => {
     if (!isLive || !selectedPaymentId) return;
@@ -310,15 +536,7 @@ export default function App() {
 
   const agents = isLive ? liveAgents : demo.agents;
   const approvals = isLive
-    ? [
-        ...liveApprovals,
-        ...(livePairing &&
-        !liveApprovals.some(
-          (item) => item.approval_id === livePairing.approval.approval_id,
-        )
-          ? [livePairing.approval]
-          : []),
-      ]
+    ? withPairingConsent(liveApprovals, livePairing)
     : demo.approvals;
   const pendingApprovals = approvals.filter(
     (approval) =>
@@ -327,6 +545,36 @@ export default function App() {
   const selectedApproval =
     approvals.find((approval) => approval.approval_id === selectedApprovalId) ??
     null;
+  const selectedPairing =
+    selectedApproval?.kind === "pairing"
+      ? (livePairings.find(
+          (pairing) => pairing.user_code === selectedApproval.subject_id,
+        ) ??
+        (livePairing?.approval.approval_id === selectedApproval.approval_id
+          ? livePairing.pairing
+          : null))
+      : null;
+  const selectedNumberExpiry = selectedPairing?.request_number_expires_at;
+  const selectedNumberSeconds = selectedPairing
+    ? pairingCountdown(selectedPairing, clock).number
+    : 0;
+  const selectedNumberExpired =
+    selectedApproval?.kind === "pairing" && selectedNumberSeconds === 0;
+
+  useEffect(() => {
+    if (
+      selectedApproval?.kind === "pairing" &&
+      selectedApproval.approval_id === selectedApprovalId &&
+      (selectedNumberExpired || selectedNumberExpiry)
+    )
+      setNumberInput("");
+  }, [
+    selectedApproval?.kind,
+    selectedApproval?.approval_id,
+    selectedApprovalId,
+    selectedNumberExpiry,
+    selectedNumberExpired,
+  ]);
   const approvalView = (approval: Approval) =>
     presentApproval(
       approval,
@@ -354,6 +602,32 @@ export default function App() {
     null;
   const activeAgent = agents.find((agent) => agent.status === "active");
   const latestActivity = paymentRows.slice(0, 2);
+  const balanceState = !isLive
+    ? "demo"
+    : !liveHome
+      ? homeLoading
+        ? "loading"
+        : "unavailable"
+      : homeError ||
+          !homeSyncedAt ||
+          clock - homeSyncedAt > 10_000 ||
+          !Number.isFinite(Date.parse(liveHome.observed_at)) ||
+          Date.parse(liveHome.observed_at) - clock > 15_000 ||
+          clock - Date.parse(liveHome.observed_at) > 15_000
+        ? "stale"
+        : "confirmed";
+  const liveBalanceUsable =
+    balanceState === "confirmed" && !liveHome?.agent_wallet.frozen;
+  const mainBalance = isLive
+    ? balanceState === "confirmed"
+      ? liveHome?.main_account.balance.amount
+      : undefined
+    : demo.mainBalance;
+  const walletBalance = isLive
+    ? balanceState === "confirmed"
+      ? liveHome?.agent_wallet.balance.amount
+      : undefined
+    : demo.walletBalance;
 
   const securityAction = useCallback(
     async (label: string, run: () => void) => {
@@ -407,6 +681,7 @@ export default function App() {
 
   const handleApprove = () => {
     if (!selectedApproval) return;
+    if (approvalSubmissionInFlight.current) return;
     if (isLive && !isLocalDemo) {
       showError(
         "A live Secure Enclave approval signature is not available yet.",
@@ -415,12 +690,22 @@ export default function App() {
     }
     if (isLocalDemo) {
       if (!demoAuthenticated)
-        return showError("Enter the one-time local demo login token first.");
+        return showError("Enter the private local app token first.");
       if (
         selectedApproval.status !== "pending" ||
         Date.parse(selectedApproval.expires_at) <= Date.now()
       )
         return showError("This approval has expired. Start a new request.");
+      if (
+        selectedApproval.kind === "pairing" &&
+        (!selectedNumberExpiry ||
+          Date.parse(selectedNumberExpiry) <= Date.now())
+      ) {
+        setNumberInput("");
+        return setNumberMessage(
+          "The request number expired. Ask the connector to refresh its number, then enter the new number here.",
+        );
+      }
       if (
         selectedApproval.level === "zero_trust" &&
         !/^\d{6}$/.test(numberInput)
@@ -433,6 +718,23 @@ export default function App() {
       setPendingSimulation({
         label: `Simulate approval of ${approvalView(card).title}`,
         run: () => {
+          if (approvalSubmissionInFlight.current) return;
+          if (
+            card.kind === "pairing" &&
+            (!selectedNumberExpiry ||
+              Date.parse(selectedNumberExpiry) <= Date.now())
+          ) {
+            setNumberInput("");
+            setNumberMessage(
+              "The request number expired. Ask the connector to refresh its number, then enter the new number here.",
+            );
+            return;
+          }
+          approvalSubmissionInFlight.current = true;
+          setApprovalBusy(true);
+          setNumberMessage(
+            "Submitting approval to Gateway. Wait for a result.",
+          );
           void (async () => {
             try {
               await approveLocalDemo(card, enteredNumber, pairingCode);
@@ -476,11 +778,35 @@ export default function App() {
                   setLivePairing(null);
                   setSelectedApprovalId(null);
                 }
-                await refreshGateway();
                 if (failures >= 3)
                   setGatewayError(
                     "Three incorrect numbers cancelled the simulated request. Start again from the connector.",
                   );
+              } else if (
+                error instanceof GatewayRequestError &&
+                card.kind === "pairing" &&
+                error.code === "request_number_expired"
+              ) {
+                setNumberInput("");
+                setNumberMessage(
+                  "That request number expired. Ask the connector to show its refreshed number, then enter it here. This did not count as a wrong attempt.",
+                );
+              } else if (
+                error instanceof GatewayRequestError &&
+                card.kind === "pairing" &&
+                error.status === 503
+              ) {
+                setNumberMessage(
+                  "Pairing could not complete because Gateway or the audit chain was unavailable. Check the request status, then retry if it is still pending.",
+                );
+              } else if (
+                error instanceof GatewayRequestError &&
+                card.kind === "pairing" &&
+                error.status === 403
+              ) {
+                setNumberMessage(
+                  "Pairing is unavailable or already being processed. Wait for its status to update before trying again.",
+                );
               } else {
                 setNumberMessage(
                   error instanceof Error
@@ -488,6 +814,10 @@ export default function App() {
                     : "Simulated approval failed.",
                 );
               }
+              await refreshGateway();
+            } finally {
+              approvalSubmissionInFlight.current = false;
+              setApprovalBusy(false);
             }
           })();
         },
@@ -554,14 +884,179 @@ export default function App() {
     setDemoLoginToken("");
     try {
       await loginLocalDemo(token);
+      hadDemoSession.current = true;
       setDemoAuthenticated(true);
       setGatewayError("");
       await refreshGateway();
+      await refreshWallet();
     } catch (error) {
       setDemoAuthenticated(false);
       setGatewayError(
         error instanceof Error ? error.message : "Local demo login failed.",
       );
+    }
+  };
+
+  const startFundingReview = async () => {
+    const amountFen = parseYuanToFen(fundingInput);
+    if (!amountFen)
+      return setFundingMessage(
+        "Enter a positive CNY amount with at most two decimal places.",
+      );
+    if (
+      !isLocalDemo ||
+      !liveBalanceUsable ||
+      !liveHome ||
+      fundingInFlight ||
+      sweepInFlight
+    )
+      return setFundingMessage(
+        "A fresh confirmed balance and local owner session are required.",
+      );
+    if (amountFen > liveHome.main_account.balance.amount)
+      return setFundingMessage(
+        "This exceeds the confirmed main-account balance.",
+      );
+    setFundingBusy(true);
+    setFundingMessage("");
+    try {
+      const challenge = await prepareGatewayFunding(amountFen);
+      if (
+        challenge.destination_address.toLowerCase() !==
+        liveHome.agent_wallet.address.toLowerCase()
+      )
+        throw new Error(
+          "Wallet destination changed. Refresh balances before transferring.",
+        );
+      setFundingReview({ amountFen, challenge });
+    } catch (error) {
+      setFundingMessage(
+        error instanceof Error ? error.message : "Transfer review unavailable.",
+      );
+    } finally {
+      setFundingBusy(false);
+    }
+  };
+
+  const confirmFunding = () => {
+    if (!fundingReview) return;
+    const { amountFen, challenge } = fundingReview;
+    if (Date.parse(challenge.expires_at) <= Date.now()) {
+      setFundingReview(null);
+      return setFundingMessage(
+        "The confirmation expired. Review this transfer again.",
+      );
+    }
+    setPendingSimulation({
+      label: `Transfer ${formatMoney(amountFen)} from WeBank main account to Agent Wallet ${challenge.destination_address}. Confirm this exact amount.`,
+      run: () => {
+        setFundingReview(null);
+        setFundingInFlight(challenge.funding_id);
+        setFundingBusy(true);
+        setFundingMessage(
+          "Submitting this transfer. Do not submit it again while its chain result is pending.",
+        );
+        void (async () => {
+          try {
+            const record = await submitSimulatedGatewayFunding(
+              challenge,
+              amountFen,
+            );
+            setFundingHistory((items) => [
+              record,
+              ...items.filter((item) => item.funding_id !== record.funding_id),
+            ]);
+            if (record.status === "completed") {
+              setFundingInFlight(null);
+              setFundingMessage("Transfer confirmed on the simulated chain.");
+              await refreshWallet();
+            }
+          } catch (error) {
+            if (
+              error instanceof GatewayRequestError &&
+              error.code === "reconciliation_required"
+            )
+              setFundingMessage(
+                "Transfer result is being reconciled. The same funding ID remains blocked from duplicate submission.",
+              );
+            else if (
+              error instanceof GatewayRequestError &&
+              error.status < 500
+            ) {
+              setFundingInFlight(null);
+              setFundingMessage(
+                error instanceof Error ? error.message : "Transfer failed.",
+              );
+              await refreshWallet();
+            } else {
+              setFundingMessage(
+                "Transfer response was lost or delayed. Checking the same funding ID for chain evidence; do not submit another transfer.",
+              );
+            }
+          } finally {
+            setFundingBusy(false);
+          }
+        })();
+      },
+    });
+  };
+
+  const confirmSweep = async () => {
+    const amountFen = sweepReviewFen;
+    if (
+      !amountFen ||
+      !liveHome ||
+      !liveBalanceUsable ||
+      fundingInFlight ||
+      sweepInFlight ||
+      amountFen > liveHome.agent_wallet.available.amount
+    )
+      return setFundingMessage(
+        "A fresh available balance is required before returning funds.",
+      );
+    setSweepReviewFen(null);
+    setSweepAttemptAt(Date.now());
+    setSweepInFlight("unknown");
+    setFundingBusy(true);
+    setFundingMessage(
+      "Returning only unreserved wallet funds to the main account.",
+    );
+    try {
+      const receipt = await sweepGatewayWallet(amountFen);
+      setSweepResult(receipt);
+      setSweepInFlight(
+        receipt.status === "completed" ? null : receipt.sweep_id,
+      );
+      setFundingMessage(
+        receipt.status === "completed"
+          ? "Return confirmed on the simulated chain."
+          : "Return requires reconciliation; funds remain unavailable.",
+      );
+      await refreshWallet();
+    } catch (error) {
+      if (
+        error instanceof GatewayRequestError &&
+        error.code === "reconciliation_required"
+      ) {
+        setSweepInFlight(
+          typeof error.details?.sweep_id === "string"
+            ? error.details.sweep_id
+            : "unknown",
+        );
+        setFundingMessage(
+          "Return outcome is being reconciled. No second return will be submitted.",
+        );
+      } else if (error instanceof GatewayRequestError && error.status < 500) {
+        setSweepInFlight(null);
+        setFundingMessage(error.message);
+      } else {
+        setFundingMessage(
+          "Return response was lost or delayed. Checking chain history before another transfer.",
+        );
+      }
+      await refreshWallet();
+    } finally {
+      setFundingBusy(false);
     }
   };
 
@@ -597,6 +1092,183 @@ export default function App() {
     openApproval("apr_pair_claude");
   };
 
+  const handleScannedPayload = async (payload: string) => {
+    if (scanInProgress.current) return;
+    scanInProgress.current = true;
+    setScanBusy(true);
+    setScanStatus("Checking this QR with WeBank...");
+    setScanReview(null);
+    setScanReceipt(null);
+    setCameraOpen(false);
+    try {
+      const result = await scanGatewayQrPayload(payload);
+      if (result.kind === "pairing") {
+        const consent = await loadPairingConsent(result.user_code);
+        setLivePairing(consent);
+        setLivePairingCode(result.user_code);
+        setDetail(null);
+        openApproval(consent.approval.approval_id);
+      } else {
+        setScanReview(result);
+        setScanStatus("Review the merchant and main-account payment below.");
+      }
+    } catch (error) {
+      setScanStatus(
+        error instanceof GatewayRequestError && error.code === "scan_invalid"
+          ? "Not a WeBank payment code. Nothing was paid or paired."
+          : error instanceof Error
+            ? error.message
+            : "This QR could not be checked.",
+      );
+    } finally {
+      scanInProgress.current = false;
+      setScanBusy(false);
+    }
+  };
+  scanPayloadHandler.current = handleScannedPayload;
+
+  const handleScanImage = async (uri: string) => {
+    try {
+      const payload = await decodeQrImageUri(uri);
+      await handleScannedPayload(payload);
+    } catch (error) {
+      setScanStatus(
+        error instanceof Error ? error.message : "The image could not be read.",
+      );
+    }
+  };
+
+  const chooseScanPhoto = async () => {
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        allowsEditing: false,
+      });
+      if (!result.canceled && result.assets[0]?.uri)
+        await handleScanImage(result.assets[0].uri);
+    } catch (error) {
+      setScanStatus(
+        error instanceof Error ? error.message : "Photo selection failed.",
+      );
+    }
+  };
+
+  const chooseScanFile = async () => {
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: "image/*",
+        multiple: false,
+        copyToCacheDirectory: true,
+      });
+      if (!result.canceled && result.assets[0]?.uri)
+        await handleScanImage(result.assets[0].uri);
+    } catch (error) {
+      setScanStatus(
+        error instanceof Error ? error.message : "File selection failed.",
+      );
+    }
+  };
+
+  const openScanCamera = async () => {
+    if (Platform.OS === "web")
+      return setScanStatus(
+        "Use From photos or From files in this web preview.",
+      );
+    const granted =
+      cameraPermission?.granted || (await requestCameraPermission()).granted;
+    if (!granted) return setScanStatus("Camera access was not granted.");
+    setCameraOpen(true);
+    setScanStatus("Point the camera at a WeBank payment or pairing QR.");
+  };
+
+  const confirmScannedPayment = () => {
+    const review = scanReview;
+    if (!review || !isLocalDemo || !demoAuthenticated) {
+      setScanStatus(
+        "Secure payment signing is unavailable outside the explicit local demo.",
+      );
+      return;
+    }
+    if (Date.parse(review.expires_at) <= Date.now()) {
+      setScanStatus("This review expired. Scan the QR again.");
+      setScanReview(null);
+      return;
+    }
+    setPendingSimulation({
+      label: `Pay ${formatMoney(review.amount.amount)} from your main account to ${review.merchant_legal_name} (${review.merchant_uscc}) for order ${review.order_id}.`,
+      run: () => {
+        void (async () => {
+          setScanBusy(true);
+          setScanStatus("Waiting for a verified main-account transfer...");
+          try {
+            const receipt = await confirmSimulatedHumanPayment(review);
+            setScanReceipt(receipt);
+            setScanReview(null);
+            setScanStatus(
+              receipt.status === "completed"
+                ? "Simulated main-account payment confirmed on FISCO BCOS."
+                : "Payment outcome needs reconciliation. Do not submit it again.",
+            );
+            await refreshWallet();
+          } catch (error) {
+            if (
+              error instanceof GatewayRequestError &&
+              error.code === "reconciliation_required"
+            ) {
+              const receipt = await loadHumanPayment(
+                review.confirmation_id,
+              ).catch(() => null);
+              if (receipt) setScanReceipt(receipt);
+              setScanReview(null);
+              setScanStatus(
+                "Payment outcome needs reconciliation. Do not submit it again.",
+              );
+            } else {
+              setScanStatus(
+                error instanceof Error ? error.message : "Payment failed.",
+              );
+            }
+          } finally {
+            setScanBusy(false);
+          }
+        })();
+      },
+    });
+  };
+
+  useEffect(() => {
+    if (Platform.OS !== "web" || detail !== "scan") return;
+    const element = dropZoneRef.current as unknown as HTMLElement | null;
+    if (!element) return;
+    const prevent = (event: DragEvent) => {
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const onDrop = (event: DragEvent) => {
+      prevent(event);
+      const file = event.dataTransfer?.files?.[0];
+      if (!file) return;
+      void (async () => {
+        try {
+          const payload = await decodeQrImageBlob(file);
+          await scanPayloadHandler.current(payload);
+        } catch (error) {
+          setScanStatus(
+            error instanceof Error
+              ? error.message
+              : "Dropped image could not be read.",
+          );
+        }
+      })();
+    };
+    element.addEventListener("dragover", prevent);
+    element.addEventListener("drop", onDrop);
+    return () => {
+      element.removeEventListener("dragover", prevent);
+      element.removeEventListener("drop", onDrop);
+    };
+  }, [detail]);
+
   const handleFreezeAgent = async (agentId: string) => {
     if (isLive) {
       try {
@@ -610,7 +1282,86 @@ export default function App() {
     setDemo((current) => freezeAgent(current, agentId));
   };
 
+  const handleUnfreezeAgent = (agentId: string) => {
+    if (isLive) {
+      if (!isLocalDemo)
+        return showError(
+          "A registered biometric Secure Enclave key is required to unfreeze this agent.",
+        );
+      setPendingSimulation({
+        label: `Simulate user-only Unfreeze for ${agentId}. This does not clear a suspended licence.`,
+        run: () => {
+          void (async () => {
+            try {
+              const challenge = await prepareGatewayAgentAction(
+                agentId,
+                "unfreeze",
+              );
+              await completeSimulatedGatewayAgentAction(
+                agentId,
+                "unfreeze",
+                challenge,
+              );
+              await refreshGateway();
+            } catch (error) {
+              showError(
+                error instanceof Error ? error.message : "Unfreeze failed",
+              );
+            }
+          })();
+        },
+      });
+      return;
+    }
+    void securityAction(`Unfreeze ${agentId}`, () =>
+      setDemo((current) => ({
+        ...current,
+        agents: current.agents.map((agent) =>
+          agent.agent_id === agentId ? { ...agent, status: "active" } : agent,
+        ),
+      })),
+    );
+  };
+
+  const handleDeleteAgent = (agentId: string, name: string) => {
+    const run = () => {
+      void (async () => {
+        try {
+          if (isLive) {
+            await deleteGatewayAgent(agentId);
+            await refreshGateway();
+          } else
+            setDemo((current) => ({
+              ...current,
+              agents: current.agents.filter(
+                (agent) => agent.agent_id !== agentId,
+              ),
+            }));
+        } catch (error) {
+          showError(error instanceof Error ? error.message : "Delete failed");
+        }
+      })();
+    };
+    if (Platform.OS === "web") {
+      if (
+        window.confirm(
+          `Delete ${name}? Access will be revoked. Payment and audit history will remain.`,
+        )
+      )
+        run();
+    } else
+      Alert.alert(
+        "Delete agent",
+        `Revoke ${name} and remove it from the list? History remains.`,
+        [
+          { text: "Cancel", style: "cancel" },
+          { text: "Delete agent", style: "destructive", onPress: run },
+        ],
+      );
+  };
+
   const handleReject = () => {
+    if (approvalSubmissionInFlight.current) return;
     if (!selectedApproval) {
       return;
     }
@@ -730,6 +1481,152 @@ export default function App() {
                 </Text>
               </View>
             </>
+          ) : detail === "scan" ? (
+            <>
+              <Text style={styles.back} onPress={() => setDetail(null)}>
+                ‹ Home
+              </Text>
+              <SectionTitle
+                kicker="PAY FROM MAIN ACCOUNT"
+                title="Scan a code"
+              />
+              <View style={styles.card}>
+                <Text style={styles.cardTitle}>A QR in a photo or file</Text>
+                <Text style={styles.bodyText}>
+                  Choose a checkout screenshot, or drop it here in the web and
+                  mirrored preview. WeBank checks the signed bill before any
+                  payment review opens.
+                </Text>
+                <View style={styles.twoButtons}>
+                  <View style={styles.halfButton}>
+                    <Button
+                      testID="scan-from-photos"
+                      tone="light"
+                      onPress={() => void chooseScanPhoto()}
+                    >
+                      From photos
+                    </Button>
+                  </View>
+                  <View style={styles.halfButton}>
+                    <Button
+                      testID="scan-from-files"
+                      tone="light"
+                      onPress={() => void chooseScanFile()}
+                    >
+                      From files
+                    </Button>
+                  </View>
+                </View>
+                {Platform.OS === "web" ? (
+                  <View
+                    ref={dropZoneRef}
+                    testID="scan-drop-zone"
+                    style={styles.scanDropZone}
+                  >
+                    <Text style={styles.scanDropText}>
+                      Drop a screenshot here
+                    </Text>
+                    <Text style={styles.finePrint}>
+                      The image stays on this device. Only its QR content is
+                      checked by the local Gateway.
+                    </Text>
+                  </View>
+                ) : (
+                  <Button
+                    testID="scan-with-camera"
+                    tone="ghost"
+                    onPress={() => void openScanCamera()}
+                  >
+                    Use camera
+                  </Button>
+                )}
+                {cameraOpen && Platform.OS !== "web" ? (
+                  <CameraView
+                    style={styles.scanCamera}
+                    barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+                    onBarcodeScanned={({ data }) =>
+                      void handleScannedPayload(data)
+                    }
+                  />
+                ) : null}
+              </View>
+              {scanStatus ? (
+                <View style={styles.notice}>
+                  <Text style={styles.noticeText}>{scanStatus}</Text>
+                </View>
+              ) : null}
+              {scanBusy ? <ActivityIndicator color={colors.purple} /> : null}
+              {scanReview ? (
+                <View style={styles.card}>
+                  <Badge>SIMULATED MAIN-ACCOUNT PAYMENT</Badge>
+                  <Text style={[styles.cardTitle, { marginTop: 12 }]}>
+                    Review this bill
+                  </Text>
+                  <InfoRow
+                    label="Registered merchant"
+                    value={scanReview.merchant_legal_name}
+                  />
+                  <InfoRow label="Legal ID" value={scanReview.merchant_uscc} />
+                  <InfoRow label="Order" value={scanReview.order_id} />
+                  <InfoRow label="From" value="Main account" />
+                  <InfoRow
+                    label="Total"
+                    value={formatMoney(scanReview.amount.amount)}
+                    last
+                  />
+                  <Button
+                    testID="confirm-scanned-payment"
+                    disabled={scanBusy || !isLocalDemo || !demoAuthenticated}
+                    onPress={confirmScannedPayment}
+                  >
+                    {isLocalDemo
+                      ? "Confirm simulated payment"
+                      : "Secure signing unavailable"}
+                  </Button>
+                  <Text style={styles.finePrint}>
+                    This pays from the main account. It does not fund or use the
+                    Agent Wallet and creates no mandate. The local web
+                    confirmation is simulated; it is not Face ID.
+                  </Text>
+                </View>
+              ) : null}
+              {scanReceipt ? (
+                <View style={styles.card}>
+                  <Text style={styles.cardTitle}>
+                    {scanReceipt.status === "completed"
+                      ? "Payment confirmed"
+                      : "Payment pending reconciliation"}
+                  </Text>
+                  <InfoRow label="Order" value={scanReceipt.order_id} />
+                  <InfoRow label="From" value="Main account" />
+                  <InfoRow
+                    label="Amount"
+                    value={formatMoney(scanReceipt.amount.amount)}
+                  />
+                  {scanReceipt.chain.tx_hash ? (
+                    <InfoRow
+                      label="Chain transaction"
+                      value={wrapHash(scanReceipt.chain.tx_hash)}
+                    />
+                  ) : null}
+                  <Button
+                    testID="refresh-scanned-payment"
+                    tone="ghost"
+                    onPress={() => {
+                      void loadHumanPayment(scanReceipt.confirmation_id).then(
+                        (next) => {
+                          setScanReceipt(next);
+                          if (next.status === "completed")
+                            setScanStatus("Payment confirmed on FISCO BCOS.");
+                        },
+                      );
+                    }}
+                  >
+                    Refresh status
+                  </Button>
+                </View>
+              ) : null}
+            </>
           ) : detail === "demo" ? (
             <>
               <Text style={styles.back} onPress={() => setDetail(null)}>
@@ -845,7 +1742,9 @@ export default function App() {
                 <View style={styles.cardTop}>
                   <Badge>{selectedApproval.kind.toUpperCase()}</Badge>
                   <Text style={styles.expiry}>
-                    Expires in{" "}
+                    {selectedApproval.kind === "pairing"
+                      ? "Pairing code: "
+                      : "Expires in "}
                     {secondsRemaining(selectedApproval.expires_at, clock)}s
                   </Text>
                 </View>
@@ -866,13 +1765,23 @@ export default function App() {
                 selectedApproval.approval_id ? (
                 <View style={styles.card}>
                   <Text style={styles.cardTitle}>Connection details</Text>
-                  <InfoRow label="App" value={livePairing.client_name} />
-                  <InfoRow label="Provider" value={livePairing.provider} />
+                  <InfoRow
+                    label="App"
+                    value={livePairing.pairing.client_name}
+                  />
+                  <InfoRow
+                    label="Provider"
+                    value={livePairing.pairing.provider}
+                  />
                   <InfoRow
                     label="Scopes"
-                    value={livePairing.requested_scopes.join(", ")}
+                    value={livePairing.pairing.requested_scopes.join(", ")}
                     last
                   />
+                  <Text style={styles.bodyText}>
+                    Approval creates a new agent identity with its own wallet
+                    limits.
+                  </Text>
                 </View>
               ) : null}
               {selectedApproval.level === "zero_trust" ? (
@@ -882,6 +1791,18 @@ export default function App() {
                     Type the six-digit number shown by the connector on your
                     Mac. This app never shows that number.
                   </Text>
+                  {isLive && selectedApproval.kind === "pairing" ? (
+                    <Text
+                      testID="request-number-expiry"
+                      style={styles.bodyText}
+                    >
+                      {selectedPairing?.status !== "pending"
+                        ? "This pairing request is closed. Start a new request from the connector."
+                        : selectedNumberExpired
+                          ? "Request number expired. Ask the connector to refresh and show its current number."
+                          : `Request number: ${selectedNumberSeconds}s left. It changes before the pairing code expires.`}
+                    </Text>
+                  ) : null}
                   <TextInput
                     testID="request-number-input"
                     style={[styles.input, styles.numberInput]}
@@ -905,9 +1826,13 @@ export default function App() {
                 <Button
                   testID="approve-action"
                   disabled={
+                    approvalBusy ||
                     (isLive && (!isLocalDemo || !demoAuthenticated)) ||
                     selectedApproval.status !== "pending" ||
                     Date.parse(selectedApproval.expires_at) <= clock ||
+                    (selectedApproval.kind === "pairing" &&
+                      (selectedNumberExpired ||
+                        selectedPairing?.status !== "pending")) ||
                     (selectedApproval.level === "zero_trust" &&
                       numberInput.length !== 6 &&
                       (isLive ||
@@ -917,17 +1842,20 @@ export default function App() {
                   }
                   onPress={handleApprove}
                 >
-                  {isLocalDemo
-                    ? demoAuthenticated
-                      ? "Simulate approval"
-                      : "Sign in to simulate"
-                    : isLive
-                      ? "Secure signing not available"
-                      : "Approve with biometric check"}
+                  {approvalBusy
+                    ? "Submitting approval..."
+                    : isLocalDemo
+                      ? demoAuthenticated
+                        ? "Simulate approval"
+                        : "Sign in to simulate"
+                      : isLive
+                        ? "Secure signing not available"
+                        : "Approve with biometric check"}
                 </Button>
                 <Button
                   testID="reject-action"
                   tone="ghost"
+                  disabled={approvalBusy}
                   onPress={handleReject}
                 >
                   {isLocalDemo ? "Reject simulated request" : "Reject request"}
@@ -1073,9 +2001,9 @@ export default function App() {
                     Sign in to the simulated local Gateway
                   </Text>
                   <Text style={styles.bodyText}>
-                    Enter the one-time app token printed by the loopback
-                    Gateway. The token stays in this screen only and is cleared
-                    after each attempt.
+                    Read the private local app token from the file path printed
+                    by the launcher. The app sends it to the loopback Gateway
+                    for sign-in and clears the input after each attempt.
                   </Text>
                   <TextInput
                     testID="local-demo-token-input"
@@ -1083,7 +2011,7 @@ export default function App() {
                     secureTextEntry
                     autoCapitalize="none"
                     autoCorrect={false}
-                    placeholder="One-time local token"
+                    placeholder="Private local app token"
                     placeholderTextColor="#AAA5AF"
                     value={demoLoginToken}
                     onChangeText={setDemoLoginToken}
@@ -1106,23 +2034,50 @@ export default function App() {
                   >
                     <View style={styles.orb} />
                     <Text style={styles.mainCardLabel}>
-                      MAIN ACCOUNT · DEMO BALANCE
+                      {isLive
+                        ? "MAIN ACCOUNT · SIMULATED CHAIN"
+                        : "MAIN ACCOUNT · DEMO BALANCE"}
                     </Text>
                     <Text style={styles.mainCardAmount}>
-                      {formatMoney(demo.mainBalance)}
+                      {mainBalance === undefined
+                        ? "Unavailable"
+                        : formatMoney(mainBalance)}
                     </Text>
                     <View style={styles.mainCardFooter}>
                       <Text style={styles.mainCardFooterText}>
-                        WeBank account
+                        {isLive ? `Balance ${balanceState}` : "WeBank account"}
                       </Text>
-                      <Text style={styles.mainCardFooterText}>•• 0842</Text>
+                      <Text style={styles.mainCardFooterText}>
+                        {isLive
+                          ? liveHome && balanceState === "confirmed"
+                            ? `Block ${liveHome.block_number}`
+                            : "Chain unavailable"
+                          : "•• 0842"}
+                      </Text>
                     </View>
                   </LinearGradient>
+                  <Button
+                    testID="open-scan"
+                    tone="light"
+                    onPress={() => {
+                      setScanStatus("");
+                      setScanReview(null);
+                      setScanReceipt(null);
+                      setCameraOpen(false);
+                      setDetail("scan");
+                    }}
+                  >
+                    Scan payment or pairing QR
+                  </Button>
                   <SectionTitle
                     kicker="YOUR AGENTS"
                     title="Agent Wallet"
                     right={
-                      isLive ? "SIMULATED" : demo.enabled ? "ACTIVE" : "SETUP"
+                      isLive
+                        ? balanceState.toUpperCase()
+                        : demo.enabled
+                          ? "ACTIVE"
+                          : "SETUP"
                     }
                   />
                   <View style={styles.walletPanel}>
@@ -1132,7 +2087,9 @@ export default function App() {
                           SEPARATE SPENDING POT
                         </Text>
                         <Text style={styles.walletAmount}>
-                          {formatMoney(demo.walletBalance)}
+                          {walletBalance === undefined
+                            ? "Unavailable"
+                            : formatMoney(walletBalance)}
                         </Text>
                       </View>
                       <View style={styles.purpleCircle}>
@@ -1143,6 +2100,14 @@ export default function App() {
                       Agents can only request payments from this wallet, within
                       your rules.
                     </Text>
+                    {isLive && liveHome && balanceState === "confirmed" ? (
+                      <Text style={styles.finePrint}>
+                        {formatMoney(liveHome.agent_wallet.reserved.amount)}{" "}
+                        reserved ·{" "}
+                        {formatMoney(liveHome.agent_wallet.available.amount)}{" "}
+                        available
+                      </Text>
+                    ) : null}
                     {demo.enabled || isLive ? (
                       <Button
                         testID="open-wallet"
@@ -1251,20 +2216,291 @@ export default function App() {
                       AGENT WALLET · SIMULATED
                     </Text>
                     <Text style={styles.walletHeroAmount}>
-                      {formatMoney(demo.walletBalance)}
+                      {walletBalance === undefined
+                        ? "Unavailable"
+                        : formatMoney(walletBalance)}
                     </Text>
                     <Text style={styles.walletHeroFoot}>
                       Separate from your main account
                     </Text>
                   </LinearGradient>
                   {isLive ? (
-                    <View style={styles.notice}>
-                      <Text style={styles.noticeTitle}>SIMULATED WALLET</Text>
-                      <Text style={styles.noticeText}>
-                        Balance and limits on this screen are design examples.
-                        Gateway wallet and policy read routes are not connected.
-                      </Text>
-                    </View>
+                    <>
+                      <View style={styles.notice}>
+                        <Text style={styles.noticeTitle}>
+                          {balanceState === "confirmed"
+                            ? "CHAIN CONFIRMED · SIMULATED CNY"
+                            : `BALANCE ${balanceState.toUpperCase()}`}
+                        </Text>
+                        <Text style={styles.noticeText}>
+                          {balanceState === "confirmed"
+                            ? `Observed at block ${liveHome?.block_number} on ${liveHome?.observed_at}.`
+                            : homeError ||
+                              "Waiting for a confirmed chain reading. Transfers are unavailable."}
+                        </Text>
+                      </View>
+                      {liveHome && balanceState === "confirmed" ? (
+                        <View style={styles.card}>
+                          <InfoRow
+                            label="Main account"
+                            value={formatMoney(
+                              liveHome.main_account.balance.amount,
+                            )}
+                          />
+                          <InfoRow
+                            label="Agent Wallet balance"
+                            value={formatMoney(
+                              liveHome.agent_wallet.balance.amount,
+                            )}
+                          />
+                          <InfoRow
+                            label="Reserved for mandates"
+                            value={formatMoney(
+                              liveHome.agent_wallet.reserved.amount,
+                            )}
+                          />
+                          <InfoRow
+                            label="Available to use or return"
+                            value={formatMoney(
+                              liveHome.agent_wallet.available.amount,
+                            )}
+                            last
+                          />
+                        </View>
+                      ) : null}
+                      {homeLoading && !liveHome ? (
+                        <ActivityIndicator color={colors.purple} />
+                      ) : null}
+                      <SectionTitle
+                        kicker="MOVE MONEY"
+                        title="Fund Agent Wallet"
+                      />
+                      <View style={styles.card}>
+                        <Text style={styles.bodyText}>
+                          Choose an amount to move from your simulated WeBank
+                          main account into the separate Agent Wallet.
+                        </Text>
+                        <TextInput
+                          testID="funding-amount"
+                          style={styles.input}
+                          value={fundingInput}
+                          onChangeText={(value) => {
+                            setFundingInput(value);
+                            setFundingReview(null);
+                          }}
+                          keyboardType="decimal-pad"
+                          accessibilityLabel="Transfer amount in CNY"
+                          placeholder="Amount in CNY"
+                          placeholderTextColor="#AAA5AF"
+                        />
+                        <Button
+                          testID="review-funding"
+                          disabled={
+                            !isLocalDemo ||
+                            !liveBalanceUsable ||
+                            fundingBusy ||
+                            Boolean(fundingInFlight || sweepInFlight)
+                          }
+                          onPress={() => void startFundingReview()}
+                        >
+                          Review transfer
+                        </Button>
+                        {!isLocalDemo ? (
+                          <Text style={styles.finePrint}>
+                            Funding requires the local simulated owner
+                            confirmation. A production biometric signing key is
+                            not connected.
+                          </Text>
+                        ) : null}
+                      </View>
+                      {fundingReview ? (
+                        <View testID="funding-review" style={styles.card}>
+                          <Text style={styles.cardTitle}>Review transfer</Text>
+                          <InfoRow label="From" value="WeBank main account" />
+                          <InfoRow label="To" value="Agent Wallet" />
+                          <Text selectable style={styles.finePrint}>
+                            Destination{" "}
+                            {fundingReview.challenge.destination_address}
+                          </Text>
+                          <InfoRow
+                            label="Amount"
+                            value={formatMoney(fundingReview.amountFen)}
+                            last
+                          />
+                          <Text style={styles.finePrint}>
+                            This review expires{" "}
+                            {new Date(
+                              fundingReview.challenge.expires_at,
+                            ).toLocaleTimeString()}
+                            .
+                          </Text>
+                          <Button
+                            testID="confirm-funding"
+                            disabled={
+                              fundingBusy ||
+                              !liveBalanceUsable ||
+                              Boolean(fundingInFlight || sweepInFlight) ||
+                              Date.parse(fundingReview.challenge.expires_at) <=
+                                clock
+                            }
+                            onPress={confirmFunding}
+                          >
+                            Confirm with simulated biometric
+                          </Button>
+                          <Button
+                            tone="ghost"
+                            onPress={() => setFundingReview(null)}
+                          >
+                            Cancel
+                          </Button>
+                        </View>
+                      ) : null}
+                      {fundingMessage ? (
+                        <View style={styles.notice}>
+                          <Text style={styles.noticeText}>
+                            {fundingMessage}
+                          </Text>
+                        </View>
+                      ) : null}
+                      {fundingInFlight ? (
+                        <Text style={styles.finePrint}>
+                          Funding {fundingInFlight}: awaiting confirmed chain
+                          evidence or reconciliation.
+                        </Text>
+                      ) : null}
+                      {sweepInFlight ? (
+                        <Text style={styles.finePrint}>
+                          Return {sweepInFlight}: awaiting confirmed chain
+                          evidence or reconciliation.
+                        </Text>
+                      ) : null}
+                      {liveHome &&
+                      balanceState === "confirmed" &&
+                      liveHome.agent_wallet.available.amount > 0 ? (
+                        <View style={styles.card}>
+                          <Text style={styles.cardTitle}>
+                            Return unused funds
+                          </Text>
+                          <Text style={styles.bodyText}>
+                            Only the unreserved available balance can return to
+                            the fixed main account.
+                          </Text>
+                          {sweepReviewFen === null ? (
+                            <Button
+                              testID="review-sweep"
+                              tone="light"
+                              disabled={
+                                !liveBalanceUsable ||
+                                fundingBusy ||
+                                Boolean(fundingInFlight || sweepInFlight)
+                              }
+                              onPress={() =>
+                                setSweepReviewFen(
+                                  liveHome.agent_wallet.available.amount,
+                                )
+                              }
+                            >
+                              Review return of{" "}
+                              {formatMoney(
+                                liveHome.agent_wallet.available.amount,
+                              )}
+                            </Button>
+                          ) : (
+                            <>
+                              <InfoRow
+                                label="From"
+                                value="Agent Wallet available"
+                              />
+                              <InfoRow label="To" value="WeBank main account" />
+                              <InfoRow
+                                label="Amount"
+                                value={formatMoney(sweepReviewFen)}
+                                last
+                              />
+                              <Button
+                                testID="confirm-sweep"
+                                disabled={
+                                  !liveBalanceUsable ||
+                                  fundingBusy ||
+                                  Boolean(fundingInFlight || sweepInFlight)
+                                }
+                                onPress={() => void confirmSweep()}
+                              >
+                                Confirm return
+                              </Button>
+                              <Button
+                                tone="ghost"
+                                onPress={() => setSweepReviewFen(null)}
+                              >
+                                Cancel
+                              </Button>
+                            </>
+                          )}
+                        </View>
+                      ) : null}
+                      {sweepResult ? (
+                        <Text style={styles.finePrint}>
+                          Return {sweepResult.sweep_id}: {sweepResult.status}.{" "}
+                          {sweepResult.chain.tx_hash ??
+                            "Awaiting chain evidence"}
+                        </Text>
+                      ) : null}
+                      <SectionTitle
+                        kicker="VERIFIED TRANSFERS"
+                        title="Funding history"
+                      />
+                      {fundingHistory
+                        .filter((item) => item.status !== "prepared")
+                        .slice()
+                        .sort(
+                          (a, b) =>
+                            Date.parse(b.created_at) - Date.parse(a.created_at),
+                        )
+                        .slice(0, 5)
+                        .map((item) => (
+                          <View key={item.funding_id} style={styles.card}>
+                            <Text style={styles.cardTitle}>
+                              {formatMoney(item.amount.amount)} ·{" "}
+                              {item.status.replaceAll("_", " ")}
+                            </Text>
+                            <Text style={styles.finePrint}>
+                              {item.funding_id} ·{" "}
+                              {new Date(item.created_at).toLocaleString()}
+                            </Text>
+                            {item.chain.tx_hash ? (
+                              <Text selectable style={styles.finePrint}>
+                                Verified chain transaction {item.chain.tx_hash}{" "}
+                                · block {item.chain.block_number ?? "pending"}
+                              </Text>
+                            ) : null}
+                          </View>
+                        ))}
+                      {sweepHistory
+                        .slice()
+                        .sort(
+                          (a, b) =>
+                            Date.parse(b.created_at) - Date.parse(a.created_at),
+                        )
+                        .slice(0, 3)
+                        .map((item) => (
+                          <View key={item.sweep_id} style={styles.card}>
+                            <Text style={styles.cardTitle}>
+                              Returned {formatMoney(item.amount.amount)} ·{" "}
+                              {item.status.replaceAll("_", " ")}
+                            </Text>
+                            <Text style={styles.finePrint}>
+                              {item.sweep_id} ·{" "}
+                              {new Date(item.created_at).toLocaleString()}
+                            </Text>
+                            {item.chain.tx_hash ? (
+                              <Text selectable style={styles.finePrint}>
+                                Verified chain transaction {item.chain.tx_hash}{" "}
+                                · block {item.chain.block_number ?? "pending"}
+                              </Text>
+                            ) : null}
+                          </View>
+                        ))}
+                    </>
                   ) : !demo.enabled ? (
                     <Button
                       onPress={() =>
@@ -1290,21 +2526,31 @@ export default function App() {
                     kicker="ACCOUNT POLICY"
                     title="Spending limits"
                   />
-                  <View style={styles.card}>
-                    <InfoRow
-                      label="Per payment"
-                      value={formatMoney(demo.perPaymentMax)}
-                    />
-                    <InfoRow
-                      label="Per day"
-                      value={formatMoney(demo.dailyMax)}
-                    />
-                    <InfoRow
-                      label="Auto-approve below"
-                      value={formatMoney(demo.autoApproveBelow)}
-                      last
-                    />
-                  </View>
+                  {!isLive ? (
+                    <View style={styles.card}>
+                      <InfoRow
+                        label="Per payment"
+                        value={formatMoney(demo.perPaymentMax)}
+                      />
+                      <InfoRow
+                        label="Per day"
+                        value={formatMoney(demo.dailyMax)}
+                      />
+                      <InfoRow
+                        label="Auto-approve below"
+                        value={formatMoney(demo.autoApproveBelow)}
+                        last
+                      />
+                    </View>
+                  ) : (
+                    <View style={styles.notice}>
+                      <Text style={styles.noticeTitle}>POLICY LIMITS</Text>
+                      <Text style={styles.noticeText}>
+                        Policy values are unavailable in this view. Existing
+                        limits still apply to every agent request.
+                      </Text>
+                    </View>
+                  )}
                   {!isLive ? (
                     <View style={styles.twoButtons}>
                       <View style={styles.halfButton}>
@@ -1450,6 +2696,52 @@ export default function App() {
                       only request actions within your wallet policy.
                     </Text>
                   </View>
+                  {isLive && livePairings.length ? (
+                    <View style={styles.card}>
+                      <Text style={styles.cardTitle}>Pairing requests</Text>
+                      {livePairings.map((pairing) => (
+                        <View key={pairing.user_code} style={styles.infoRow}>
+                          <View style={{ flex: 1 }}>
+                            <Text style={styles.infoValue}>
+                              {pairing.client_name} · {pairing.status}
+                            </Text>
+                            <Text style={styles.infoLabel}>
+                              Code {pairing.user_code} ·{" "}
+                              {pairing.status === "pending"
+                                ? `${pairingCountdown(pairing, clock).code}s for code · ${pairingCountdown(pairing, clock).number}s for number`
+                                : "Code closed"}
+                            </Text>
+                          </View>
+                          {pairing.status === "pending" ? (
+                            <Button
+                              testID={`open-pairing-${pairing.user_code}`}
+                              tone="light"
+                              onPress={() => {
+                                void (async () => {
+                                  try {
+                                    const consent = await loadPairingConsent(
+                                      pairing.user_code,
+                                    );
+                                    setLivePairing(consent);
+                                    setLivePairingCode(pairing.user_code);
+                                    openApproval(consent.approval.approval_id);
+                                  } catch (error) {
+                                    showError(
+                                      error instanceof Error
+                                        ? error.message
+                                        : "Pairing unavailable",
+                                    );
+                                  }
+                                })();
+                              }}
+                            >
+                              Review
+                            </Button>
+                          ) : null}
+                        </View>
+                      ))}
+                    </View>
+                  ) : null}
                   {agents.length ? (
                     agents.map((agent) => (
                       <View
@@ -1468,17 +2760,44 @@ export default function App() {
                             <Text style={styles.bodyText}>
                               {agent.status === "active"
                                 ? "Connected and active"
-                                : "Access frozen"}
+                                : agent.status === "frozen"
+                                  ? "Access frozen"
+                                  : "Access revoked"}
                             </Text>
                           </View>
-                          <Badge
-                            tone={agent.status === "active" ? "purple" : "red"}
+                          <Pressable
+                            testID={`licence-badge-${agent.agent_id}`}
+                            accessibilityRole="button"
+                            accessibilityLabel={`${agent.licence.level} licence. ${licenceExplanation(agent.licence.level)}`}
+                            accessibilityHint="Tap for licence details"
+                            onHoverIn={() =>
+                              setExpandedLicenceId(agent.agent_id)
+                            }
+                            onHoverOut={() => setExpandedLicenceId(null)}
+                            onFocus={() => setExpandedLicenceId(agent.agent_id)}
+                            onBlur={() => setExpandedLicenceId(null)}
+                            onPress={() => setExpandedLicenceId(agent.agent_id)}
                           >
-                            {agent.status === "active"
-                              ? `${agent.licence.level}-PLATE`
-                              : "FROZEN"}
-                          </Badge>
+                            <Badge
+                              tone={
+                                agent.licence.level === "L"
+                                  ? "yellow"
+                                  : agent.licence.level === "SUSPENDED"
+                                    ? "red"
+                                    : "green"
+                              }
+                            >
+                              {agent.licence.level === "SUSPENDED"
+                                ? "SUSPENDED"
+                                : `${agent.licence.level}-PLATE`}
+                            </Badge>
+                          </Pressable>
                         </View>
+                        {expandedLicenceId === agent.agent_id ? (
+                          <Text style={styles.licenceHelp}>
+                            {licenceExplanation(agent.licence.level)}
+                          </Text>
+                        ) : null}
                         <View style={styles.agentStats}>
                           <Text style={styles.statText}>
                             {agent.licence.clean_purchases} clean purchases
@@ -1498,6 +2817,85 @@ export default function App() {
                             Freeze this agent
                           </Button>
                         ) : null}
+                        {agent.status === "frozen" ? (
+                          <Button
+                            testID={`unfreeze-agent-${agent.agent_id}`}
+                            tone="light"
+                            onPress={() => handleUnfreezeAgent(agent.agent_id)}
+                          >
+                            Unfreeze this agent
+                          </Button>
+                        ) : null}
+                        {agent.licence.level === "SUSPENDED" ? (
+                          <Button
+                            testID={`relicense-agent-${agent.agent_id}`}
+                            tone="light"
+                            onPress={() => {
+                              if (!isLocalDemo)
+                                return showError(
+                                  "A registered biometric Secure Enclave key is required to re-license this agent.",
+                                );
+                              void (async () => {
+                                try {
+                                  const history = await loadGatewayAgentHistory(
+                                    agent.agent_id,
+                                  );
+                                  const recent =
+                                    history.items
+                                      .slice(-3)
+                                      .map((event) => event.summary)
+                                      .join("; ") || "No recorded events";
+                                  setPendingSimulation({
+                                    label: `Review ${agent.display_name}'s retained history: ${recent}. This simulated action starts at L and does not clear a freeze.`,
+                                    run: () => {
+                                      void (async () => {
+                                        try {
+                                          const challenge =
+                                            await prepareGatewayAgentAction(
+                                              agent.agent_id,
+                                              "relicense",
+                                            );
+                                          await completeSimulatedGatewayAgentAction(
+                                            agent.agent_id,
+                                            "relicense",
+                                            challenge,
+                                          );
+                                          await refreshGateway();
+                                        } catch (error) {
+                                          showError(
+                                            error instanceof Error
+                                              ? error.message
+                                              : "Re-license failed",
+                                          );
+                                        }
+                                      })();
+                                    },
+                                  });
+                                } catch (error) {
+                                  showError(
+                                    error instanceof Error
+                                      ? error.message
+                                      : "History unavailable",
+                                  );
+                                }
+                              })();
+                            }}
+                          >
+                            Re-license agent
+                          </Button>
+                        ) : null}
+                        <Button
+                          testID={`delete-agent-${agent.agent_id}`}
+                          tone="danger"
+                          onPress={() =>
+                            handleDeleteAgent(
+                              agent.agent_id,
+                              agent.display_name,
+                            )
+                          }
+                        >
+                          Delete agent
+                        </Button>
                       </View>
                     ))
                   ) : (
@@ -1891,6 +3289,25 @@ const styles = StyleSheet.create({
     padding: 20,
   },
   emptyText: { color: colors.muted, fontSize: 12, lineHeight: 18 },
+  scanDropZone: {
+    borderWidth: 1,
+    borderStyle: "dashed",
+    borderColor: colors.purple,
+    borderRadius: 8,
+    backgroundColor: colors.purpleLight,
+    alignItems: "center",
+    justifyContent: "center",
+    minHeight: 112,
+    marginTop: 16,
+    padding: 14,
+  },
+  scanDropText: { color: colors.purple, fontSize: 13, fontWeight: "800" },
+  scanCamera: {
+    height: 230,
+    borderRadius: 8,
+    overflow: "hidden",
+    marginTop: 14,
+  },
   demoLink: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -1979,6 +3396,7 @@ const styles = StyleSheet.create({
     letterSpacing: 0.4,
   },
   badgeGreen: { backgroundColor: colors.greenLight },
+  badgeYellow: { backgroundColor: colors.yellowLight },
   badgeRed: { backgroundColor: colors.redLight },
   badgeDark: { backgroundColor: "#37303D" },
   approvalListCard: {
@@ -2036,6 +3454,15 @@ const styles = StyleSheet.create({
   },
   agentAvatarText: { color: colors.white, fontSize: 23, fontWeight: "800" },
   agentText: { flex: 1 },
+  licenceHelp: {
+    color: colors.ink,
+    backgroundColor: colors.paper,
+    borderRadius: 7,
+    padding: 11,
+    marginTop: 12,
+    fontSize: 12,
+    lineHeight: 18,
+  },
   agentStats: {
     flexDirection: "row",
     justifyContent: "space-between",

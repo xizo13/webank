@@ -1,6 +1,20 @@
 # Verification and known limits
 
-This record separates the default automated gate, opt-in local FISCO evidence, and acceptance still pending as of 2026-10-14.
+This record separates the default automated gate and opt-in local FISCO evidence recorded on 2026-10-14 from the current operator limits.
+The historical results below do not constitute a fresh full workspace gate for later changes.
+
+## 2026-10-19 source publication checks
+
+The current product source passed Biome lint across 131 files and TypeScript checks across all 11 workspace projects with a typecheck script.
+Vitest passed 147 tests with three opt-in tests skipped when two suites that bind `127.0.0.1` were excluded.
+The sandbox denied those suites permission to open a local listener, so the full default Vitest command is not recorded as passing for this date.
+The launcher passed 34 Python unit tests.
+The connector extension test built a self-contained MCPB, loaded its nine tools from another directory, and verified that the archive contains bundled dependency license texts.
+The public checkout still needs a clean dependency install and its own full CI run after publication.
+
+In an owner browser session, a fresh pairing created an independent agent and anchored its audit record on the preserved local FISCO chain.
+The owner has not completed the shopping payment portion of the latest interactive demo run.
+The browser approval remains simulated, and no iPhone build or on-device test is claimed.
 
 ## Default workspace gate
 
@@ -35,6 +49,8 @@ The shop order, connector status, and app detail all reported the same payment h
 A security-only run verified rejection of a changed signed request, a honeypot merchant, and a frozen agent without sending another 27,900 fen payment.
 A callback-failure run put an 8,800 fen test-token payment on FISCO but returned `503 reconciliation_required`, retained transaction `0x4f0acce11f4ca7efe14a8e97f927e66b689c9a8209b6edf796a6248c1976be17`, and left the shop order awaiting payment.
 The app detail also returned 503, so the callback failure did not create a false paid record.
+That is historical evidence from the earlier run.
+The current `callback-failure` CLI mode only chooses a different product and does not force the shop callback to fail, so it must not be used as a new callback-failure test without a fault injector.
 
 These hashes belong to a local permissioned chain and are not independently resolvable in a public explorer.
 The CLI driver used an in-memory connector credential store, simulated app approval and reservation, a fixture risk result, and an unavailable Guardian.
@@ -44,13 +60,15 @@ The separate `spike-fisco/REPORT.md` in the public checkout records the earlier 
 
 ## Acceptance and deployment limits
 
-- Final visual acceptance of the latest Expo presentation is pending on a suitable device or isolated VM.
+- The owner visually inspected the browser pairing flow; full screen and iPhone acceptance remain pending.
 - A local Face ID prompt is not a bank-verifiable approval signature; the Secure Enclave action signer is not implemented.
-- Gateway sessions, tokens, nonces, mandates, reservations, approvals, and audit records are in memory and do not survive a restart.
+- The limited Gateway fixture keeps state in memory; the opt-in loopback local-demo Gateway persists private sessions, tokens, nonces, mandates, reservations, approvals, payment intents, receipts, and its receipt signing identity across an ordinary restart.
+- The local-demo launcher preserves its chain deployment and shop state across an ordinary restart; `--fresh` archives both the prior Gateway state and shop state with the old address manifest, then starts a new funded deployment with a zero-balance Agent Wallet.
+- The current CLI driver does not fund that new wallet, so a funded run needs an owner app funding step before creating a mandate.
 - The connector uses a local software key readable by a same-user process.
 - The limited Gateway fixture cannot approve or pay; the separate opt-in local-demo listener uses simulated app proof and real local-chain test-token transactions.
 - The Treasurer is not wired to banking or chain settlement.
 - The mock shops and `ECnySim` do not represent real merchants or e-CNY.
-- There is no durable recovery worker for an uncertain chain or shop callback result.
+- There is no automatic recovery worker for an uncertain chain or shop callback result; the loopback Gateway durably holds such work for operator reconciliation.
 
 Do not use this prototype with real payment credentials, customer records, or funds.

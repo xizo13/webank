@@ -18,10 +18,12 @@ contract AgentWallet {
     bool public frozen;
 
     mapping(bytes32 => bool) public paid;
+    mapping(bytes32 => bool) public swept;
     mapping(uint256 => uint256) public spentByDay;
     mapping(uint256 => uint256) public spentByMonth;
 
     event Paid(bytes32 indexed paymentId, bytes32 indexed merchantId, address indexed payout, uint256 amount);
+    event Swept(bytes32 indexed sweepId, address indexed main, uint256 amount);
     event Frozen(bool frozen);
     event CapsSet(uint256 perPaymentCap, uint256 dailyCap, uint256 monthlyCap);
     event GatewaySet(address indexed gateway);
@@ -92,6 +94,17 @@ contract AgentWallet {
         spentByMonth[month] += amount;
         require(token.transfer(payout, amount), "transfer failed");
         emit Paid(paymentId, merchantId, payout, amount);
+    }
+
+    /// @notice The app must verify no active hold or uncertain payment before the bank invokes this.
+    function sweepToMain(bytes32 sweepId, uint256 amount) external {
+        require(msg.sender == bank, "not bank");
+        require(sweepId != bytes32(0), "zero sweep id");
+        require(!swept[sweepId], "already swept");
+        require(amount > 0, "zero amount");
+        swept[sweepId] = true;
+        require(token.transfer(bank, amount), "transfer failed");
+        emit Swept(sweepId, bank, amount);
     }
 
     /// @notice UTC day index for a timestamp with an explicit input unit.

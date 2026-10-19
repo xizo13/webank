@@ -18,6 +18,7 @@ import {
   PaymentStatusResponseSchema,
   PaymentSubmissionResponseSchema,
   ReceiptSchema,
+  ShopCheckoutRequestSchema,
   VerificationSchema,
   ZeroTrustVerificationSchema,
 } from "../src/index.js";
@@ -25,6 +26,13 @@ import {
 const timestamp = "2026-10-13T14:22:05+08:00";
 const tx = `0x${"a".repeat(64)}`;
 const hash = `sha256:${"b".repeat(64)}`;
+const shippingAddress = {
+  name: "Lin Demo",
+  phone: "13800138000",
+  address_line: "88 Demo Road",
+  city: "Shenzhen",
+  postcode: "518000",
+};
 const approval = {
   schema: "approval.v1",
   approval_id: "apr_31cd",
@@ -87,12 +95,21 @@ const paymentRequest = {
   amount: { amount: 27_900, currency: "CNY" },
   line_items: [
     {
+      type: "product",
       sku: "SONY-XM5-BLK",
       gtin: "4548736132597",
       name: "Sony WH-1000XM5 Black",
       condition: "new",
+      variant: "Black",
+      options: { colour: "Black" },
       qty: 1,
       unit_price: { amount: 27_900, currency: "CNY" },
+    },
+    {
+      type: "shipping",
+      name: "Standard delivery",
+      qty: 1,
+      unit_price: { amount: 0, currency: "CNY" },
     },
   ],
   expires_at: "2026-10-13T14:37:00+08:00",
@@ -132,6 +149,19 @@ const receipt = {
 };
 
 describe("shared contract boundaries", () => {
+  it("requires the same shipping address shape as the shop checkout route", () => {
+    expect(
+      ShopCheckoutRequestSchema.safeParse({
+        shipping_address: shippingAddress,
+      }).success,
+    ).toBe(true);
+    expect(
+      ShopCheckoutRequestSchema.safeParse({
+        shipping_profile: "default",
+      }).success,
+    ).toBe(false);
+  });
+
   it("accepts canonical versioned records", () => {
     expect(MandateSchema.safeParse(mandate).success).toBe(true);
     expect(ApprovalSchema.safeParse(approval).success).toBe(true);
@@ -407,6 +437,8 @@ describe("shared contract boundaries", () => {
       status: "awaiting_user",
       decision: stepUp,
       approval_id: "apr_31cd",
+      level: "zero_trust",
+      expires_at: "2026-10-13T06:25:05Z",
       poll_after: 3,
     };
     expect(
@@ -425,12 +457,14 @@ describe("shared contract boundaries", () => {
     expect(
       PaymentSubmissionResponseSchema.safeParse({
         ...pending,
+        level: "everyday",
         approval_level: "everyday",
       }).success,
     ).toBe(true);
     expect(
       PaymentSubmissionResponseSchema.safeParse({
         ...pending,
+        level: "everyday",
         approval_level: "everyday",
         request_number: "001234",
       }).success,
@@ -497,7 +531,10 @@ describe("shared contract boundaries", () => {
   it("round trips a signed payment request URI and validates decoded JSON", () => {
     const signed = {
       ...paymentRequest,
-      line_items: [{ ...paymentRequest.line_items[0], name: "索尼耳机" }],
+      line_items: [
+        { ...paymentRequest.line_items[0], name: "索尼耳机" },
+        paymentRequest.line_items[1],
+      ],
     };
     const uri = encodePaymentRequestUri(signed);
     expect(uri).toMatch(/^ecny:\/\/pay\?d=[A-Za-z0-9_-]+$/);

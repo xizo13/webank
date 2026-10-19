@@ -5,6 +5,10 @@ import type {
   CredentialStore,
   Credentials,
 } from "../agents/connector-mcp/src/storage.js";
+import {
+  demoVariantBySku,
+  ShopCheckoutRequestSchema,
+} from "../packages/contracts/src/index.js";
 
 const gateway = "http://127.0.0.1:3002";
 const shop = "http://127.0.0.1:3001";
@@ -71,8 +75,19 @@ async function shopPost(operation: string, body: Record<string, unknown> = {}) {
 }
 
 async function checkout(sku: string) {
-  await shopPost("add_to_cart", { sku, qty: 1, options: {} });
-  return shopPost("checkout", { shipping_profile: "default" }) as Promise<{
+  const variant = demoVariantBySku(sku);
+  assert.ok(variant, `Unknown demo variant: ${sku}`);
+  await shopPost("add_to_cart", { sku, qty: 1, options: variant.options });
+  const checkoutRequest = ShopCheckoutRequestSchema.parse({
+    shipping_address: {
+      name: "Lin Demo",
+      phone: "13800138000",
+      address_line: "88 Demo Road",
+      city: "Shenzhen",
+      postcode: "518000",
+    },
+  });
+  return shopPost("checkout", checkoutRequest) as Promise<{
     order_id: string;
     payment_request: string;
   }>;
@@ -116,6 +131,8 @@ async function approveCard(
 async function mandate(cookie: string, amount: number, categories: string[]) {
   const proposed = await connector.createMandate({
     description: "Local CLI checkout under the approved cap",
+    user_text: "Local CLI checkout under the approved cap",
+    intent_level: "open",
     constraints: [
       { type: "amount_range", max: { amount, currency: "CNY" } },
       { type: "categories", allowed: categories },
@@ -130,7 +147,7 @@ async function mandate(cookie: string, amount: number, categories: string[]) {
   });
   assert.equal(proposed.status, "pending_user");
   const card = await pendingCard(cookie, proposed.mandate_id);
-  const approved = await approveCard(cookie, card);
+  const approved = await approveCard(cookie, card, proposed.request_number);
   assert.equal(approved.status, 200, JSON.stringify(approved.data));
   assert.equal(
     (approved.data as { mandate: { approved_by: string } }).mandate.approved_by,
@@ -194,6 +211,12 @@ async function main() {
       rationale: "CLI demo selected the signed shop order",
     });
     assert.equal(payment.status, "awaiting_user", JSON.stringify(payment));
+    if (
+      !payment.payment_id ||
+      !("request_number" in payment) ||
+      typeof payment.request_number !== "string"
+    )
+      throw new Error("Expected a numbered pending payment, not a mandate");
     assert.match(payment.request_number, /^\d{6}$/);
     const paymentCard = await pendingCard(cookie, payment.payment_id);
     const decided = await approveCard(
@@ -280,7 +303,7 @@ async function main() {
   );
   console.log("tampering: merchant signature rejected, no shop fulfillment");
 
-  const decoyMandate = await mandate(cookie, 10_000, ["gift_cards"]);
+  const decoyMandate = await mandate(cookie, 10_000, ["electronics"]);
   const decoy = await checkout("REWARD-GIFT-500");
   const deniedDecoy = await connector.requestPayment({
     mandate_id: decoyMandate,
@@ -297,14 +320,18 @@ async function main() {
     cookie,
   );
   assert.equal(frozen.status, 200);
-  await assert.rejects(() =>
-    connector.createMandate({
-      description: "Should be blocked after freeze",
-      constraints: [
-        { type: "budget", max: { amount: 1000, currency: "CNY" } },
-        { type: "recurrence", frequency: "NONE", max_occurrences: 1 },
-      ],
-    }),
+  await assert.rejects(
+    () =>
+      connector.createMandate({
+        description: "Should be blocked after freeze",
+        user_text: "Should be blocked after freeze",
+        intent_level: "open",
+        constraints: [
+          { type: "budget", max: { amount: 1000, currency: "CNY" } },
+          { type: "recurrence", frequency: "NONE", max_occurrences: 1 },
+        ],
+      }),
+    { code: "agent_frozen" },
   );
   console.log("freeze: app froze agent, signed connector request rejected");
 }

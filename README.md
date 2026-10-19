@@ -8,15 +8,16 @@ All merchants and currency in this repository are simulated, and no real funds m
 
 | Area | Current behavior |
 | --- | --- |
-| Expo app | In-memory Agent Wallet walkthrough by default; explicit loopback mode can read Gateway state and submit a visibly simulated local approval. |
+| Expo app | Browser walkthrough by default; explicit loopback web mode reads simulated balances and Gateway state and submits visibly simulated local approvals; an iOS development build has not been verified. |
 | Shops | Local Next.js storefront and Shop MCP tools with mock products, carts, orders, and Ed25519-signed payment requests. |
-| Connector | Five stdio MCP tools with device-code pairing, local P-256 key, scoped tokens, and signed agent requests; tested against a contract-shaped HTTP stub. |
+| Connector | Nine stdio MCP tools with device-code pairing, user-intent mandate proposal before shopping, local P-256 key, scoped tokens, and signed agent requests; tested through MCP and Gateway HTTP. |
 | Gateway | Fastify payment and pairing logic with scoped agent authentication, replay protection, policy and mandate checks, optional Guardian verdict, receipts, audit records, and an opt-in loopback FISCO composition. |
 | Chain | Five Solidity demo contracts and a viem adapter tested against a local non-SM FISCO BCOS v3.17.1 chain. |
 | Treasurer | Separate in-memory proposal, funding, and monitor simulation; it is not connected to live bank accounts or chain settlement. |
 
 The CLI integration driver has exercised shop checkout, the actual connector client, Gateway checks, simulated app approval and reservation, local FISCO settlement, shop confirmation, and app payment detail in one path.
-This is not a live Claude session or a bank-verifiable phone approval.
+An owner browser session has also completed a fresh agent pairing with an audit anchor on the local chain.
+The completed payment path was a CLI run, not a live Claude shopping session or a bank-verifiable phone approval.
 The separate limited Gateway fixture supports read, reject, and freeze demonstrations but cannot approve a card or move money.
 
 ## Requirements and checks
@@ -40,6 +41,9 @@ With the pinned dependencies and local FISCO runtime already present, `./scripts
 `./scripts/local-demo-down.sh` stops only the processes recorded by the operator.
 The launcher does not install dependencies or open a browser.
 The web approval is explicitly simulated, while the contract deployment and test-token payment use real transactions on the local permissioned chain.
+The loopback Gateway keeps its private session, grants, mandates, payments, and receipt identity across an ordinary restart.
+A fresh native deployment mints 866,000 fen to the simulated main account and begins with zero Agent Wallet balance, so the owner must fund the wallet in the app before creating a spending mandate.
+The [operator guide](scripts/local-demo-README.md) covers reset preflight, private archives, and recovery after a failed fresh start.
 
 The individual components can also be explored separately.
 Start the Expo web preview for the in-memory app walkthrough:
@@ -67,5 +71,7 @@ The chain is optional for the default app and shop demonstrations; see the [chai
 The [architecture](docs/architecture.md) names each implemented interface and the adapters still supplied by test fixtures.
 The connector stores a software private key in a local file, so an AI with the same user's filesystem access can read it.
 The app has no production Secure Enclave action signer, and a successful local Face ID prompt is not a bank-verifiable payment approval.
-Gateway state is in memory, and the local FISCO token is not e-CNY.
+The browser demo has been exercised, but the iOS app has not been built and tested on an iPhone for this release.
+The limited Gateway fixture keeps state in memory; the opt-in loopback FISCO Gateway persists private local state but does not support replicas.
+The local FISCO token is not e-CNY.
 Do not use this prototype for real credentials, customer data, or payments.

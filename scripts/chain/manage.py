@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import platform
@@ -28,6 +29,8 @@ RUNTIME = CHAIN_DIR / "runtime"
 NODES = RUNTIME / "nodes" / "127.0.0.1"
 ONCHAIN = ROOT / "onchain"
 ADDRESSES = CHAIN_DIR / "addresses.json"
+PENDING_FRESH = RUNTIME / "fresh-deployment-pending.json"
+FRESH_RESET = ROOT / "scripts/local-demo-runtime/fresh-reset.json"
 PIDS = RUNTIME / "pids.json"
 RPC_URL = "http://127.0.0.1:8545"
 VERSION = "v3.17.1"
@@ -379,19 +382,78 @@ def deploy_and_seed(bank_key: str, gateway_address: str, merchants: Path | None)
     env = {**os.environ, "FISCO_BANK_PRIVATE_KEY": bank_key, "FISCO_GATEWAY_ADDRESS": gateway_address,
            "FISCO_DEPLOY_OUTPUT": str(ADDRESSES), "FISCO_RPC_URL": RPC_URL}
     fingerprint = deployment_fingerprint()
-    deploy = True
+    deploy = not ADDRESSES.is_file()
+    fresh_journal = None
+    if FRESH_RESET.is_file():
+        if FRESH_RESET.stat().st_mode & 0o077:
+            fail("Fresh reset journal has unsafe permissions")
+        fresh_journal = json.loads(FRESH_RESET.read_text())
+        if (fresh_journal.get("version") != 1 or fresh_journal.get("phase") != "archived"
+                or fresh_journal.get("sourceFingerprint") != fingerprint):
+            fail("Fresh reset journal is incompatible with deployment source")
+    if PENDING_FRESH.exists() and not fresh_journal:
+        fail("Pending fresh deployment exists without a reset journal; inspect before starting")
     if ADDRESSES.is_file():
         current = json.loads(ADDRESSES.read_text())
         address_fields = ("ecnySim", "merchantRegistry", "licenceRegistry", "auditAnchor", "agentWallet")
-        if (current.get("chainId") == 20200
+        if not (current.get("chainId") == 20200
                 and current.get("gateway", "").lower() == gateway_address.lower()
                 and current.get("deploymentFingerprint") == fingerprint
                 and all(isinstance(current.get(field), str) for field in address_fields)):
-            deploy = any(
-                rpc("eth_getCode", [current[field], "latest"]) in (None, "0x")
-                for field in address_fields
-            )
-    if deploy:
+            fail("Existing deployment differs from source or signer; refusing automatic redeploy. Stage and explicitly migrate while preserving chain history and Gateway state.")
+        if any(rpc("eth_getCode", [current[field], "latest"]) in (None, "0x") for field in address_fields):
+            fail("Existing deployment has missing contract code; refusing automatic redeploy.")
+    if deploy and fresh_journal:
+        if not PENDING_FRESH.is_file():
+            env["FISCO_DEPLOY_OUTPUT"] = str(PENDING_FRESH)
+            say("Deploying five fresh funded demo contracts with the bank signer")
+            subprocess.run(["corepack", "pnpm", "--filter", "@webank/onchain", "run", "deploy"], cwd=ROOT, env=env, check=True)
+        if PENDING_FRESH.stat().st_mode & 0o077:
+            fail("Pending fresh deployment has unsafe permissions")
+        pending = json.loads(PENDING_FRESH.read_text())
+        if not isinstance(pending, dict) or pending.get("deploymentFingerprint") is not None:
+            fail("Pending fresh deployment manifest is invalid")
+        bank_address = subprocess.check_output(
+            ["node", "--input-type=module", "-e", "import { privateKeyToAccount } from 'viem/accounts'; console.log(privateKeyToAccount(process.env.KEY).address)"],
+            cwd=ONCHAIN,
+            env={**os.environ, "KEY": bank_key},
+            text=True,
+        ).strip()
+        if str(pending.get("bank", "")).lower() != bank_address.lower() or str(pending.get("gateway", "")).lower() != gateway_address.lower():
+            fail("Pending fresh deployment signer differs from current signer")
+        if pending.get("agentWallet") == fresh_journal.get("priorAgentWallet"):
+            fail("Pending fresh deployment reused the old wallet")
+        pending["deploymentFingerprint"] = fingerprint
+        spec = importlib.util.spec_from_file_location("local_demo_proof", ROOT / "scripts/local-demo.py")
+        if spec is None or spec.loader is None:
+            fail("Fresh deployment verifier could not be loaded")
+        verifier = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(verifier)
+        if (pending.get("migration") is not None or not isinstance(pending.get("txHashes"), dict)
+                or set(pending["txHashes"]) != verifier.NATIVE_FUNDED_TXS):
+            fail("Pending fresh deployment lacks native funded transaction evidence")
+        verifier.verify_deployment_funding(pending)
+        temporary = ADDRESSES.with_suffix(".json.tmp")
+        descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(descriptor, "w") as output:
+            json.dump(pending, output, indent=2)
+            output.write("\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(ADDRESSES)
+        directory = os.open(ADDRESSES.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        PENDING_FRESH.unlink()
+        directory = os.open(PENDING_FRESH.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        say(f"Verified and activated fresh funded contracts at {ADDRESSES}")
+    elif deploy:
         say("Deploying five demo contracts with the bank signer")
         subprocess.run(["corepack", "pnpm", "--filter", "@webank/onchain", "run", "deploy"], cwd=ROOT, env=env, check=True)
         deployed = json.loads(ADDRESSES.read_text())
@@ -402,6 +464,17 @@ def deploy_and_seed(bank_key: str, gateway_address: str, merchants: Path | None)
         temporary.replace(ADDRESSES)
     else:
         say(f"Using deployed contracts from {ADDRESSES}")
+        if PENDING_FRESH.is_file() and fresh_journal:
+            pending = json.loads(PENDING_FRESH.read_text())
+            pending["deploymentFingerprint"] = fingerprint
+            if pending != json.loads(ADDRESSES.read_text()):
+                fail("Pending fresh deployment conflicts with active addresses")
+            PENDING_FRESH.unlink()
+            directory = os.open(PENDING_FRESH.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
     ADDRESSES.chmod(0o600)
     if merchants:
         config = json.loads(ADDRESSES.read_text())
@@ -449,16 +522,46 @@ def up(args: argparse.Namespace) -> None:
     say("The bank signer stays in a separate ignored file")
 
 
+def stage_funding(args: argparse.Namespace) -> None:
+    if not ADDRESSES.is_file():
+        fail("No active deployment to stage from")
+    output = RUNTIME / "funding-stage.json"
+    if output.exists():
+        fail(f"Staged deployment already exists: {output}; review or archive it before staging again")
+    if not (RUNTIME / "bank.env").is_file():
+        fail("Existing bank signer is missing; restore it before staging")
+    if int(rpc("eth_chainId", []), 16) != 20200:
+        fail("Local FISCO Web3 RPC has the wrong chain ID")
+    ensure_dependencies()
+    bank_key, _gateway_key, _gateway_address = read_keys()
+    env = {**os.environ,
+           "FISCO_BANK_PRIVATE_KEY": bank_key,
+           "FISCO_PRIOR_ADDRESSES": str(ADDRESSES),
+           "FISCO_STAGED_OUTPUT": str(output),
+           "FISCO_RPC_URL": RPC_URL}
+    if args.prior_receipt_hash:
+        if not re.fullmatch(r"0x[0-9a-fA-F]{64}", args.prior_receipt_hash):
+            fail("Prior receipt hash must be 32-byte hex")
+        env["FISCO_PRIOR_RECEIPT_HASH"] = args.prior_receipt_hash
+    subprocess.run(["corepack", "pnpm", "--filter", "@webank/onchain", "run", "stage:funding"],
+                   cwd=ROOT, env=env, check=True)
+    say("Active addresses and Gateway state were not changed")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     up_parser = commands.add_parser("up", help="Start or resume the local FISCO chain and deploy contracts")
     up_parser.add_argument("--merchants-file", help="Shop /api/merchants JSON saved locally")
     up_parser.add_argument("--merchants-url", help="Local shop /api/merchants URL")
+    stage_parser = commands.add_parser("stage-funding", help="Stage a separate funded-main deployment without cutover")
+    stage_parser.add_argument("--prior-receipt-hash", help="Verify an old wallet transaction before staging")
     commands.add_parser("down", help="Stop only the nodes started by this script")
     args = parser.parse_args()
     if args.command == "up":
         up(args)
+    elif args.command == "stage-funding":
+        stage_funding(args)
     else:
         stop_nodes()
 

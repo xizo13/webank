@@ -41,12 +41,13 @@ export default async function ProductPage({
           <p className="detail-description">{product.description}</p>
           {(product.shop === "malicious" || product.shop === "decoy") && (
             <div className="scenario-note">
-              Scenario content: this seller text is untrusted. The wallet must
-              evaluate the actual merchant and item before any payment.
+              Scenario content: this seller text is untrusted. Review the seller
+              and item shown in the signed payment request.
             </div>
           )}
           <ProductActions
-            sku={product.sku}
+            initialSku={product.sku}
+            variants={product.variants}
             sizes={product.sizes}
             colours={product.colours}
           />
@@ -54,10 +55,6 @@ export default async function ProductPage({
             <div>
               <span>Merchant ID</span>
               <strong>{shops[product.shop].merchantId}</strong>
-            </div>
-            <div>
-              <span>Product code</span>
-              <strong>{product.gtin}</strong>
             </div>
             <div>
               <span>Condition</span>

@@ -1,7 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { presentApproval } from "./approvalPresentation";
+import {
+  pairingCountdown,
+  presentApproval,
+  withPairingConsent,
+} from "./approvalPresentation";
 import type { Approval } from "./flow";
-import type { LivePayment } from "./gateway";
+import type { LivePayment, PairingConsent } from "./gateway";
 
 const base: Approval = {
   approval_id: "apr_example",
@@ -62,5 +66,50 @@ describe("approval presentation", () => {
     expect(view.lines).toEqual([
       "This request needs your review before it can continue.",
     ]);
+  });
+
+  it("uses the current pairing consent hash over a stale polled approval", () => {
+    const selected: PairingConsent = {
+      approval: {
+        ...base,
+        kind: "pairing",
+        subject_id: "ABCD-EFGH",
+        payload_hash: `sha256:${"b".repeat(64)}`,
+        lines: ["New independent agent identity"],
+      },
+      pairing: {
+        user_code: "ABCD-EFGH",
+        client_name: "Claude personal shopper",
+        provider: "Anthropic",
+        requested_scopes: ["wallet:pay"],
+        status: "pending",
+        expires_at: "2026-10-14T12:10:00Z",
+        request_number_expires_at: "2026-10-14T12:03:00Z",
+      },
+      public_key: "test-key",
+    };
+    const shown = withPairingConsent([base], selected);
+    expect(shown).toHaveLength(1);
+    expect(shown[0]?.payload_hash).toBe(selected.approval.payload_hash);
+    expect(shown[0]?.lines).toEqual(["New independent agent identity"]);
+  });
+
+  it("tracks the shorter request-number deadline separately from the pairing code", () => {
+    const pairing = {
+      expires_at: "2026-10-14T12:10:00Z",
+      request_number_expires_at: "2026-10-14T12:03:00Z",
+    };
+    expect(
+      pairingCountdown(pairing, Date.parse("2026-10-14T12:00:00Z")),
+    ).toEqual({
+      code: 600,
+      number: 180,
+    });
+    expect(
+      pairingCountdown(pairing, Date.parse("2026-10-14T12:03:01Z")),
+    ).toEqual({
+      code: 419,
+      number: 0,
+    });
   });
 });

@@ -1,5 +1,6 @@
 "use client";
 
+import type { ShippingAddress } from "@webank/contracts";
 import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
@@ -7,6 +8,14 @@ import { formatCny } from "../../lib/catalog";
 import type { Cart } from "../../lib/store";
 
 export default function CartPage() {
+  const [address, setAddress] = useState<ShippingAddress>({
+    name: "Lin Demo",
+    phone: "13800138000",
+    address_line: "88 Demo Road",
+    city: "Shenzhen",
+    postcode: "518000",
+  });
+  const [addressConfirmed, setAddressConfirmed] = useState(false);
   const router = useRouter();
   const [cart, setCart] = useState<Cart | null>(null);
   const [busy, setBusy] = useState(false);
@@ -31,7 +40,7 @@ export default function CartPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           operation,
-          ...(operation === "checkout" ? { shipping_profile: "default" } : {}),
+          ...(operation === "checkout" ? { shipping_address: address } : {}),
         }),
       });
       const result = await response.json();
@@ -51,8 +60,8 @@ export default function CartPage() {
       <div className="eyebrow dark">YOUR DEMO BAG</div>
       <h1 className="page-title">Your cart.</h1>
       <p className="page-intro">
-        Checkout creates a signed request. It does not move simulated money
-        until WeBank approves it.
+        Checkout creates a merchant-signed payment request. No simulated funds
+        move at checkout.
       </p>
       {!cart ? (
         <p>Loading cart...</p>
@@ -93,9 +102,58 @@ export default function CartPage() {
             ))}
           </div>
           <div className="cart-total">
-            <span>Total</span>
+            <span>Items</span>
             <strong>{formatCny(cart.total.amount)}</strong>
           </div>
+          <section className="shipping-form">
+            <div className="eyebrow dark">SHIPPING ADDRESS</div>
+            <h2>Confirm where this order goes.</h2>
+            <p>
+              Sample address for this demo. Check or replace it before the
+              payment request is signed.
+            </p>
+            <div className="shipping-fields">
+              {(
+                [
+                  ["name", "Recipient"],
+                  ["phone", "Phone"],
+                  ["address_line", "Street address"],
+                  ["city", "City"],
+                  ["postcode", "Postcode"],
+                ] as const
+              ).map(([field, label]) => (
+                <label key={field}>
+                  {label}
+                  <input
+                    value={address[field]}
+                    onChange={(event) => {
+                      setAddress((current) => ({
+                        ...current,
+                        [field]: event.target.value,
+                      }));
+                      setAddressConfirmed(false);
+                    }}
+                    required
+                  />
+                </label>
+              ))}
+            </div>
+            <label className="shipping-confirm">
+              <input
+                type="checkbox"
+                checked={addressConfirmed}
+                onChange={(event) => setAddressConfirmed(event.target.checked)}
+              />
+              I confirm this shipping address.
+            </label>
+            <p>
+              Standard delivery:{" "}
+              {formatCny(
+                cart.shop === "shopA" || cart.shop === "shopB" ? 500 : 0,
+              )}
+              . The signed payment total includes delivery.
+            </p>
+          </section>
           <div className="cart-actions">
             <button
               type="button"
@@ -109,7 +167,11 @@ export default function CartPage() {
               type="button"
               className="button primary"
               onClick={() => void act("checkout")}
-              disabled={busy}
+              disabled={
+                busy ||
+                !addressConfirmed ||
+                Object.values(address).some((value) => !value.trim())
+              }
             >
               {busy ? "Working..." : "Continue to checkout ↗"}
             </button>

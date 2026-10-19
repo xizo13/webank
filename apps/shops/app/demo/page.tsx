@@ -1,11 +1,33 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 
 export default function DemoPage() {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const [scenarios, setScenarios] = useState({ attack: false, drill: false });
+  const [scenariosLoaded, setScenariosLoaded] = useState(false);
+  useEffect(() => {
+    let active = true;
+    void fetch("/api/shop?operation=scenarios")
+      .then((response) => {
+        if (!response.ok) throw new Error("Scenario status unavailable.");
+        return response.json();
+      })
+      .then((data) => {
+        if (active && data.scenarios) {
+          setScenarios(data.scenarios);
+          setScenariosLoaded(true);
+        }
+      })
+      .catch(() => {
+        if (active) setMessage("Scenario status unavailable.");
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
   async function action(
     operation: string,
     values: Record<string, unknown> = {},
@@ -21,12 +43,19 @@ export default function DemoPage() {
       const data = await response.json();
       if (!response.ok)
         throw new Error(data.error?.message || "Demo action failed");
+      if (data.scenarios) {
+        setScenarios(data.scenarios);
+        setScenariosLoaded(true);
+      }
+      if (operation === "reset") setScenarios({ attack: false, drill: false });
       setMessage(
         operation === "set_price"
           ? `Price changed to ¥${(data.product.price / 100).toFixed(2)}.`
           : operation === "advance_clock"
             ? `Demo clock: ${data.now}.`
-            : "Shop demo reset. Merchant signing keys were preserved.",
+            : operation === "set_scenario"
+              ? `${values.scenario === "attack" ? "Attack" : "Fire drill"} ${values.enabled ? "enabled" : "disabled"}.`
+              : "Shop demo reset. Merchant signing keys were preserved.",
       );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Demo action failed");
@@ -47,8 +76,8 @@ export default function DemoPage() {
           <span className="demo-number">01 / AUTONOMOUS PURCHASE</span>
           <h2>Drop the price.</h2>
           <p>
-            Move Nova Quiet 3 below the ¥250 trigger and let the agent complete
-            a standing mandate.
+            Move Nova Quiet 3 below the ¥250 scenario trigger to test the price
+            drop.
           </p>
           <button
             type="button"
@@ -78,26 +107,56 @@ export default function DemoPage() {
           </button>
         </section>
         <section className="demo-card red-card">
-          <span className="demo-number">03 / PROMPT INJECTION</span>
+          <span className="demo-number">03 / DEMO 4 ATTACK</span>
           <h2>Open the trap.</h2>
           <p>
             A merchant listing tells the agent to pay an unrelated service fee.
             Its actual payee remains visible in the signed request.
           </p>
-          <Link className="button primary" href="/p/FLASH-Q3-FEE">
-            View malicious listing ↗
-          </Link>
+          <button
+            type="button"
+            className="button primary"
+            disabled={busy || !scenariosLoaded}
+            onClick={() =>
+              void action("set_scenario", {
+                scenario: "attack",
+                enabled: !scenarios.attack,
+              })
+            }
+          >
+            {scenarios.attack ? "Disable attack" : "Enable attack"}
+          </button>
+          {scenarios.attack ? (
+            <Link className="button primary" href="/p/FLASH-Q3-FEE">
+              View malicious listing ↗
+            </Link>
+          ) : null}
         </section>
         <section className="demo-card purple-card">
-          <span className="demo-number">04 / FIRE DRILL</span>
+          <span className="demo-number">04 / DEMO 5 FIRE DRILL</span>
           <h2>Test the licence.</h2>
           <p>
-            A decoy gift-card merchant is marked as a honeypot in the registry.
-            Payment must be blocked.
+            A decoy gift-card merchant is marked as a honeypot in the registry
+            for the fire-drill scenario.
           </p>
-          <Link className="button primary" href="/p/REWARD-GIFT-500">
-            View decoy listing ↗
-          </Link>
+          <button
+            type="button"
+            className="button primary"
+            disabled={busy || !scenariosLoaded}
+            onClick={() =>
+              void action("set_scenario", {
+                scenario: "drill",
+                enabled: !scenarios.drill,
+              })
+            }
+          >
+            {scenarios.drill ? "Disable fire drill" : "Enable fire drill"}
+          </button>
+          {scenarios.drill ? (
+            <Link className="button primary" href="/p/REWARD-GIFT-500">
+              View decoy listing ↗
+            </Link>
+          ) : null}
         </section>
       </div>
       <div className="demo-reset">

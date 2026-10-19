@@ -1,9 +1,10 @@
 import type { ChainAddresses, FiscoChain } from "@webank/chain";
-import { type Hex, keccak256, stringToHex } from "viem";
+import { type Address, type Hex, keccak256, stringToHex } from "viem";
 import type {
   AuditRecordKind,
   GatewayDependencies,
   Merchant,
+  WalletFundingRail,
 } from "./types.js";
 
 const auditKinds: Record<AuditRecordKind, number> = {
@@ -58,6 +59,7 @@ export function createFiscoGatewayAdapters(input: {
         first_seen: classification.first_seen,
         honeypot: classification.honeypot,
         public_key: record.signingKey,
+        payout: record.payout,
       };
     },
     async executePayment({ paymentId, request, merchant }) {
@@ -106,6 +108,98 @@ export function createFiscoGatewayAdapters(input: {
       )
         throw new Error("FISCO audit event did not match record");
       return hash;
+    },
+  };
+}
+
+/** Read-only Gateway view plus isolated bank-write delegation. */
+export function createFiscoFundingRail(input: {
+  chain: FiscoChain;
+  addresses: ChainAddresses & { bank: Address };
+  bankExecutor: {
+    fund(fundingId: string, amount: bigint): Promise<Hex>;
+    sweep(sweepId: string, amount: bigint): Promise<Hex>;
+    payFromMain(confirmationId: string, amount: bigint): Promise<Hex>;
+  };
+}): WalletFundingRail {
+  const { chain, addresses, bankExecutor } = input;
+  const fundingHash = (id: string) => keccak256(stringToHex(id));
+  const matches = (value: {
+    hash: Hex;
+    blockNumber: bigint;
+    amount: bigint;
+    main: Address;
+    wallet: Address;
+  }) => ({
+    hash: value.hash,
+    blockNumber: value.blockNumber,
+    amount: value.amount,
+    main: value.main,
+    wallet: value.wallet,
+  });
+  return {
+    deployment: {
+      token: addresses.ecnySim,
+      main: addresses.bank,
+      wallet: addresses.agentWallet,
+    },
+    snapshot: () =>
+      chain.getWalletSnapshot(
+        addresses.ecnySim,
+        addresses.bank,
+        addresses.agentWallet,
+      ),
+    fund: (id, amount) => bankExecutor.fund(id, amount),
+    payFromMain: (id, amount) => bankExecutor.payFromMain(id, amount),
+    mainPaymentEvidence: async (hash, payout, amount) => {
+      const evidence = await chain.getTransactionEvidence(hash);
+      if (evidence.status !== "success")
+        throw new Error("Main-account payment reverted");
+      const matches = evidence.transferEvents.filter(
+        (event) =>
+          event.token.toLowerCase() === addresses.ecnySim.toLowerCase() &&
+          event.from.toLowerCase() === addresses.bank.toLowerCase() &&
+          event.to.toLowerCase() === payout.toLowerCase() &&
+          event.amount === amount,
+      );
+      if (matches.length !== 1)
+        throw new Error("Main-account payment evidence did not match");
+      return { hash, blockNumber: evidence.blockNumber };
+    },
+    fundingApplied: (id) =>
+      chain.isFundingApplied(addresses.ecnySim, fundingHash(id)),
+    fundingEvidence: async (hash, id) =>
+      matches(
+        await chain.getFundingEvidence(
+          hash,
+          addresses.ecnySim,
+          fundingHash(id),
+        ),
+      ),
+    findFundingEvidence: async (id, fromBlock) => {
+      const evidence = await chain.findFundingEvidence(
+        addresses.ecnySim,
+        fundingHash(id),
+        fromBlock,
+      );
+      return evidence ? matches(evidence) : undefined;
+    },
+    sweep: (id, amount) => bankExecutor.sweep(id, amount),
+    sweepEvidence: async (hash, id) =>
+      matches(
+        await chain.getSweepEvidence(
+          hash,
+          addresses.agentWallet,
+          fundingHash(id),
+        ),
+      ),
+    findSweepEvidence: async (id, fromBlock) => {
+      const evidence = await chain.findSweepEvidence(
+        addresses.agentWallet,
+        fundingHash(id),
+        fromBlock,
+      );
+      return evidence ? matches(evidence) : undefined;
     },
   };
 }

@@ -8,7 +8,7 @@
   },
   "scripts": {
     "build": "corepack pnpm -r --if-present build",
-    "typecheck": "corepack pnpm -r --if-present typecheck",
+    "typecheck": "corepack pnpm -r --if-present typecheck && tsc --noEmit --target es2022 --module nodenext --moduleResolution nodenext --esModuleInterop --skipLibCheck scripts/local-demo-e2e.mts",
     "test": "vitest run --passWithNoTests",
     "lint": "biome check .",
     "format": "biome format --write .",

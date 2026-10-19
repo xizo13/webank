@@ -68,12 +68,21 @@ const payment: PaymentRequest = {
   amount: { amount: 27900, currency: "CNY" },
   line_items: [
     {
+      type: "product",
       sku: "SONY-XM5-BLK",
       gtin: "4548736132597",
       name: "Sony WH-1000XM5 Black",
       condition: "new",
+      variant: "Black",
+      options: { colour: "Black" },
       qty: 1,
       unit_price: { amount: 27900, currency: "CNY" },
+    },
+    {
+      type: "shipping",
+      name: "Standard delivery",
+      qty: 1,
+      unit_price: { amount: 0, currency: "CNY" },
     },
   ],
   expires_at: "2026-10-16T00:00:00Z",

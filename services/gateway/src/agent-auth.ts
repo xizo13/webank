@@ -32,6 +32,27 @@ export class AgentAuth {
   private readonly refresh = new Map<string, TokenEntry>();
   private readonly nonces = new Map<string, number>();
 
+  snapshot() {
+    return {
+      access: [...this.access],
+      refresh: [...this.refresh],
+      nonces: [...this.nonces],
+    };
+  }
+
+  restore(value: ReturnType<AgentAuth["snapshot"]>): void {
+    for (const [key, entry] of value.access) this.access.set(key, entry);
+    for (const [key, entry] of value.refresh) this.refresh.set(key, entry);
+    for (const [key, until] of value.nonces) this.nonces.set(key, until);
+  }
+
+  accessStatus(token: string | undefined, agentId: string, nowMs: number) {
+    if (!token) return "missing" as const;
+    const entry = this.access.get(hashToken(token));
+    if (!entry || entry.agentId !== agentId) return "missing" as const;
+    return entry.expiresAt <= nowMs ? ("expired" as const) : ("valid" as const);
+  }
+
   issue(agentId: string, nowMs: number) {
     const accessToken = randomBytes(32).toString("base64url");
     const refreshToken = randomBytes(32).toString("base64url");
@@ -51,6 +72,21 @@ export class AgentAuth {
     };
   }
 
+  refreshAgentId(token: string, nowMs: number): string | null {
+    const entry = this.refresh.get(hashToken(token));
+    return entry && entry.expiresAt > nowMs ? entry.agentId : null;
+  }
+
+  hasAccess(
+    token: string | undefined,
+    agentId: string,
+    nowMs: number,
+  ): boolean {
+    if (!token) return false;
+    const entry = this.access.get(hashToken(token));
+    return entry?.agentId === agentId && entry.expiresAt > nowMs;
+  }
+
   rotate(token: string, nowMs: number) {
     const key = hashToken(token);
     const entry = this.refresh.get(key);
@@ -68,21 +104,30 @@ export class AgentAuth {
     }
   }
 
+  revokeAccess(agentId: string): void {
+    for (const [token, entry] of this.access) {
+      if (entry.agentId === agentId) this.access.delete(token);
+    }
+  }
+
   verify(
     request: FastifyRequest,
     rawBody: Uint8Array,
     agents: Map<string, Agent>,
     nowMs: number,
+    keyOnly = false,
   ): AuthResult {
-    const bearer = request.headers.authorization?.match(
-      /^Bearer ([A-Za-z0-9_-]+)$/,
-    );
-    if (!bearer) return { error: "bad_signature" };
-    const token = this.access.get(hashToken(bearer[1] ?? ""));
-    if (!token) return { error: "bad_signature" };
-    if (token.expiresAt <= nowMs) return { error: "token_expired" };
-    const agent = agents.get(token.agentId);
-    if (!agent) return { error: "bad_signature" };
+    let tokenAgentId: string | undefined;
+    if (!keyOnly) {
+      const bearer = request.headers.authorization?.match(
+        /^Bearer ([A-Za-z0-9_-]+)$/,
+      );
+      if (!bearer) return { error: "bad_signature" };
+      const token = this.access.get(hashToken(bearer[1] ?? ""));
+      if (!token) return { error: "bad_signature" };
+      if (token.expiresAt <= nowMs) return { error: "token_expired" };
+      tokenAgentId = token.agentId;
+    }
 
     const signatureInput = request.headers["signature-input"];
     const signatureHeader = request.headers.signature;
@@ -105,6 +150,8 @@ export class AgentAuth {
     const expires = Number(input[3]);
     const nonce = input[4] ?? "";
     const keyId = input[5] ?? "";
+    const agent = agents.get(keyOnly ? keyId : (tokenAgentId ?? ""));
+    if (!agent) return { error: "bad_signature" };
     const nowSeconds = Math.floor(nowMs / 1000);
     if (
       !Number.isSafeInteger(created) ||

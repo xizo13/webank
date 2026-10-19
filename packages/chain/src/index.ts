@@ -12,6 +12,7 @@ import { normalizeChainError } from "./errors.js";
 import {
   AgentWalletAbi,
   AuditAnchorAbi,
+  ECnySimAbi,
   LicenceRegistryAbi,
   MerchantRegistryAbi,
 } from "./generated/abis.js";
@@ -48,6 +49,12 @@ export type TransactionEvidence = {
   transactionIndex: number;
   blockTimestampMs: number;
   blockTimeIso: string;
+  transferEvents: Array<{
+    token: Address;
+    from: Address;
+    to: Address;
+    amount: bigint;
+  }>;
   paidEvents: Array<{
     paymentId: Hex;
     merchantId: Hex;
@@ -60,6 +67,42 @@ export type TransactionEvidence = {
     kind: number;
     atMs: number;
   }>;
+  fundedEvents: Array<{
+    token: Address;
+    fundingId: Hex;
+    main: Address;
+    wallet: Address;
+    amount: bigint;
+  }>;
+  sweptEvents: Array<{
+    wallet: Address;
+    sweepId: Hex;
+    main: Address;
+    amount: bigint;
+  }>;
+};
+
+export type FundingEvidence = TransactionEvidence["fundedEvents"][number] & {
+  hash: Hex;
+  blockNumber: bigint;
+};
+
+export type WalletSnapshot = {
+  mainBalance: bigint;
+  walletBalance: bigint;
+  walletFrozen: boolean;
+  blockNumber: bigint;
+  observedAt: string;
+};
+
+export type SweepEvidence = {
+  hash: Hex;
+  blockNumber: bigint;
+  wallet: Address;
+  sweepId: Hex;
+  main: Address;
+  token: Address;
+  amount: bigint;
 };
 
 export type MerchantRecord = {
@@ -106,6 +149,36 @@ export type FiscoChain = {
   ): Promise<Hex>;
   getMerchant(address: Address, merchantId: Hex): Promise<MerchantRecord>;
   getLicence(address: Address, agentId: Hex): Promise<LicenceRecord>;
+  getTokenBalance(token: Address, account: Address): Promise<bigint>;
+  getWalletSnapshot(
+    token: Address,
+    main: Address,
+    wallet: Address,
+  ): Promise<WalletSnapshot>;
+  isFundingApplied(token: Address, fundingId: Hex): Promise<boolean>;
+  fundAgentWallet(token: Address, fundingId: Hex, amount: bigint): Promise<Hex>;
+  transferMain(token: Address, payout: Address, amount: bigint): Promise<Hex>;
+  sweepToMain(wallet: Address, sweepId: Hex, amount: bigint): Promise<Hex>;
+  getFundingEvidence(
+    hash: Hex,
+    token: Address,
+    fundingId: Hex,
+  ): Promise<FundingEvidence>;
+  findFundingEvidence(
+    token: Address,
+    fundingId: Hex,
+    fromBlock: bigint,
+  ): Promise<FundingEvidence | undefined>;
+  getSweepEvidence(
+    hash: Hex,
+    wallet: Address,
+    sweepId: Hex,
+  ): Promise<SweepEvidence>;
+  findSweepEvidence(
+    wallet: Address,
+    sweepId: Hex,
+    fromBlock: bigint,
+  ): Promise<SweepEvidence | undefined>;
   getTransactionEvidence(hash: Hex): Promise<TransactionEvidence>;
 };
 
@@ -158,6 +231,91 @@ export async function connectFisco(
     if (!walletClient || !account)
       throw new Error("A private key is required for chain writes");
     return { walletClient, account };
+  }
+
+  async function sweepEvidence(
+    hash: Hex,
+    wallet: Address,
+    sweepId: Hex,
+  ): Promise<SweepEvidence> {
+    const receipt = await publicClient.getTransactionReceipt({ hash });
+    if (receipt.status !== "success")
+      throw new Error("Sweep transaction reverted");
+    const events = parseEventLogs({
+      abi: AgentWalletAbi,
+      logs: receipt.logs,
+      eventName: "Swept",
+      strict: false,
+    }).filter(
+      (event) =>
+        event.address.toLowerCase() === wallet.toLowerCase() &&
+        event.args.sweepId?.toLowerCase() === sweepId.toLowerCase(),
+    );
+    const event = events[0];
+    if (events.length !== 1 || !event)
+      throw new Error("Expected exactly one matching Swept event");
+    const [token, bank] = await Promise.all([
+      publicClient.readContract({
+        address: wallet,
+        abi: AgentWalletAbi,
+        functionName: "token",
+        blockNumber: receipt.blockNumber,
+      }),
+      publicClient.readContract({
+        address: wallet,
+        abi: AgentWalletAbi,
+        functionName: "bank",
+        blockNumber: receipt.blockNumber,
+      }),
+    ]);
+    const main = requiredEventArg(event.args.main, "main");
+    const amount = requiredEventArg(event.args.amount, "amount");
+    if (main.toLowerCase() !== bank.toLowerCase())
+      throw new Error("Sweep destination differs from fixed bank main account");
+    const transfers = parseEventLogs({
+      abi: ECnySimAbi,
+      logs: receipt.logs,
+      eventName: "Transfer",
+      strict: false,
+    }).filter(
+      (log) =>
+        log.address.toLowerCase() === token.toLowerCase() &&
+        log.args.from?.toLowerCase() === wallet.toLowerCase() &&
+        log.args.to?.toLowerCase() === bank.toLowerCase() &&
+        log.args.amount === amount,
+    );
+    if (transfers.length !== 1)
+      throw new Error("Sweep has no matching token transfer to main");
+    return {
+      hash,
+      blockNumber: receipt.blockNumber,
+      wallet: event.address,
+      sweepId: requiredEventArg(event.args.sweepId, "sweepId"),
+      main,
+      token,
+      amount,
+    };
+  }
+
+  async function findUniqueEventHash(
+    fromBlock: bigint,
+    readRange: (
+      from: bigint,
+      to: bigint,
+    ) => Promise<readonly { transactionHash: Hex }[]>,
+  ): Promise<Hex | undefined> {
+    if (fromBlock < 0n) throw new RangeError("fromBlock must be nonnegative");
+    const tip = await publicClient.getBlockNumber();
+    let found: Hex | undefined;
+    // FISCO v3.17.1 silently stops after ten blocks even when toBlock is later.
+    for (let start = fromBlock; start <= tip; start += 10n) {
+      const end = start + 9n < tip ? start + 9n : tip;
+      for (const log of await readRange(start, end)) {
+        if (found) throw new Error("Multiple events for one operation ID");
+        found = log.transactionHash;
+      }
+    }
+    return found;
   }
 
   return {
@@ -285,6 +443,240 @@ export async function connectFisco(
         args: [agentId],
       });
     },
+    async getTokenBalance(token: Address, owner: Address) {
+      return publicClient.readContract({
+        address: token,
+        abi: ECnySimAbi,
+        functionName: "balanceOf",
+        args: [owner],
+      });
+    },
+    async getWalletSnapshot(token: Address, main: Address, wallet: Address) {
+      const blockNumber = await publicClient.getBlockNumber();
+      const [
+        mainBalance,
+        walletBalance,
+        walletFrozen,
+        walletToken,
+        walletBank,
+      ] = await Promise.all([
+        publicClient.readContract({
+          address: token,
+          abi: ECnySimAbi,
+          functionName: "balanceOf",
+          args: [main],
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: token,
+          abi: ECnySimAbi,
+          functionName: "balanceOf",
+          args: [wallet],
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: wallet,
+          abi: AgentWalletAbi,
+          functionName: "frozen",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: wallet,
+          abi: AgentWalletAbi,
+          functionName: "token",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address: wallet,
+          abi: AgentWalletAbi,
+          functionName: "bank",
+          blockNumber,
+        }),
+      ]);
+      if (walletToken.toLowerCase() !== token.toLowerCase())
+        throw new Error("Wallet token differs from snapshot token");
+      if (walletBank.toLowerCase() !== main.toLowerCase())
+        throw new Error("Wallet bank differs from snapshot main account");
+      return {
+        mainBalance,
+        walletBalance,
+        walletFrozen,
+        blockNumber,
+        observedAt: new Date().toISOString(),
+      };
+    },
+    async isFundingApplied(token: Address, fundingId: Hex) {
+      return publicClient.readContract({
+        address: token,
+        abi: ECnySimAbi,
+        functionName: "funded",
+        args: [fundingId],
+      });
+    },
+    async fundAgentWallet(token: Address, fundingId: Hex, amount: bigint) {
+      const { walletClient, account } = signer();
+      try {
+        const { request } = await publicClient.simulateContract({
+          address: token,
+          abi: ECnySimAbi,
+          functionName: "fundAgentWallet",
+          args: [fundingId, amount],
+          account,
+        });
+        return send(
+          await walletClient.writeContract({ ...request, account, chain }),
+        );
+      } catch (error) {
+        throw normalizeChainError(error, ECnySimAbi);
+      }
+    },
+    async transferMain(token: Address, payout: Address, amount: bigint) {
+      const { walletClient, account } = signer();
+      try {
+        const { request } = await publicClient.simulateContract({
+          address: token,
+          abi: ECnySimAbi,
+          functionName: "transfer",
+          args: [payout, amount],
+          account,
+        });
+        return send(
+          await walletClient.writeContract({ ...request, account, chain }),
+        );
+      } catch (error) {
+        throw normalizeChainError(error, ECnySimAbi);
+      }
+    },
+    async sweepToMain(wallet: Address, sweepId: Hex, amount: bigint) {
+      const { walletClient, account } = signer();
+      try {
+        const { request } = await publicClient.simulateContract({
+          address: wallet,
+          abi: AgentWalletAbi,
+          functionName: "sweepToMain",
+          args: [sweepId, amount],
+          account,
+        });
+        return send(
+          await walletClient.writeContract({ ...request, account, chain }),
+        );
+      } catch (error) {
+        throw normalizeChainError(error, AgentWalletAbi);
+      }
+    },
+    async getFundingEvidence(hash: Hex, token: Address, fundingId: Hex) {
+      const receipt = await publicClient.getTransactionReceipt({ hash });
+      if (receipt.status !== "success")
+        throw new Error("Funding transaction reverted");
+      const matches = parseEventLogs({
+        abi: ECnySimAbi,
+        logs: receipt.logs,
+        eventName: "Funded",
+        strict: false,
+      }).filter(
+        (event) =>
+          event.address.toLowerCase() === token.toLowerCase() &&
+          event.args.fundingId?.toLowerCase() === fundingId.toLowerCase(),
+      );
+      if (matches.length !== 1)
+        throw new Error("Expected exactly one matching Funded event");
+      const event = matches[0];
+      if (!event) throw new Error("Funded event missing");
+      return {
+        hash,
+        blockNumber: receipt.blockNumber,
+        token: event.address,
+        fundingId: requiredEventArg(event.args.fundingId, "fundingId"),
+        main: requiredEventArg(event.args.main, "main"),
+        wallet: requiredEventArg(event.args.wallet, "wallet"),
+        amount: requiredEventArg(event.args.amount, "amount"),
+      };
+    },
+    async findFundingEvidence(
+      token: Address,
+      fundingId: Hex,
+      fromBlock: bigint,
+    ) {
+      const hash = await findUniqueEventHash(fromBlock, (start, end) =>
+        publicClient.getContractEvents({
+          address: token,
+          abi: ECnySimAbi,
+          eventName: "Funded",
+          args: { fundingId },
+          fromBlock: start,
+          toBlock: end,
+        }),
+      );
+      if (!hash) {
+        if (
+          await publicClient.readContract({
+            address: token,
+            abi: ECnySimAbi,
+            functionName: "funded",
+            args: [fundingId],
+          })
+        )
+          throw new Error(
+            "Funding ID is applied but no matching event was found from starting block",
+          );
+        return undefined;
+      }
+      const receipt = await publicClient.getTransactionReceipt({ hash });
+      if (receipt.status !== "success")
+        throw new Error("Funding event has reverted receipt");
+      const matches = parseEventLogs({
+        abi: ECnySimAbi,
+        logs: receipt.logs,
+        eventName: "Funded",
+        strict: false,
+      }).filter(
+        (event) =>
+          event.address.toLowerCase() === token.toLowerCase() &&
+          event.args.fundingId?.toLowerCase() === fundingId.toLowerCase(),
+      );
+      const event = matches[0];
+      if (matches.length !== 1 || !event)
+        throw new Error("Funding log does not match receipt");
+      return {
+        hash,
+        blockNumber: receipt.blockNumber,
+        token: event.address,
+        fundingId: requiredEventArg(event.args.fundingId, "fundingId"),
+        main: requiredEventArg(event.args.main, "main"),
+        wallet: requiredEventArg(event.args.wallet, "wallet"),
+        amount: requiredEventArg(event.args.amount, "amount"),
+      };
+    },
+    async getSweepEvidence(hash: Hex, wallet: Address, sweepId: Hex) {
+      return sweepEvidence(hash, wallet, sweepId);
+    },
+    async findSweepEvidence(wallet: Address, sweepId: Hex, fromBlock: bigint) {
+      const hash = await findUniqueEventHash(fromBlock, (start, end) =>
+        publicClient.getContractEvents({
+          address: wallet,
+          abi: AgentWalletAbi,
+          eventName: "Swept",
+          args: { sweepId },
+          fromBlock: start,
+          toBlock: end,
+        }),
+      );
+      if (!hash) {
+        if (
+          await publicClient.readContract({
+            address: wallet,
+            abi: AgentWalletAbi,
+            functionName: "swept",
+            args: [sweepId],
+          })
+        )
+          throw new Error(
+            "Sweep ID is applied but no matching event was found from starting block",
+          );
+        return undefined;
+      }
+      return sweepEvidence(hash, wallet, sweepId);
+    },
     async getTransactionEvidence(hash: Hex): Promise<TransactionEvidence> {
       const receipt = await publicClient.getTransactionReceipt({ hash });
       const block = await publicClient.getBlock({
@@ -303,6 +695,24 @@ export async function connectFisco(
         eventName: "Anchored",
         strict: false,
       });
+      const fundedEvents = parseEventLogs({
+        abi: ECnySimAbi,
+        logs: receipt.logs,
+        eventName: "Funded",
+        strict: false,
+      });
+      const sweptEvents = parseEventLogs({
+        abi: AgentWalletAbi,
+        logs: receipt.logs,
+        eventName: "Swept",
+        strict: false,
+      });
+      const transferEvents = parseEventLogs({
+        abi: ECnySimAbi,
+        logs: receipt.logs,
+        eventName: "Transfer",
+        strict: false,
+      });
       return {
         hash,
         status: receipt.status,
@@ -310,6 +720,12 @@ export async function connectFisco(
         transactionIndex: receipt.transactionIndex,
         blockTimestampMs,
         blockTimeIso: new Date(blockTimestampMs).toISOString(),
+        transferEvents: transferEvents.map((event) => ({
+          token: event.address,
+          from: requiredEventArg(event.args.from, "from"),
+          to: requiredEventArg(event.args.to, "to"),
+          amount: requiredEventArg(event.args.amount, "amount"),
+        })),
         paidEvents: paidEvents.map((event) => ({
           paymentId: requiredEventArg(event.args.paymentId, "paymentId"),
           merchantId: requiredEventArg(event.args.merchantId, "merchantId"),
@@ -321,6 +737,19 @@ export async function connectFisco(
           subjectId: requiredEventArg(event.args.subjectId, "subjectId"),
           kind: requiredEventArg(event.args.kind, "kind"),
           atMs: normalizeBlockTimestamp(requiredEventArg(event.args.at, "at")),
+        })),
+        fundedEvents: fundedEvents.map((event) => ({
+          token: event.address,
+          fundingId: requiredEventArg(event.args.fundingId, "fundingId"),
+          main: requiredEventArg(event.args.main, "main"),
+          wallet: requiredEventArg(event.args.wallet, "wallet"),
+          amount: requiredEventArg(event.args.amount, "amount"),
+        })),
+        sweptEvents: sweptEvents.map((event) => ({
+          wallet: event.address,
+          sweepId: requiredEventArg(event.args.sweepId, "sweepId"),
+          main: requiredEventArg(event.args.main, "main"),
+          amount: requiredEventArg(event.args.amount, "amount"),
         })),
       };
     },

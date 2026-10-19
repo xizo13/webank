@@ -19,7 +19,7 @@ Reserved funds are tied to a commitment and merchant; Buffer is capped at the ap
 A rogue funding attempt or limit breach freezes the Treasurer and emits `monitor.alert` data.
 The app and Gateway still need to connect these alerts to audit anchors and notifications.
 
-Run the focused checks from `product-work` after workspace dependencies are linked:
+Run the focused checks from the repository root after workspace dependencies are linked:
 
 ```sh
 ./node_modules/.bin/tsc -p services/monitor/tsconfig.json --noEmit

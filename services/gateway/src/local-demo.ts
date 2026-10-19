@@ -1,14 +1,20 @@
 import {
+  createPrivateKey,
+  createPublicKey,
   generateKeyPairSync,
   randomBytes,
   sign,
   timingSafeEqual,
 } from "node:crypto";
+import { existsSync } from "node:fs";
 import type { ChainAddresses, FiscoChain } from "@webank/chain";
-import type { Policy } from "@webank/contracts";
+import type { Mandate, Policy } from "@webank/contracts";
 import { createGuardianEvaluator } from "@webank/guardian";
+import type { Address, Hex } from "viem";
 import { createGateway } from "./app.js";
-import { createFiscoGatewayAdapters } from "./fisco.js";
+import { createLocalBankExecutor } from "./bank-executor.js";
+import { DurableState } from "./durable-state.js";
+import { createFiscoFundingRail, createFiscoGatewayAdapters } from "./fisco.js";
 import { createShopPaymentNotifier } from "./shop-notifier.js";
 import type { GatewayDependencies } from "./types.js";
 
@@ -24,7 +30,10 @@ type ManifestMerchant = {
 
 export type LocalDemoOptions = {
   chain: FiscoChain;
-  addresses: ChainAddresses;
+  addresses: ChainAddresses & {
+    bank?: Address;
+    migration?: { state: string };
+  };
   merchants: ManifestMerchant[];
   shopOrigin: string;
   appOrigin: string;
@@ -32,7 +41,50 @@ export type LocalDemoOptions = {
   shopToken: string;
   fetcher?: typeof fetch;
   env?: NodeJS.ProcessEnv;
+  statePath?: string;
+  bankExecutor?: {
+    fund(fundingId: string, amount: bigint): Promise<Hex>;
+    sweep(sweepId: string, amount: bigint): Promise<Hex>;
+    payFromMain(confirmationId: string, amount: bigint): Promise<Hex>;
+  };
 };
+
+type DemoIdentity = {
+  loginToken: string;
+  sessionToken: string;
+  receiptPrivateKey: string;
+};
+
+function demoIdentity(statePath?: string): DemoIdentity {
+  if (!statePath) {
+    return {
+      loginToken: randomBytes(24).toString("base64url"),
+      sessionToken: randomBytes(24).toString("base64url"),
+      receiptPrivateKey: generateKeyPairSync("ed25519")
+        .privateKey.export({ format: "pem", type: "pkcs8" })
+        .toString(),
+    };
+  }
+  const store = new DurableState<DemoIdentity>(`${statePath}.identity`);
+  try {
+    const existing = store.load();
+    if (existing) {
+      if (
+        !/^[A-Za-z0-9_-]{32}$/.test(existing.loginToken) ||
+        !/^[A-Za-z0-9_-]{32}$/.test(existing.sessionToken) ||
+        typeof existing.receiptPrivateKey !== "string" ||
+        !existing.receiptPrivateKey.includes("BEGIN PRIVATE KEY")
+      )
+        throw new Error("Local demo identity is incompatible");
+      return existing;
+    }
+    const created = demoIdentity();
+    store.save(created);
+    return created;
+  } finally {
+    store.close();
+  }
+}
 
 function loopbackOrigin(value: string, name: string): string {
   const url = new URL(value);
@@ -68,6 +120,14 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
   )
     throw new Error(
       "Local demo requires WEBANK_LOCAL_DEMO=1 and WEBANK_DEMO_APPROVALS=1 outside production",
+    );
+  if (
+    options.statePath &&
+    existsSync(options.statePath) !==
+      existsSync(`${options.statePath}.identity`)
+  )
+    throw new Error(
+      "Gateway state and local demo signing identity must both exist or both be new",
     );
   const shopOrigin = loopbackOrigin(options.shopOrigin, "Shop origin");
   const appOrigin = loopbackOrigin(options.appOrigin, "App origin");
@@ -149,10 +209,32 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
   }
 
   const userId = "usr_local_demo";
-  const loginToken = randomBytes(24).toString("base64url");
-  const sessionToken = randomBytes(24).toString("base64url");
-  const receiptKey = generateKeyPairSync("ed25519");
-  const reservations = new Map<string, number>();
+  const identity = demoIdentity(options.statePath);
+  const { loginToken, sessionToken } = identity;
+  const receiptKey = identity.receiptPrivateKey;
+  const fundingEnabled = options.addresses.migration?.state === "active";
+  if (fundingEnabled && (!options.addresses.bank || !options.statePath))
+    throw new Error(
+      "Active funding deployment needs the bank address and durable Gateway state",
+    );
+  const bankExecutor = fundingEnabled
+    ? (options.bankExecutor ??
+      createLocalBankExecutor(options.statePath ?? "", options.addresses))
+    : undefined;
+  const walletFunding =
+    fundingEnabled && options.addresses.bank && bankExecutor
+      ? createFiscoFundingRail({
+          chain: options.chain,
+          addresses: { ...options.addresses, bank: options.addresses.bank },
+          bankExecutor,
+        })
+      : undefined;
+  const reservations = new Map<string, Mandate>();
+  const remainingHold = (mandate: Mandate) => {
+    if (mandate.status !== "active") return 0;
+    const budget = mandate.constraints.find((item) => item.type === "budget");
+    return budget ? Math.max(0, budget.max.amount - mandate.spent.amount) : 0;
+  };
   const policy: Policy = {
     schema: "policy.v1",
     user_id: userId,
@@ -172,6 +254,31 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
   };
   const deps: GatewayDependencies = {
     ...chainAdapter,
+    walletFunding,
+    verifyFundingProof: fundingEnabled
+      ? async (actionHash, verification) => {
+          const value = verification as {
+            action_hash?: unknown;
+            device_signature?: unknown;
+          };
+          return (
+            value?.action_hash === actionHash &&
+            value.device_signature === "simulated-local-funding"
+          );
+        }
+      : undefined,
+    verifyHumanPaymentProof: fundingEnabled
+      ? async (actionHash, verification) => {
+          const value = verification as {
+            action_hash?: unknown;
+            device_signature?: unknown;
+          };
+          return (
+            value?.action_hash === actionHash &&
+            value.device_signature === "simulated-local-human-payment"
+          );
+        }
+      : undefined,
     authenticateApp: async (request) => {
       const cookie = request.headers.cookie?.match(
         /(?:^|;\s*)webank_local_demo_session=([^;]+)/,
@@ -190,15 +297,30 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
       const budget = mandate.constraints.find((item) => item.type === "budget");
       if (!budget || reservations.has(mandate.mandate_id)) return false;
       const used = [...reservations.values()].reduce(
-        (total, amount) => total + amount,
+        (total, item) => total + remainingHold(item),
         0,
       );
-      if (used + budget.max.amount > 50_000) return false;
-      reservations.set(mandate.mandate_id, budget.max.amount);
+      if (walletFunding) {
+        const snapshot = await walletFunding.snapshot();
+        if (
+          snapshot.walletFrozen ||
+          BigInt(used + budget.max.amount) > snapshot.walletBalance
+        )
+          return false;
+      } else if (used + budget.max.amount > 50_000) return false;
+      reservations.set(mandate.mandate_id, mandate);
       return true;
     },
     releaseMandate: async (mandate) => {
       reservations.delete(mandate.mandate_id);
+    },
+    restoreReservations: (mandates) => {
+      reservations.clear();
+      for (const mandate of mandates) {
+        if (mandate.status !== "active") continue;
+        if (remainingHold(mandate) > 0)
+          reservations.set(mandate.mandate_id, mandate);
+      }
     },
     assessRisk: async () => ({
       result: "step_up",
@@ -212,9 +334,11 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
       fetcher,
     }),
     signReceipt: async (bytes) =>
-      sign(null, bytes, receiptKey.privateKey).toString("base64url"),
+      sign(null, bytes, receiptKey).toString("base64url"),
     appCorsOrigin: appOrigin,
     verificationUriBase: `${gatewayOrigin}/v1/app/pairing`,
+    statePath: options.statePath,
+    stateContext: JSON.stringify(options.addresses),
   };
   const app = createGateway(deps, { agents: [], policies: [policy] });
   app.post("/demo/login", async (request, reply) => {
@@ -230,5 +354,9 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
       )
       .send({ simulated: true, user_id: userId });
   });
-  return { app, loginToken, receiptPublicKey: receiptKey.publicKey };
+  return {
+    app,
+    loginToken,
+    receiptPublicKey: createPublicKey(createPrivateKey(receiptKey)),
+  };
 }

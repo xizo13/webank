@@ -1,14 +1,67 @@
 import type {
   Agent,
   Approval,
+  DemoVariant,
   GuardianInput,
   GuardianVerdict,
   Mandate,
   PaymentRequest,
   Policy,
   Receipt,
+  RuleDeniedError,
 } from "@webank/contracts";
 import type { FastifyRequest } from "fastify";
+
+export interface WalletSnapshot {
+  mainBalance: bigint;
+  walletBalance: bigint;
+  walletFrozen: boolean;
+  blockNumber: bigint;
+  observedAt: string;
+}
+
+export interface TransferEvidence {
+  hash: `0x${string}`;
+  blockNumber: bigint;
+  amount: bigint;
+  main: `0x${string}`;
+  wallet: `0x${string}`;
+}
+
+/** Reads chain state; writes are delegated to a bank process outside Gateway. */
+export interface WalletFundingRail {
+  deployment: {
+    token: `0x${string}`;
+    main: `0x${string}`;
+    wallet: `0x${string}`;
+  };
+  snapshot(): Promise<WalletSnapshot>;
+  fund(fundingId: string, amount: bigint): Promise<`0x${string}`>;
+  payFromMain(confirmationId: string, amount: bigint): Promise<`0x${string}`>;
+  mainPaymentEvidence(
+    hash: `0x${string}`,
+    payout: `0x${string}`,
+    amount: bigint,
+  ): Promise<{ hash: `0x${string}`; blockNumber: bigint }>;
+  fundingApplied(fundingId: string): Promise<boolean>;
+  fundingEvidence(
+    hash: `0x${string}`,
+    fundingId: string,
+  ): Promise<TransferEvidence>;
+  findFundingEvidence(
+    fundingId: string,
+    fromBlock: bigint,
+  ): Promise<TransferEvidence | undefined>;
+  sweep(sweepId: string, amount: bigint): Promise<`0x${string}`>;
+  sweepEvidence(
+    hash: `0x${string}`,
+    sweepId: string,
+  ): Promise<TransferEvidence>;
+  findSweepEvidence(
+    sweepId: string,
+    fromBlock: bigint,
+  ): Promise<TransferEvidence | undefined>;
+}
 
 export interface Merchant {
   merchant_id: string;
@@ -20,6 +73,8 @@ export interface Merchant {
   honeypot: boolean;
   /** Raw 32-byte Ed25519 public key as 0x-prefixed hex, from the rail registry. */
   public_key: `0x${string}`;
+  /** Registered on-chain payout. Required for a human main-account QR payment. */
+  payout?: `0x${string}`;
 }
 
 export interface RiskAssessment {
@@ -29,6 +84,19 @@ export interface RiskAssessment {
 }
 
 export interface GatewayDependencies {
+  walletFunding?: WalletFundingRail;
+  /** Production must provide a bank-backed proof verifier; local demo uses an explicit simulated proof. */
+  verifyFundingProof?(
+    actionHash: string,
+    verification: unknown,
+    userId: string,
+  ): Promise<boolean>;
+  /** Production must verify a registered biometric device key; loopback demo labels its proof simulated. */
+  verifyHumanPaymentProof?(
+    actionHash: string,
+    verification: unknown,
+    userId: string,
+  ): Promise<boolean>;
   /** Test override only. Live mode uses Gateway's OAuth token and RFC 9421 verifier. */
   authenticateAgent?(request: FastifyRequest): Promise<Agent | null>;
   /** Must verify the WeBank app session. */
@@ -44,6 +112,8 @@ export interface GatewayDependencies {
   /** Licence engine assigns points for three wrong zero-trust request numbers. */
   recordNumberMatchFailure(agentId: string, approvalId: string): Promise<void>;
   lookupMerchant(id: string): Promise<Merchant | null>;
+  /** Test override; otherwise Gateway uses the fixed local mock variant registry. */
+  lookupVariant?(sku: string): Promise<DemoVariant | null>;
   /** Must make an actual hold against available agent-wallet funds. */
   reserveMandate(mandate: Mandate): Promise<boolean>;
   /** Called only after a verified approval or a documented auto-threshold grant. */
@@ -83,6 +153,12 @@ export interface GatewayDependencies {
   verificationUriBase?: string;
   /** Exact browser origin allowed to send credentialed demo app requests. */
   appCorsOrigin?: string;
+  /** Owner-only local demo snapshot; omitted for ephemeral test instances. */
+  statePath?: string;
+  /** Deployment identity checked against the restored snapshot. */
+  stateContext?: string;
+  /** Rebuilds local reservation holds from restored active mandates. */
+  restoreReservations?(mandates: Mandate[]): void;
 }
 
 export type AuditRecordKind =
@@ -104,14 +180,22 @@ export interface GatewaySeed {
 
 export interface StoredPayment {
   paymentId: string;
+  /** Original deployment identity survives an explicit funding cutover. */
+  deployment?: string;
   mandateId: string;
   agentId: string;
   userId: string;
   merchant: Merchant;
   request: PaymentRequest;
   decision: import("@webank/contracts").Decision;
-  status: "paid" | "awaiting_user" | "denied" | "reconciliation_required";
+  status:
+    | "paid"
+    | "awaiting_user"
+    | "settling"
+    | "denied"
+    | "reconciliation_required";
   receipt?: Receipt;
+  denialError?: RuleDeniedError;
   /** Preserved even if audit or merchant confirmation fails after a verified Paid event. */
   settlementTx?: `0x${string}`;
   approvalId?: string;

@@ -1,5 +1,12 @@
 import { randomUUID } from "node:crypto";
-import { lstat, mkdir, readFile, rename, writeFile } from "node:fs/promises";
+import {
+  lstat,
+  mkdir,
+  readFile,
+  rename,
+  unlink,
+  writeFile,
+} from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -21,11 +28,14 @@ export interface Credentials {
   refreshToken?: string;
   tokenExpiresAt?: number;
   pending?: PendingPairing;
+  /** An unverified prior key retained during explicit, owner-approved recovery. */
+  quarantined?: Omit<Credentials, "pending" | "quarantined">;
 }
 
 export interface CredentialStore {
   load(): Promise<Credentials | null>;
   save(credentials: Credentials): Promise<void>;
+  clear?(): Promise<void>;
 }
 
 export class FileCredentialStore implements CredentialStore {
@@ -76,5 +86,11 @@ export class FileCredentialStore implements CredentialStore {
       await unlink(temp).catch(() => undefined);
       throw error;
     }
+  }
+
+  async clear(): Promise<void> {
+    await unlink(this.path).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error;
+    });
   }
 }

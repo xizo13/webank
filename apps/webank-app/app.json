@@ -10,7 +10,9 @@
       "supportsTablet": false,
       "bundleIdentifier": "com.xizo.webankagentwalletdemo",
       "infoPlist": {
-        "NSFaceIDUsageDescription": "Confirm a specific Agent Wallet action with Face ID."
+        "NSFaceIDUsageDescription": "Confirm a specific Agent Wallet action with Face ID.",
+        "NSCameraUsageDescription": "Scan a payment or pairing QR code.",
+        "NSPhotoLibraryUsageDescription": "Select a QR screenshot for payment or pairing review."
       }
     },
     "web": {
@@ -23,7 +25,18 @@
         {
           "faceIDPermission": "Confirm a specific Agent Wallet action with Face ID."
         }
-      ]
+      ],
+      [
+        "expo-camera",
+        { "cameraPermission": "Scan a payment or pairing QR code." }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Select a QR screenshot for payment or pairing review."
+        }
+      ],
+      "expo-document-picker"
     ]
   }
 }

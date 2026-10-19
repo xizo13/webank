@@ -3,6 +3,11 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  AuditAnchorAbi,
+  LicenceRegistryAbi,
+  MerchantRegistryAbi,
+} from "@webank/chain";
+import {
   type Abi,
   type Address,
   createPublicClient,
@@ -42,7 +47,11 @@ export type DeployOptions = {
   perPaymentCap?: bigint;
   dailyCap?: bigint;
   monthlyCap?: bigint;
-  initialBalance?: bigint;
+  mainOpeningBalance?: bigint;
+  reuse?: Pick<
+    Deployment,
+    "merchantRegistry" | "licenceRegistry" | "auditAnchor"
+  >;
   merchant?: SeedMerchant;
 };
 
@@ -128,9 +137,49 @@ export async function deployAll(options: DeployOptions): Promise<Deployment> {
   }
 
   const ecnySim = await deploy("ECnySim");
-  const merchantRegistry = await deploy("MerchantRegistry");
-  const licenceRegistry = await deploy("LicenceRegistry");
-  const auditAnchor = await deploy("AuditAnchor", [options.gateway]);
+  const merchantRegistry =
+    options.reuse?.merchantRegistry ?? (await deploy("MerchantRegistry"));
+  const licenceRegistry =
+    options.reuse?.licenceRegistry ?? (await deploy("LicenceRegistry"));
+  const auditAnchor =
+    options.reuse?.auditAnchor ??
+    (await deploy("AuditAnchor", [options.gateway]));
+  if (options.reuse) {
+    for (const [name, address] of Object.entries(options.reuse)) {
+      assert.notEqual(
+        await publicClient.getCode({ address }),
+        undefined,
+        `${name} has no code`,
+      );
+    }
+    assert.equal(
+      await publicClient.readContract({
+        address: merchantRegistry,
+        abi: MerchantRegistryAbi,
+        functionName: "bank",
+      }),
+      bank.address,
+      "Merchant registry belongs to another bank",
+    );
+    assert.equal(
+      await publicClient.readContract({
+        address: licenceRegistry,
+        abi: LicenceRegistryAbi,
+        functionName: "bank",
+      }),
+      bank.address,
+      "Licence registry belongs to another bank",
+    );
+    assert.equal(
+      await publicClient.readContract({
+        address: auditAnchor,
+        abi: AuditAnchorAbi,
+        functionName: "gateway",
+      }),
+      options.gateway,
+      "Audit anchor belongs to another gateway",
+    );
+  }
   const agentWallet = await deploy("AgentWallet", [
     ecnySim,
     merchantRegistry,
@@ -144,8 +193,15 @@ export async function deployAll(options: DeployOptions): Promise<Deployment> {
     "ECnySim",
     ecnySim,
     "mint",
-    [agentWallet, options.initialBalance ?? 1_000_000n],
-    "fundWallet",
+    [bank.address, options.mainOpeningBalance ?? 866_000n],
+    "openingMint",
+  );
+  await write(
+    "ECnySim",
+    ecnySim,
+    "configureAgentWallet",
+    [agentWallet],
+    "configureAgentWallet",
   );
   if (options.merchant) {
     const merchant = options.merchant;

@@ -40,7 +40,9 @@ export function OrderStatus({
       <span className="status-dot" />
       <div>
         <strong>
-          {status === "paid" ? "Payment confirmed" : "Awaiting WeBank decision"}
+          {status === "paid"
+            ? "Payment confirmed"
+            : "Awaiting payment confirmation"}
         </strong>
         <p>
           {status === "paid"

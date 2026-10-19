@@ -262,6 +262,8 @@ describe.runIf(live)("live signed checkout through Gateway and FISCO", () => {
       ];
       const mandate = await agentPost("/v1/agent/mandates", {
         description: "Buy Nova Quiet 3 from Arc Goods",
+        user_text: "Buy Nova Quiet 3 from Arc Goods",
+        intent_level: "open",
         constraints,
       });
       expect(mandate.status).toBe(202);
@@ -277,14 +279,27 @@ describe.runIf(live)("live signed checkout through Gateway and FISCO", () => {
           verification: {
             action_hash: mandateCard.payload_hash,
             device_signature: "live-biometric-fixture",
+            request_number: mandate.body.request_number,
           },
         },
         { ...appHeaders, "idempotency-key": randomUUID() },
       );
       expect(approved.status).toBe(200);
       await shop("reset");
-      await shop("add_to_cart", { sku: "NOVA-Q3-BLK", qty: 1 });
-      const checkout = await shop("checkout", { shipping_profile: "default" });
+      await shop("add_to_cart", {
+        sku: "NOVA-Q3-BLK",
+        qty: 1,
+        options: { colour: "Black", size: "One size" },
+      });
+      const checkout = await shop("checkout", {
+        shipping_address: {
+          name: "Lin Demo",
+          phone: "13800138000",
+          address_line: "88 Demo Road",
+          city: "Shenzhen",
+          postcode: "518000",
+        },
+      });
       const payment = await agentPost("/v1/agent/payments", {
         mandate_id: mandate.body.mandate.mandate_id,
         payment_request: checkout.payment_request,
@@ -358,6 +373,8 @@ describe.runIf(live)("live signed checkout through Gateway and FISCO", () => {
       expect(frozen.status).toBe(200);
       const frozenAttempt = await agentPost("/v1/agent/mandates", {
         description: "Another purchase",
+        user_text: "Another purchase",
+        intent_level: "open",
         constraints,
       });
       expect(frozenAttempt.status).toBe(401);

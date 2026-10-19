@@ -1,6 +1,35 @@
 import type { Approval } from "./flow";
 import { formatMoney } from "./flow";
-import type { LivePayment } from "./gateway";
+import type { LivePayment, PairingConsent, PairingSummary } from "./gateway";
+
+export function secondsRemaining(expiresAt: string, now: number): number {
+  return Math.max(0, Math.ceil((Date.parse(expiresAt) - now) / 1000));
+}
+
+export function pairingCountdown(
+  pairing: Pick<PairingSummary, "expires_at" | "request_number_expires_at">,
+  now: number,
+) {
+  return {
+    code: secondsRemaining(pairing.expires_at, now),
+    number: pairing.request_number_expires_at
+      ? secondsRemaining(pairing.request_number_expires_at, now)
+      : 0,
+  };
+}
+
+export function withPairingConsent(
+  approvals: Approval[],
+  consent: PairingConsent | null,
+): Approval[] {
+  if (!consent) return approvals;
+  return [
+    ...approvals.filter(
+      (approval) => approval.approval_id !== consent.approval.approval_id,
+    ),
+    consent.approval,
+  ];
+}
 
 const reviewReasons: Record<string, string> = {
   mandate: "The spending mandate needs your approval",

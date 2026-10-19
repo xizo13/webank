@@ -1,7 +1,10 @@
+import { existsSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import { isAbsolute } from "node:path";
+import { fileURLToPath } from "node:url";
 import { type ChainAddresses, connectFisco } from "@webank/chain";
 import { createLocalDemoGateway } from "./local-demo.js";
+import { installGatewayShutdown } from "./shutdown.js";
 
 if (
   process.env.NODE_ENV === "production" ||
@@ -30,6 +33,17 @@ if (!privateKey || !/^0x[0-9a-fA-F]{64}$/.test(privateKey))
   throw new Error("FISCO_GATEWAY_PRIVATE_KEY is required");
 const shopToken = process.env.SHOP_INTERNAL_TOKEN;
 if (!shopToken) throw new Error("SHOP_INTERNAL_TOKEN is required");
+if (
+  existsSync(
+    new URL(
+      "../../../scripts/local-demo-runtime/funding-cutover.json",
+      import.meta.url,
+    ),
+  )
+)
+  throw new Error(
+    "Funding cutover is incomplete; resume migration before starting Gateway",
+  );
 const addresses = JSON.parse(
   await readFile(
     new URL("../../../scripts/chain/addresses.json", import.meta.url),
@@ -54,17 +68,26 @@ const { app, loginToken } = await createLocalDemoGateway({
   appOrigin: process.env.WEBANK_DEMO_APP_ORIGIN ?? "http://127.0.0.1:8081",
   gatewayOrigin: `http://${host}:${port}`,
   shopToken,
+  statePath:
+    process.env.WEBANK_GATEWAY_STATE_PATH ??
+    fileURLToPath(
+      new URL(
+        "../../../scripts/local-demo-runtime/gateway-state.json",
+        import.meta.url,
+      ),
+    ),
 });
 await app.listen({ host, port });
+installGatewayShutdown(app);
 process.stdout.write(`SIMULATED local Gateway at http://${host}:${port}\n`);
 const tokenFile = process.env.WEBANK_LOCAL_DEMO_TOKEN_FILE;
 if (tokenFile) {
   if (!isAbsolute(tokenFile))
     throw new Error("WEBANK_LOCAL_DEMO_TOKEN_FILE must be absolute");
   await writeFile(tokenFile, `${loginToken}\n`, { flag: "wx", mode: 0o600 });
-  process.stdout.write(`One-time app login token file: ${tokenFile}\n`);
+  process.stdout.write(`Private local app token file: ${tokenFile}\n`);
 } else {
-  process.stdout.write(`One-time app login token: ${loginToken}\n`);
+  process.stdout.write(`Private local app token: ${loginToken}\n`);
 }
 process.stdout.write(
   "Approval proof is simulated. FISCO transactions use local test tokens only.\n",

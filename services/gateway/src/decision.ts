@@ -90,33 +90,37 @@ export function checkMandate(
   const product = mandate.constraints.find((item) => item.type === "product");
   if (mandate.intent_level !== "open" && !product)
     return deny("locked_product_missing");
+  const productItems = request.line_items.filter(
+    (item) => item.type === "product",
+  );
   if (product) {
-    const totalQty = request.line_items.reduce(
-      (sum, item) => sum + item.qty,
-      0,
-    );
+    const totalQty = productItems.reduce((sum, item) => sum + item.qty, 0);
     if (totalQty !== product.qty) return deny("quantity_mismatch");
-    if (
-      product.gtin &&
-      request.line_items.some((item) => item.gtin !== product.gtin)
-    )
+    if (product.gtin && productItems.some((item) => item.gtin !== product.gtin))
       return deny("gtin_mismatch");
     if (
       product.condition &&
-      request.line_items.some((item) => item.condition !== product.condition)
+      productItems.some((item) => item.condition !== product.condition)
     )
       return deny("condition_mismatch");
+    if (product.variant) {
+      const expected = product.variant.trim().toLowerCase();
+      if (
+        productItems.some(
+          (item) => item.variant.trim().toLowerCase() !== expected,
+        )
+      )
+        return deny("variant_mismatch");
+    }
     if (
       product.skus &&
-      request.line_items.some((item) => !product.skus?.includes(item.sku))
+      productItems.some((item) => !product.skus?.includes(item.sku))
     )
       return deny("sku_mismatch");
     if (product.brand && product.model && !product.gtin) {
       const expected = `${product.brand} ${product.model}`.toLowerCase();
       if (
-        request.line_items.some(
-          (item) => !item.name.toLowerCase().includes(expected),
-        )
+        productItems.some((item) => !item.name.toLowerCase().includes(expected))
       )
         return deny("product_model_mismatch");
     }
@@ -151,7 +155,12 @@ export function checkPolicy(
   const licenceCap =
     agent.licence.level === "P" ? 30_000 : Number.MAX_SAFE_INTEGER;
   const effectiveCap = Math.min(policy.per_payment_max.amount, licenceCap);
-  if (amount > effectiveCap) return deny("per_payment_cap_exceeded");
+  if (amount > effectiveCap)
+    return deny(
+      amount > policy.per_payment_max.amount
+        ? "per_payment_cap_exceeded"
+        : "licence_cap_exceeded",
+    );
   if (spentToday + amount > policy.daily_max.amount)
     return deny("daily_cap_exceeded");
   if (spentMonth + amount > policy.monthly_max.amount)

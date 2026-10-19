@@ -3,6 +3,7 @@ import {
   AgentIdSchema,
   AgentScopeSchema,
   ApprovalIdSchema,
+  ApprovalLevelSchema,
   MandateIdSchema,
   MoneySchema,
   NonEmptyStringSchema,
@@ -12,6 +13,7 @@ import {
   PositiveMoneySchema,
   pageSchema,
   RequestNumberSchema,
+  RuleDeniedErrorSchema,
   TimestampSchema,
   VerificationSchema,
 } from "./common.js";
@@ -24,6 +26,7 @@ import {
   MandateSchema,
   ReceiptSchema,
   RiskSignalSchema,
+  ShippingAddressSchema,
   SignedLineItemSchema,
 } from "./records.js";
 
@@ -39,6 +42,7 @@ export const DeviceAuthorizationRequestSchema = z
     provider: NonEmptyStringSchema,
     agent_public_key: z.string().startsWith("p256:").min(6),
     requested_scopes: z.array(AgentScopeSchema).min(1),
+    replacement_ticket: NonEmptyStringSchema.optional(),
   })
   .strict();
 export const DeviceAuthorizationResponseSchema = z
@@ -48,6 +52,7 @@ export const DeviceAuthorizationResponseSchema = z
     verification_uri: z.string().url(),
     qr_payload: NonEmptyStringSchema,
     request_number: RequestNumberSchema,
+    request_number_expires_at: TimestampSchema.optional(),
     expires_in: z.literal(600),
     interval: z.literal(3),
   })
@@ -86,6 +91,8 @@ export const DeviceTokenErrorSchema = z
 export const CreateMandateRequestSchema = z
   .object({
     description: NonEmptyStringSchema,
+    user_text: NonEmptyStringSchema,
+    intent_level: z.enum(["open", "product", "listing"]),
     constraints: MandateConstraintsSchema,
   })
   .strict();
@@ -93,16 +100,42 @@ export const MandateResponseSchema = z
   .object({ mandate: MandateSchema })
   .strict();
 export const CreateMandateResponseSchema = z
-  .object({ mandate: MandateSchema, approval_id: ApprovalIdSchema.optional() })
+  .object({
+    mandate: MandateSchema,
+    approval_id: ApprovalIdSchema.optional(),
+    level: ApprovalLevelSchema.optional(),
+    expires_at: TimestampSchema.optional(),
+    request_number: RequestNumberSchema.optional(),
+  })
   .strict()
-  .refine(
-    (response) =>
-      response.mandate.status !== "pending_user" || !!response.approval_id,
-    {
-      message: "Pending mandate requires approval ID",
-      path: ["approval_id"],
-    },
-  );
+  .superRefine((response, ctx) => {
+    if (response.mandate.status === "pending_user") {
+      if (!response.approval_id || !response.level || !response.expires_at)
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Pending mandate requires approval metadata",
+        });
+      if (response.level === "zero_trust" && !response.request_number)
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: "Zero-trust mandate requires request number",
+        });
+    } else if (
+      response.approval_id ||
+      response.level ||
+      response.expires_at ||
+      response.request_number
+    )
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Active mandate cannot contain pending approval metadata",
+      });
+    if (response.level !== "zero_trust" && response.request_number)
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Request number is zero-trust only",
+      });
+  });
 
 export const PriceEvidenceSchema = z
   .object({
@@ -114,11 +147,20 @@ export const PriceEvidenceSchema = z
   .strict();
 export const CreatePaymentRequestSchema = z
   .object({
-    mandate_id: MandateIdSchema,
+    mandate_id: MandateIdSchema.optional(),
     payment_request: PaymentRequestUriSchema,
     cart_claim: z.array(z.unknown()).optional(),
     price_evidence: z.array(PriceEvidenceSchema),
     rationale: NonEmptyStringSchema,
+  })
+  .strict();
+export const PendingMandatePaymentResponseSchema = z
+  .object({
+    mandate_id: MandateIdSchema,
+    status: z.literal("awaiting_user"),
+    approval_id: ApprovalIdSchema,
+    level: ApprovalLevelSchema,
+    expires_at: TimestampSchema,
   })
   .strict();
 
@@ -147,11 +189,13 @@ const AwaitingUserPaymentResponseBaseSchema = z
     status: z.literal("awaiting_user"),
     decision: DecisionSchema,
     approval_id: ApprovalIdSchema,
+    expires_at: TimestampSchema,
     poll_after: z.number().int().positive(),
   })
   .strict();
 export const ZeroTrustPaymentResponseSchema =
   AwaitingUserPaymentResponseBaseSchema.extend({
+    level: z.literal("zero_trust"),
     approval_level: z.literal("zero_trust"),
     request_number: RequestNumberSchema,
   }).refine(
@@ -162,6 +206,7 @@ export const ZeroTrustPaymentResponseSchema =
   );
 export const EverydayPaymentResponseSchema =
   AwaitingUserPaymentResponseBaseSchema.extend({
+    level: z.literal("everyday"),
     approval_level: z.literal("everyday"),
   }).refine(
     (response) =>
@@ -179,6 +224,7 @@ export const DeniedPaymentResponseSchema = z
     status: z.literal("denied"),
     decision: DecisionSchema,
     receipt: ReceiptSchema,
+    error: RuleDeniedErrorSchema,
   })
   .strict()
   .refine(
@@ -203,6 +249,7 @@ export const PaymentStatusResponseSchema = z
     status: PaymentStatusSchema,
     decision: DecisionSchema,
     receipt: ReceiptSchema.optional(),
+    error: RuleDeniedErrorSchema.optional(),
   })
   .strict()
   .superRefine((response, ctx) => {
@@ -229,6 +276,13 @@ export const PaymentStatusResponseSchema = z
         code: z.ZodIssueCode.custom,
         path: ["receipt"],
         message: "Pending payment cannot have a receipt",
+      });
+    }
+    if (response.error && response.status !== "denied") {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["error"],
+        message: "Only denied payments can carry a denial error",
       });
     }
     if (response.status !== "awaiting_user" && !response.receipt) {
@@ -338,7 +392,7 @@ export const GuardianVerdictSchema = z
   .strict();
 
 export const ShopCheckoutRequestSchema = z
-  .object({ shipping_profile: z.literal("default") })
+  .object({ shipping_address: ShippingAddressSchema })
   .strict();
 export const ShopCheckoutResponseSchema = z
   .object({

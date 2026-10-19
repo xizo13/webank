@@ -44,6 +44,15 @@ export const AgentSchema = z
       })
       .strict(),
     status: z.enum(["active", "frozen", "revoked"]),
+    lineage: z
+      .object({
+        root_agent_id: AgentIdSchema,
+        replaces_agent_id: AgentIdSchema.nullable(),
+        replaced_by_agent_id: AgentIdSchema.nullable(),
+      })
+      .strict()
+      .optional(),
+    deleted_at: TimestampSchema.nullable().optional(),
     created_at: TimestampSchema,
     last_used_at: TimestampSchema.nullable(),
   })
@@ -161,6 +170,19 @@ export const MandateConstraintsSchema = z
   .min(1)
   .superRefine((constraints, ctx) => {
     const types = constraints.map((constraint) => constraint.type);
+    for (const required of [
+      "amount_range",
+      "categories",
+      "budget",
+      "recurrence",
+      "execution_window",
+    ] as const) {
+      if (!types.includes(required))
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: `Missing ${required} constraint`,
+        });
+    }
     if (new Set(types).size !== types.length) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -170,6 +192,14 @@ export const MandateConstraintsSchema = z
     const window = constraints.find(
       (constraint) => constraint.type === "execution_window",
     );
+    const recurrence = constraints.find(
+      (constraint) => constraint.type === "recurrence",
+    );
+    if (recurrence?.frequency === "NONE" && recurrence.max_occurrences !== 1)
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Non-recurring mandates allow exactly one occurrence",
+      });
     if (
       window?.not_before &&
       Date.parse(window.not_before) >= Date.parse(window.not_after)
@@ -261,16 +291,50 @@ export const MandateSchema = z
   });
 export type Mandate = z.infer<typeof MandateSchema>;
 
-export const SignedLineItemSchema = z
+export const ShippingAddressSchema = z
   .object({
+    name: NonEmptyStringSchema,
+    phone: z
+      .string()
+      .trim()
+      .regex(/^[+0-9() -]{6,24}$/),
+    address_line: NonEmptyStringSchema,
+    city: NonEmptyStringSchema,
+    postcode: NonEmptyStringSchema,
+  })
+  .strict();
+export type ShippingAddress = z.infer<typeof ShippingAddressSchema>;
+
+export const SignedProductLineItemSchema = z
+  .object({
+    type: z.literal("product"),
     sku: NonEmptyStringSchema,
     gtin: NonEmptyStringSchema,
     name: NonEmptyStringSchema,
     condition: NonEmptyStringSchema,
+    variant: NonEmptyStringSchema,
+    options: z
+      .object({
+        colour: NonEmptyStringSchema.optional(),
+        size: NonEmptyStringSchema.optional(),
+      })
+      .strict(),
     qty: z.number().int().safe().positive(),
     unit_price: PositiveMoneySchema,
   })
   .strict();
+export const SignedShippingLineItemSchema = z
+  .object({
+    type: z.literal("shipping"),
+    name: NonEmptyStringSchema,
+    qty: z.literal(1),
+    unit_price: MoneySchema,
+  })
+  .strict();
+export const SignedLineItemSchema = z.discriminatedUnion("type", [
+  SignedProductLineItemSchema,
+  SignedShippingLineItemSchema,
+]);
 export const PaymentRequestSchema = z
   .object({
     schema: z.literal("payreq.v1"),
@@ -290,6 +354,22 @@ export const PaymentRequestSchema = z
       ),
     {
       message: "Line item currencies must match payment currency",
+      path: ["line_items"],
+    },
+  )
+  .refine(
+    (request) => request.line_items.some((item) => item.type === "product"),
+    {
+      message: "Payment request needs a product line",
+      path: ["line_items"],
+    },
+  )
+  .refine(
+    (request) =>
+      request.line_items.filter((item) => item.type === "shipping").length ===
+      1,
+    {
+      message: "Payment request requires one shipping line",
       path: ["line_items"],
     },
   );

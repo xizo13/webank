@@ -30,16 +30,126 @@ export type LivePaymentDetail = {
 
 export type PairingConsent = {
   approval: Approval;
+  pairing: PairingSummary;
+  public_key: string;
+};
+
+export type ReplacementSummary = {
+  agent_id: string;
+  display_name: string;
+  provider: string;
+  prior_status: string;
+  status_before_revoke?: string;
+  prior_licence_level: string;
+  points: number;
+  demerit_count: number;
+  latest_reason: string | null;
+  root_agent_id: string;
+  deleted_at: string | null;
+};
+
+export type PairingSummary = {
+  user_code: string;
   client_name: string;
   provider: string;
   requested_scopes: string[];
-  public_key: string;
+  status: "pending" | "approved" | "rejected" | "expired";
+  expires_at: string;
+  request_number_expires_at: string | null;
 };
 
 export type GatewaySnapshot = {
   agents: Agent[];
   approvals: Approval[];
   payments: LivePayment[];
+  pairings: PairingSummary[];
+};
+
+export type Money = { amount: number; currency: "CNY" };
+export type LiveHome = {
+  schema: "home.v1";
+  simulated: true;
+  main_account: { balance: Money };
+  agent_wallet: {
+    balance: Money;
+    reserved: Money;
+    available: Money;
+    address: string;
+    frozen: boolean;
+  };
+  block_number: number;
+  observed_at: string;
+  alerts: string[];
+};
+export type FundingChallenge = {
+  funding_id: string;
+  challenge_id: string;
+  action_hash: string;
+  expires_at: string;
+  source_balance: Money;
+  destination_balance: Money;
+  destination_address: string;
+  simulated: true;
+};
+export type FundingRecord = {
+  schema: "funding.v1";
+  funding_id: string;
+  user_id: string;
+  amount: Money;
+  source: "main";
+  destination: "agent_wallet";
+  status:
+    | "prepared"
+    | "settling"
+    | "completed"
+    | "reconciliation_required"
+    | "failed";
+  chain: { network: string; tx_hash?: string; block_number?: number };
+  created_at: string;
+  completed_at?: string;
+};
+export type SweepRecord = {
+  schema: "sweep.v1";
+  sweep_id: string;
+  user_id: string;
+  amount: Money;
+  status: "settling" | "completed" | "reconciliation_required";
+  chain: { network: string; tx_hash?: string; block_number?: number };
+  created_at: string;
+  completed_at?: string;
+};
+export type ScanResult =
+  | { kind: "pairing"; user_code: string }
+  | {
+      kind: "payment";
+      confirmation_id: string;
+      challenge_id: string;
+      action_hash: string;
+      merchant_id: string;
+      merchant_legal_name: string;
+      merchant_uscc: string;
+      order_id: string;
+      amount: Money;
+      source_account: "main";
+      expires_at: string;
+      simulated: true;
+    };
+export type HumanPayment = {
+  schema: "human_payment.v1";
+  confirmation_id: string;
+  order_id: string;
+  merchant_id: string;
+  amount: Money;
+  source_account: "main";
+  status:
+    | "prepared"
+    | "settling"
+    | "completed"
+    | "reconciliation_required"
+    | "failed";
+  chain: { network: string; tx_hash?: string; block_number?: number };
+  created_at: string;
+  completed_at?: string;
 };
 
 export class GatewayRequestError extends Error {
@@ -47,9 +157,25 @@ export class GatewayRequestError extends Error {
     message: string,
     readonly status: number,
     readonly code: string | null,
+    readonly details: Record<string, unknown> | null = null,
   ) {
     super(message);
   }
+}
+
+export function gatewaySnapshotErrorMessage(
+  error: unknown,
+  localDemo: boolean,
+  hadAuthenticatedSession: boolean,
+): string | null {
+  if (
+    localDemo &&
+    !hadAuthenticatedSession &&
+    error instanceof GatewayRequestError &&
+    error.status === 401
+  )
+    return null;
+  return error instanceof Error ? error.message : "Gateway unavailable";
 }
 
 export function isLoopbackLocalDemo(
@@ -106,21 +232,43 @@ export function createGatewayClient(
     }
     if (!response.ok) {
       const payload = (await response.json().catch(() => null)) as {
-        error?: { code?: string } | string;
+        error?: ({ code?: string } & Record<string, unknown>) | string;
       } | null;
       const code =
         typeof payload?.error === "string"
           ? payload.error
           : (payload?.error?.code ?? null);
+      const rule =
+        typeof payload?.error === "object" &&
+        typeof payload.error?.rule === "string"
+          ? payload.error.rule
+          : null;
       const reason =
         code === "demo_login_denied"
           ? "Demo login token was not accepted."
-          : response.status === 401
-            ? "App session expired. Sign in again."
-            : response.status === 403
-              ? "Request is unavailable or expired."
-              : `Gateway returned ${response.status}.`;
-      throw new GatewayRequestError(reason, response.status, code);
+          : rule === "insufficient_main_funds"
+            ? "The confirmed main-account balance is too low for this transfer."
+            : rule === "insufficient_wallet_funds"
+              ? "The Agent Wallet has too little unreserved money to return."
+              : code === "reconciliation_required"
+                ? "The transfer outcome is being reconciled. Do not submit it again."
+                : code === "chain_unavailable"
+                  ? "Chain balance is unavailable. Try again after it recovers."
+                  : code === "action_changed"
+                    ? "This transfer review expired or changed. Start a new review."
+                    : code === "request_number_expired"
+                      ? "That pairing request number expired. Ask the connector to show its refreshed number."
+                      : response.status === 401
+                        ? "App session expired. Sign in again."
+                        : response.status === 403
+                          ? "Request is unavailable or expired."
+                          : `Gateway returned ${response.status}.`;
+      throw new GatewayRequestError(
+        reason,
+        response.status,
+        code,
+        typeof payload?.error === "object" ? payload.error : null,
+      );
     }
     return response.json() as Promise<T>;
   }
@@ -141,7 +289,7 @@ export function createGatewayClient(
       requireLocalDemo();
       if (!/^[A-Za-z0-9_-]{16,}$/.test(token))
         throw new Error(
-          "Enter the one-time token printed by the local Gateway.",
+          "Enter the private local app token from the file path printed by the launcher.",
         );
       const result = await request<{ simulated: boolean }>("/demo/login", {
         method: "POST",
@@ -151,25 +299,234 @@ export function createGatewayClient(
         throw new Error("Gateway did not confirm local demo mode.");
     },
     async snapshot(): Promise<GatewaySnapshot> {
-      const [agents, approvals, payments] = await Promise.all([
+      const [agents, approvals, payments, pairings] = await Promise.all([
         request<{ items: Agent[] }>("/v1/app/agents"),
         request<{ items: Approval[] }>("/v1/app/approvals?status=pending"),
         request<{ items: LivePayment[] }>("/v1/app/payments"),
+        request<{ items: PairingSummary[] }>("/v1/app/pairings"),
       ]);
       if (
         !Array.isArray(agents.items) ||
         !Array.isArray(approvals.items) ||
-        !Array.isArray(payments.items)
+        !Array.isArray(payments.items) ||
+        !Array.isArray(pairings.items)
       )
         throw new Error("Gateway response is missing items.");
       return {
         agents: agents.items,
         approvals: approvals.items.filter((item) => item.status === "pending"),
         payments: payments.items,
+        pairings: pairings.items,
       };
+    },
+    async home(): Promise<LiveHome> {
+      const home = await request<LiveHome>("/v1/app/home");
+      const money = (value: Money | undefined) =>
+        value?.currency === "CNY" &&
+        Number.isSafeInteger(value.amount) &&
+        value.amount >= 0;
+      if (
+        home.schema !== "home.v1" ||
+        home.simulated !== true ||
+        !money(home.main_account?.balance) ||
+        !money(home.agent_wallet?.balance) ||
+        !money(home.agent_wallet?.reserved) ||
+        !money(home.agent_wallet?.available) ||
+        home.agent_wallet.available.amount !==
+          Math.max(
+            0,
+            home.agent_wallet.balance.amount -
+              home.agent_wallet.reserved.amount,
+          ) ||
+        typeof home.agent_wallet?.address !== "string" ||
+        typeof home.agent_wallet?.frozen !== "boolean" ||
+        !Number.isSafeInteger(home.block_number) ||
+        !Number.isFinite(Date.parse(home.observed_at)) ||
+        Date.parse(home.observed_at) > Date.now() + 15_000
+      )
+        throw new Error(
+          "Gateway returned an invalid chain balance. Transfers are unavailable.",
+        );
+      return home;
+    },
+    fundingHistory(): Promise<FundingRecord[]> {
+      return request<{ items: FundingRecord[] }>(
+        "/v1/app/agent-wallet/funding",
+      ).then((response) => {
+        if (!Array.isArray(response.items))
+          throw new Error("Funding history is unavailable.");
+        return response.items;
+      });
+    },
+    funding(fundingId: string): Promise<FundingRecord> {
+      return request(
+        `/v1/app/agent-wallet/funding/${encodeURIComponent(fundingId)}`,
+      );
+    },
+    sweepHistory(): Promise<SweepRecord[]> {
+      return request<{ items: SweepRecord[] }>(
+        "/v1/app/agent-wallet/sweep",
+      ).then((response) => {
+        if (!Array.isArray(response.items))
+          throw new Error("Return history is unavailable.");
+        return response.items;
+      });
+    },
+    sweepDetail(sweepId: string): Promise<SweepRecord> {
+      return request(
+        `/v1/app/agent-wallet/sweep/${encodeURIComponent(sweepId)}`,
+      );
+    },
+    async prepareFunding(amountFen: number): Promise<FundingChallenge> {
+      requireLocalDemo();
+      const challenge = await request<FundingChallenge>(
+        "/v1/app/agent-wallet/funding/prepare",
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            amount: { amount: amountFen, currency: "CNY" },
+          }),
+        },
+      );
+      if (
+        challenge.simulated !== true ||
+        !/^fnd_[A-Za-z0-9_-]+$/.test(challenge.funding_id) ||
+        !/^fch_[A-Za-z0-9_-]+$/.test(challenge.challenge_id) ||
+        !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+        !/^0x[0-9a-fA-F]{40}$/.test(challenge.destination_address) ||
+        Date.parse(challenge.expires_at) <= Date.now()
+      )
+        throw new Error("Gateway returned an invalid transfer review.");
+      return challenge;
+    },
+    submitSimulatedFunding(
+      challenge: FundingChallenge,
+      amountFen: number,
+    ): Promise<FundingRecord> {
+      requireLocalDemo();
+      return request("/v1/app/agent-wallet/funding", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": `funding-${challenge.funding_id}`,
+        },
+        body: JSON.stringify({
+          funding_id: challenge.funding_id,
+          challenge_id: challenge.challenge_id,
+          amount: { amount: amountFen, currency: "CNY" },
+          verification: {
+            action_hash: challenge.action_hash,
+            device_signature: "simulated-local-funding",
+          },
+        }),
+      });
+    },
+    sweep(amountFen: number): Promise<SweepRecord> {
+      return request("/v1/app/agent-wallet/sweep", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": mutationKey("sweep"),
+        },
+        body: JSON.stringify({
+          amount: { amount: amountFen, currency: "CNY" },
+        }),
+      });
     },
     pairing(userCode: string): Promise<PairingConsent> {
       return request(`/v1/app/pairing/${encodeURIComponent(userCode)}`);
+    },
+    scanPayload(qrPayload: string): Promise<ScanResult> {
+      return request("/v1/app/scan/decode", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ qr_payload: qrPayload }),
+      });
+    },
+    humanPayment(confirmationId: string): Promise<HumanPayment> {
+      return request(
+        `/v1/app/scan/payments/${encodeURIComponent(confirmationId)}`,
+      );
+    },
+    confirmSimulatedHumanPayment(
+      review: Extract<ScanResult, { kind: "payment" }>,
+    ): Promise<HumanPayment> {
+      requireLocalDemo();
+      if (Date.parse(review.expires_at) <= Date.now())
+        throw new Error("This QR payment review expired. Scan it again.");
+      return request(
+        `/v1/app/scan/payments/${encodeURIComponent(review.confirmation_id)}/confirm`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": `human-payment-${review.confirmation_id}`,
+          },
+          body: JSON.stringify({
+            challenge_id: review.challenge_id,
+            verification: {
+              action_hash: review.action_hash,
+              device_signature: "simulated-local-human-payment",
+            },
+          }),
+        },
+      );
+    },
+    prepareAgentAction(agentId: string, action: "unfreeze" | "relicense") {
+      return request<{
+        action_hash: string;
+        challenge_id: string;
+        expires_at: string;
+        agent_summary: ReplacementSummary;
+      }>(`/v1/app/agents/${encodeURIComponent(agentId)}/prepare-action`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": mutationKey("prepare-action"),
+        },
+        body: JSON.stringify({ action }),
+      });
+    },
+    agentHistory(agentId: string) {
+      return request<{
+        root_agent_id: string;
+        items: Array<{ kind: string; summary: string; created_at: string }>;
+      }>(`/v1/app/agents/${encodeURIComponent(agentId)}/history`);
+    },
+    completeSimulatedAgentAction(
+      agentId: string,
+      action: "unfreeze" | "relicense",
+      challenge: { action_hash: string; challenge_id: string },
+    ) {
+      requireLocalDemo();
+      return request<{ agent: Agent; simulated: true }>(
+        `/v1/app/agents/${encodeURIComponent(agentId)}/${action}`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": mutationKey(action),
+          },
+          body: JSON.stringify({
+            challenge_id: challenge.challenge_id,
+            verification: {
+              action_hash: challenge.action_hash,
+              device_signature: "simulated-local-approval",
+            },
+          }),
+        },
+      );
+    },
+    deleteAgent(agentId: string): Promise<{ agent: Agent }> {
+      return request(`/v1/app/agents/${encodeURIComponent(agentId)}/revoke`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": mutationKey("delete-agent"),
+        },
+        body: JSON.stringify({ confirmation_agent_id: agentId }),
+      });
     },
     denyPairing(userCode: string): Promise<{ approval: Approval }> {
       return request(`/v1/app/pairing/${encodeURIComponent(userCode)}/deny`, {
@@ -256,8 +613,44 @@ function configuredClient() {
 }
 
 export const loadGatewaySnapshot = () => configuredClient().snapshot();
+export const loadGatewayHome = () => configuredClient().home();
+export const loadGatewayFundingHistory = () =>
+  configuredClient().fundingHistory();
+export const loadGatewayFunding = (id: string) =>
+  configuredClient().funding(id);
+export const loadGatewaySweepHistory = () => configuredClient().sweepHistory();
+export const loadGatewaySweep = (id: string) =>
+  configuredClient().sweepDetail(id);
+export const prepareGatewayFunding = (amountFen: number) =>
+  configuredClient().prepareFunding(amountFen);
+export const submitSimulatedGatewayFunding = (
+  challenge: FundingChallenge,
+  amountFen: number,
+) => configuredClient().submitSimulatedFunding(challenge, amountFen);
+export const sweepGatewayWallet = (amountFen: number) =>
+  configuredClient().sweep(amountFen);
 export const loadPairingConsent = (code: string) =>
   configuredClient().pairing(code);
+export const scanGatewayQrPayload = (payload: string) =>
+  configuredClient().scanPayload(payload);
+export const loadHumanPayment = (id: string) =>
+  configuredClient().humanPayment(id);
+export const confirmSimulatedHumanPayment = (
+  review: Extract<ScanResult, { kind: "payment" }>,
+) => configuredClient().confirmSimulatedHumanPayment(review);
+export const prepareGatewayAgentAction = (
+  id: string,
+  action: "unfreeze" | "relicense",
+) => configuredClient().prepareAgentAction(id, action);
+export const loadGatewayAgentHistory = (id: string) =>
+  configuredClient().agentHistory(id);
+export const completeSimulatedGatewayAgentAction = (
+  id: string,
+  action: "unfreeze" | "relicense",
+  challenge: { action_hash: string; challenge_id: string },
+) => configuredClient().completeSimulatedAgentAction(id, action, challenge);
+export const deleteGatewayAgent = (id: string) =>
+  configuredClient().deleteAgent(id);
 export const denyGatewayPairing = (code: string) =>
   configuredClient().denyPairing(code);
 export const rejectGatewayApproval = (id: string) =>

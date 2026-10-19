@@ -2,7 +2,8 @@ import { describe, expect, it, vi } from "vitest";
 import type { Approval } from "./flow";
 import {
   createGatewayClient,
-  type GatewayRequestError,
+  GatewayRequestError,
+  gatewaySnapshotErrorMessage,
   isLoopbackLocalDemo,
 } from "./gateway";
 
@@ -30,6 +31,7 @@ describe("Gateway app client", () => {
       const path = new URL(String(input)).pathname;
       if (path === "/v1/app/agents")
         return json({ items: [{ agent_id: "agt_one", status: "active" }] });
+      if (path === "/v1/app/pairings") return json({ items: [] });
       if (path === "/v1/app/approvals")
         return json({
           items: [
@@ -81,6 +83,7 @@ describe("Gateway app client", () => {
       "apr_one",
     ]);
     expect(snapshot.payments[0]?.amount.amount).toBe(27900);
+    expect(snapshot.pairings).toEqual([]);
     const consent = await client.pairing("ABCD-EFGH");
     expect(consent.approval.title).toBe("Connect");
     expect(JSON.stringify(consent)).not.toContain("request_number");
@@ -88,6 +91,55 @@ describe("Gateway app client", () => {
       expect.stringContaining("/v1/app/pairing/ABCD-EFGH"),
       expect.objectContaining({ credentials: "include" }),
     );
+  });
+
+  it("reads independent pairing details from the consent summary", async () => {
+    const pairing = {
+      user_code: "ABCD-EFGH",
+      client_name: "Claude personal shopper",
+      provider: "Anthropic",
+      requested_scopes: ["wallet:pay", "wallet:mandate"],
+      status: "pending",
+      expires_at: "2099-01-01T00:00:00Z",
+      request_number_expires_at: "2099-01-01T00:00:00Z",
+    };
+    const fetcher = vi.fn(async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v1/app/pairing/ABCD-EFGH")
+        return json({
+          approval: approval("pairing"),
+          pairing,
+          public_key: "test-key",
+          replacement_candidates: [],
+        });
+      throw new Error(`Unexpected path ${path}`);
+    }) as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:8787", fetcher);
+    const consent = await client.pairing(pairing.user_code);
+    expect(consent.pairing.client_name).toBe("Claude personal shopper");
+    expect(consent.pairing.provider).toBe("Anthropic");
+    expect(consent.pairing.requested_scopes.join(", ")).toBe(
+      "wallet:pay, wallet:mandate",
+    );
+    expect(consent).not.toHaveProperty("requested_scopes");
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
+  it("explains an expired pairing number without treating it as a wrong attempt", async () => {
+    const client = createGatewayClient(
+      "http://127.0.0.1:8787",
+      vi.fn(async () =>
+        json({ error: { code: "request_number_expired" } }, 409),
+      ) as unknown as typeof fetch,
+      true,
+    );
+    await expect(
+      client.approveSimulated(approval("pairing"), "123456", "ABCD-EFGH"),
+    ).rejects.toMatchObject({
+      status: 409,
+      code: "request_number_expired",
+      message: expect.stringContaining("refreshed number"),
+    });
   });
 
   it("sends idempotent deny, reject, and freeze requests, and loads a receipt", async () => {
@@ -130,6 +182,59 @@ describe("Gateway app client", () => {
     });
   });
 
+  it("prepares simulated owner recovery, reads history, and confirms Delete by agent ID", async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        calls.push({ path, init: init ?? {} });
+        if (path.endsWith("/prepare-action"))
+          return json({
+            action_hash: "sha256:action",
+            challenge_id: "chg_one",
+            expires_at: "2099-01-01T00:00:00Z",
+            agent_summary: {},
+          });
+        if (path.endsWith("/history"))
+          return json({
+            root_agent_id: "agt_old",
+            items: [
+              {
+                kind: "freeze",
+                summary: "User froze agent",
+                created_at: "2026-10-15T00:00:00Z",
+              },
+            ],
+          });
+        return json({
+          agent: { agent_id: "agt_old", status: "revoked" },
+          simulated: true,
+        });
+      },
+    ) as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:8787", fetcher, true);
+    const challenge = await client.prepareAgentAction("agt_old", "unfreeze");
+    await client.agentHistory("agt_old");
+    await client.completeSimulatedAgentAction("agt_old", "unfreeze", challenge);
+    await client.deleteAgent("agt_old");
+    expect(calls.map((call) => call.path)).toEqual([
+      "/v1/app/agents/agt_old/prepare-action",
+      "/v1/app/agents/agt_old/history",
+      "/v1/app/agents/agt_old/unfreeze",
+      "/v1/app/agents/agt_old/revoke",
+    ]);
+    expect(JSON.parse(String(calls[2]?.init.body))).toEqual({
+      challenge_id: "chg_one",
+      verification: {
+        action_hash: "sha256:action",
+        device_signature: "simulated-local-approval",
+      },
+    });
+    expect(JSON.parse(String(calls[3]?.init.body))).toEqual({
+      confirmation_agent_id: "agt_old",
+    });
+  });
+
   it("reports offline and expired-session errors while preserving caller state", async () => {
     const offline = createGatewayClient(
       "http://127.0.0.1:8787",
@@ -143,6 +248,24 @@ describe("Gateway app client", () => {
       vi.fn(async () => json({}, 401)) as unknown as typeof fetch,
     );
     await expect(expired.snapshot()).rejects.toThrow("App session expired");
+  });
+
+  it("prompts sign-in on an initial local demo 401, then reports an expired session after login", () => {
+    const unauthorized = new GatewayRequestError(
+      "App session expired. Sign in again.",
+      401,
+      "unauthorized",
+    );
+    expect(gatewaySnapshotErrorMessage(unauthorized, true, false)).toBeNull();
+    expect(gatewaySnapshotErrorMessage(unauthorized, true, true)).toBe(
+      "App session expired. Sign in again.",
+    );
+    expect(gatewaySnapshotErrorMessage(unauthorized, false, false)).toBe(
+      "App session expired. Sign in again.",
+    );
+    expect(
+      gatewaySnapshotErrorMessage(new Error("Gateway is offline"), true, false),
+    ).toBe("Gateway is offline");
   });
 
   it("locks simulated approval without the explicit flag and exact loopback origin", async () => {
@@ -284,5 +407,290 @@ describe("Gateway app client", () => {
     await expect(
       offline.approveSimulated(approval(), "123456"),
     ).rejects.toThrow("Gateway is offline");
+  });
+
+  it("reads chain balances and funding history, then submits the exact reviewed owner transfer", async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const challenge = {
+      funding_id: "fnd_one",
+      challenge_id: "fch_one",
+      action_hash: `sha256:${"a".repeat(64)}`,
+      expires_at: "2099-01-01T00:00:00Z",
+      source_balance: { amount: 866000, currency: "CNY" },
+      destination_balance: { amount: 0, currency: "CNY" },
+      destination_address: `0x${"2".repeat(40)}`,
+      simulated: true,
+    };
+    const record = {
+      schema: "funding.v1",
+      funding_id: "fnd_one",
+      user_id: "usr_owner",
+      amount: { amount: 100000, currency: "CNY" },
+      source: "main",
+      destination: "agent_wallet",
+      status: "completed",
+      chain: {
+        network: "FISCO BCOS local",
+        tx_hash: `0x${"3".repeat(64)}`,
+        block_number: 2,
+      },
+      created_at: "2026-10-15T12:00:00Z",
+      completed_at: "2026-10-15T12:00:01Z",
+    };
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init: RequestInit = {}) => {
+        const path = new URL(String(input)).pathname;
+        calls.push({ path, init });
+        if (path === "/v1/app/home")
+          return json({
+            schema: "home.v1",
+            simulated: true,
+            main_account: { balance: { amount: 866000, currency: "CNY" } },
+            agent_wallet: {
+              balance: { amount: 0, currency: "CNY" },
+              reserved: { amount: 0, currency: "CNY" },
+              available: { amount: 0, currency: "CNY" },
+              address: challenge.destination_address,
+              frozen: false,
+            },
+            block_number: 1,
+            observed_at: "2026-10-15T12:00:00Z",
+            alerts: [],
+          });
+        if (path === "/v1/app/agent-wallet/funding/prepare")
+          return json(challenge);
+        if (path === "/v1/app/agent-wallet/funding")
+          return init.method === "POST"
+            ? json(record)
+            : json({ items: [record] });
+        if (path === "/v1/app/agent-wallet/funding/fnd_one")
+          return json(record);
+        if (path === "/v1/app/agent-wallet/sweep" && init.method === "POST")
+          return json({
+            schema: "sweep.v1",
+            sweep_id: "swp_one",
+            status: "completed",
+            amount: { amount: 50000, currency: "CNY" },
+            chain: {
+              network: "FISCO BCOS local",
+              tx_hash: `0x${"4".repeat(64)}`,
+            },
+          });
+        if (path === "/v1/app/agent-wallet/sweep")
+          return json({
+            items: [{ sweep_id: "swp_one", status: "completed" }],
+          });
+        if (path === "/v1/app/agent-wallet/sweep/swp_one")
+          return json({ sweep_id: "swp_one", status: "completed" });
+        throw new Error(`Unexpected ${path}`);
+      },
+    ) as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:3002", fetcher, true);
+    expect((await client.home()).main_account.balance.amount).toBe(866000);
+    expect((await client.fundingHistory())[0]?.chain.tx_hash).toBe(
+      record.chain.tx_hash,
+    );
+    expect((await client.funding("fnd_one")).status).toBe("completed");
+    const prepared = await client.prepareFunding(100000);
+    expect(prepared.destination_address).toBe(challenge.destination_address);
+    expect((await client.submitSimulatedFunding(prepared, 100000)).status).toBe(
+      "completed",
+    );
+    expect((await client.sweep(50000)).status).toBe("completed");
+    expect((await client.sweepHistory())[0]?.status).toBe("completed");
+    expect((await client.sweepDetail("swp_one")).sweep_id).toBe("swp_one");
+    expect(calls.map((call) => call.path)).toEqual([
+      "/v1/app/home",
+      "/v1/app/agent-wallet/funding",
+      "/v1/app/agent-wallet/funding/fnd_one",
+      "/v1/app/agent-wallet/funding/prepare",
+      "/v1/app/agent-wallet/funding",
+      "/v1/app/agent-wallet/sweep",
+      "/v1/app/agent-wallet/sweep",
+      "/v1/app/agent-wallet/sweep/swp_one",
+    ]);
+    expect(JSON.parse(String(calls[3]?.init.body))).toEqual({
+      amount: { amount: 100000, currency: "CNY" },
+    });
+    expect(JSON.parse(String(calls[4]?.init.body))).toEqual({
+      funding_id: "fnd_one",
+      challenge_id: "fch_one",
+      amount: { amount: 100000, currency: "CNY" },
+      verification: {
+        action_hash: challenge.action_hash,
+        device_signature: "simulated-local-funding",
+      },
+    });
+    expect(new Headers(calls[4]?.init.headers).get("Idempotency-Key")).toBe(
+      "funding-fnd_one",
+    );
+    expect(
+      new Headers(calls[5]?.init.headers).get("Idempotency-Key"),
+    ).toBeTruthy();
+    expect(calls.every((call) => call.init.credentials === "include")).toBe(
+      true,
+    );
+  });
+
+  it("keeps funding writes locked outside explicit local mode", async () => {
+    const fetcher = vi.fn(async () => json({}));
+    const client = createGatewayClient(
+      "https://bank.example",
+      fetcher as unknown as typeof fetch,
+      false,
+    );
+    await expect(client.prepareFunding(100)).rejects.toThrow(
+      "explicit loopback",
+    );
+    expect(() =>
+      client.submitSimulatedFunding({ funding_id: "fnd_one" } as never, 100),
+    ).toThrow("explicit loopback");
+    expect(fetcher).not.toHaveBeenCalled();
+  });
+
+  it("rejects malformed or fixture-like balance responses before showing money", async () => {
+    const client = createGatewayClient(
+      "http://127.0.0.1:3002",
+      vi.fn(async () =>
+        json({
+          schema: "home.v1",
+          simulated: true,
+          main_account: { balance: { amount: 866000, currency: "CNY" } },
+        }),
+      ) as unknown as typeof fetch,
+      true,
+    );
+    await expect(client.home()).rejects.toThrow("invalid chain balance");
+  });
+
+  it("rejects a chain observation timestamp far in the future", async () => {
+    const client = createGatewayClient(
+      "http://127.0.0.1:3002",
+      vi.fn(async () =>
+        json({
+          schema: "home.v1",
+          simulated: true,
+          main_account: { balance: { amount: 866000, currency: "CNY" } },
+          agent_wallet: {
+            balance: { amount: 0, currency: "CNY" },
+            reserved: { amount: 0, currency: "CNY" },
+            available: { amount: 0, currency: "CNY" },
+            address: `0x${"2".repeat(40)}`,
+            frozen: false,
+          },
+          block_number: 1,
+          observed_at: new Date(Date.now() + 60_000).toISOString(),
+          alerts: [],
+        }),
+      ) as unknown as typeof fetch,
+      true,
+    );
+    await expect(client.home()).rejects.toThrow("invalid chain balance");
+  });
+
+  it("surfaces an insufficient-main-funds rule from the Gateway funding response", async () => {
+    const client = createGatewayClient(
+      "http://127.0.0.1:3002",
+      vi.fn(async () =>
+        json(
+          {
+            error: {
+              code: "policy_denied",
+              rule: "insufficient_main_funds",
+              detail: {},
+              user_explanation:
+                "The simulated main account does not have enough confirmed funds.",
+              fixable: false,
+            },
+          },
+          403,
+        ),
+      ) as unknown as typeof fetch,
+      true,
+    );
+    await expect(
+      client.submitSimulatedFunding(
+        {
+          funding_id: "fnd_one",
+          challenge_id: "fch_one",
+          action_hash: `sha256:${"a".repeat(64)}`,
+          expires_at: "2099-01-01T00:00:00Z",
+          source_balance: { amount: 866000, currency: "CNY" },
+          destination_balance: { amount: 0, currency: "CNY" },
+          destination_address: `0x${"2".repeat(40)}`,
+          simulated: true,
+        },
+        800000,
+      ),
+    ).rejects.toMatchObject({
+      code: "policy_denied",
+      details: { rule: "insufficient_main_funds" },
+      message:
+        "The confirmed main-account balance is too low for this transfer.",
+    });
+  });
+
+  it("passes decoded QR content to the app-only scan path and confirms only in explicit loopback demo mode", async () => {
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const review = {
+      kind: "payment" as const,
+      confirmation_id: "hpm_one",
+      challenge_id: "hpc_one",
+      action_hash: `sha256:${"a".repeat(64)}`,
+      merchant_id: "mch_shopA",
+      merchant_legal_name: "BaoTaoShop (mock)",
+      merchant_uscc: "MOCK91440300TEST001",
+      order_id: "ord_one",
+      amount: { amount: 28400, currency: "CNY" as const },
+      source_account: "main" as const,
+      expires_at: "2099-01-01T00:00:00Z",
+      simulated: true as const,
+    };
+    const receipt = {
+      schema: "human_payment.v1",
+      confirmation_id: "hpm_one",
+      order_id: "ord_one",
+      merchant_id: "mch_shopA",
+      amount: review.amount,
+      source_account: "main",
+      status: "completed",
+      chain: { network: "FISCO BCOS local", tx_hash: `0x${"b".repeat(64)}` },
+      created_at: "2026-10-15T00:00:00Z",
+    };
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        calls.push({ path, init: init ?? {} });
+        if (path === "/v1/app/scan/decode") return json(review);
+        return json(receipt);
+      },
+    ) as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:3002", fetcher, true);
+    expect(await client.scanPayload("ecny://pay?d=signed")).toEqual(review);
+    expect(await client.confirmSimulatedHumanPayment(review)).toEqual(receipt);
+    expect(await client.humanPayment(review.confirmation_id)).toEqual(receipt);
+    expect(calls.map((call) => call.path)).toEqual([
+      "/v1/app/scan/decode",
+      "/v1/app/scan/payments/hpm_one/confirm",
+      "/v1/app/scan/payments/hpm_one",
+    ]);
+    expect(JSON.parse(String(calls[0]?.init.body))).toEqual({
+      qr_payload: "ecny://pay?d=signed",
+    });
+    expect(new Headers(calls[1]?.init.headers).get("Idempotency-Key")).toBe(
+      "human-payment-hpm_one",
+    );
+    expect(JSON.parse(String(calls[1]?.init.body))).toEqual({
+      challenge_id: "hpc_one",
+      verification: {
+        action_hash: review.action_hash,
+        device_signature: "simulated-local-human-payment",
+      },
+    });
+    const nonDemo = createGatewayClient("https://bank.example", fetcher, false);
+    expect(() => nonDemo.confirmSimulatedHumanPayment(review)).toThrow(
+      "explicit loopback",
+    );
+    expect(calls).toHaveLength(3);
   });
 });

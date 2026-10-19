@@ -32,10 +32,10 @@ export default async function CheckoutPage({
   return (
     <main className="inner-page checkout-page">
       <div className="eyebrow dark">CHECKOUT / {order.order_id}</div>
-      <h1 className="page-title">Ready for WeBank.</h1>
+      <h1 className="page-title">Payment request ready.</h1>
       <p className="page-intro">
-        The merchant has signed the bill. Your agent can carry it to WeBank,
-        where the wallet checks the actual payee, items and mandate.
+        The seller has signed this simulated bill. Review the seller, items,
+        delivery and total before using the payment request.
       </p>
       <div className="checkout-grid">
         <section className="checkout-card">
@@ -52,7 +52,7 @@ export default async function CheckoutPage({
             unoptimized
           />
           <strong>{formatCny(order.total.amount)}</strong>
-          <p>Scan or hand the URI to the WeBank connector.</p>
+          <p>Scan the QR code or copy the payment request URI.</p>
           <div className="uri-box">{order.payment_request}</div>
           <div className="tiny-note">
             Signed by {shops[order.shop].name}. Expires{" "}
@@ -64,17 +64,41 @@ export default async function CheckoutPage({
           <h2>{shops[order.shop].name}</h2>
           <div className="summary-list">
             {order.items.map((item) => (
-              <div key={item.sku}>
+              <div key={`${item.sku}-${JSON.stringify(item.options)}`}>
                 <span>
-                  {item.sku} × {item.qty}
+                  {item.sku}
+                  {Object.keys(item.options).length > 0
+                    ? ` (${[item.options.colour, item.options.size].filter(Boolean).join(" / ")})`
+                    : ""}{" "}
+                  × {item.qty}
                 </span>
                 <span>{formatCny(item.qty * item.unit_price.amount)}</span>
               </div>
             ))}
+            {order.shipping_fee && (
+              <div>
+                <span>Standard delivery</span>
+                <span>{formatCny(order.shipping_fee.amount)}</span>
+              </div>
+            )}
           </div>
           <div className="summary-total">
             <span>Total</span>
             <strong>{formatCny(order.total.amount)}</strong>
+          </div>
+          <div className="shipping-address-summary">
+            <strong>Shipping to</strong>
+            {order.shipping_address ? (
+              <p>
+                {order.shipping_address.name} · {order.shipping_address.phone}
+                <br />
+                {order.shipping_address.address_line}
+                <br />
+                {order.shipping_address.city} {order.shipping_address.postcode}
+              </p>
+            ) : (
+              <p>Address was not recorded for this earlier demo order.</p>
+            )}
           </div>
           <OrderStatus orderId={order.order_id} initialStatus={order.status} />
           <Link href="/" className="text-link">

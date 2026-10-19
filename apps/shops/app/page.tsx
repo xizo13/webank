@@ -1,6 +1,6 @@
 import Link from "next/link";
 import { formatCny, type ShopId, shops } from "../lib/catalog";
-import { listProducts } from "../lib/store";
+import { demoScenarios, listProducts, visibleShop } from "../lib/store";
 import { ProductArt } from "./product-art";
 
 export const dynamic = "force-dynamic";
@@ -13,20 +13,24 @@ export default async function HomePage({
   const params = await searchParams;
   const shop =
     params.shop && params.shop in shops ? (params.shop as ShopId) : undefined;
+  const scenarios = demoScenarios();
+  const visibleShops = (Object.keys(shops) as ShopId[]).filter((key) =>
+    visibleShop(key, scenarios),
+  );
   const results = listProducts(params.q || "", undefined, shop);
   return (
     <main>
       <section className="hero">
         <div className="hero-copy">
           <div className="eyebrow">
-            <span className="eyebrow-line" /> THE AGENT SHOPPING SANDBOX
+            <span className="eyebrow-line" /> THE SIMULATED SHOPPING SANDBOX
           </div>
           <h1>
             A better way to <em>buy with trust.</em>
           </h1>
           <p>
-            Explore four simulated shops. Compare products, build a cart, and
-            pass a signed payment request to the WeBank Agent Wallet.
+            Explore simulated shops. Compare products, build a cart, and receive
+            a signed e-CNY payment request at checkout.
           </p>
           <div className="hero-actions">
             <a href="#catalog" className="button primary">
@@ -65,7 +69,7 @@ export default async function HomePage({
             <Link className={!shop ? "active" : ""} href="/">
               All shops
             </Link>
-            {(Object.keys(shops) as ShopId[]).map((key) => (
+            {visibleShops.map((key) => (
               <Link
                 key={key}
                 className={shop === key ? "active" : ""}
@@ -118,7 +122,7 @@ export default async function HomePage({
         <div className="eyebrow">THE DEMO RULE</div>
         <p>
           Shopping content is untrusted.{" "}
-          <span>Every payment goes through WeBank's checks.</span>
+          <span>Review the seller, items and total before checkout.</span>
         </p>
         <Link href="/demo">Explore the scenarios ↗</Link>
       </section>

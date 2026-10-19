@@ -4,6 +4,7 @@ import {
   AgentWalletAbi,
   ChainRevertError,
   connectFisco,
+  decodeChainRevert,
   ECnySimAbi,
 } from "@webank/chain";
 import {
@@ -16,6 +17,7 @@ import {
 } from "viem";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 import { deployAll } from "../scripts/deploy.js";
+import { stageFundingMigration } from "../scripts/stage-funding.js";
 
 const rpcUrl = process.env.FISCO_RPC_URL ?? "http://127.0.0.1:8545";
 const bankPrivateKey = generatePrivateKey();
@@ -31,6 +33,9 @@ const denialId = keccak256(stringToHex("smoke-denial"));
 const agentId = keccak256(stringToHex("smoke-agent"));
 const agentKeyHash = keccak256(stringToHex("smoke-agent-key"));
 const signingKey = keccak256(stringToHex("demo-public-key"));
+const fundingId = keccak256(stringToHex("smoke-funding-one"));
+const secondFundingId = keccak256(stringToHex("smoke-funding-two"));
+const sweepId = keccak256(stringToHex("smoke-sweep-one"));
 const publicClient = createPublicClient({
   chain: defineChain({
     id: 20200,
@@ -48,7 +53,7 @@ const deployment = await deployAll({
   perPaymentCap: 30_000n,
   dailyCap: 50_000n,
   monthlyCap: 100_000n,
-  initialBalance: 100_000n,
+  mainOpeningBalance: 100_000n,
   merchant: {
     id: merchantId,
     payout: merchantPayout,
@@ -61,6 +66,54 @@ const deployment = await deployAll({
 const chain = await connectFisco({ rpcUrl, privateKey: gatewayPrivateKey });
 const bankChain = await connectFisco({ rpcUrl, privateKey: bankPrivateKey });
 const readonlyChain = await connectFisco({ rpcUrl });
+assert.equal(
+  await readonlyChain.getTokenBalance(
+    deployment.ecnySim,
+    deployment.agentWallet,
+  ),
+  0n,
+);
+assert.equal(
+  await readonlyChain.getTokenBalance(deployment.ecnySim, deployment.bank),
+  100_000n,
+);
+const fundingHash = await bankChain.fundAgentWallet(
+  deployment.ecnySim,
+  fundingId,
+  100_000n,
+);
+const fundingEvidence = await readonlyChain.getFundingEvidence(
+  fundingHash,
+  deployment.ecnySim,
+  fundingId,
+);
+assert.equal(fundingEvidence.main.toLowerCase(), deployment.bank.toLowerCase());
+assert.equal(
+  fundingEvidence.wallet.toLowerCase(),
+  deployment.agentWallet.toLowerCase(),
+);
+assert.equal(fundingEvidence.amount, 100_000n);
+const recoveredFunding = await readonlyChain.findFundingEvidence(
+  deployment.ecnySim,
+  fundingId,
+  fundingEvidence.blockNumber,
+);
+assert.equal(recoveredFunding?.hash, fundingHash);
+assert.equal(
+  await readonlyChain.getTokenBalance(deployment.ecnySim, deployment.bank),
+  0n,
+);
+assert.equal(
+  await readonlyChain.getTokenBalance(
+    deployment.ecnySim,
+    deployment.agentWallet,
+  ),
+  100_000n,
+);
+assert.equal(
+  await readonlyChain.isFundingApplied(deployment.ecnySim, fundingId),
+  true,
+);
 const registryRecord = await readonlyChain.getMerchant(
   deployment.merchantRegistry,
   merchantId,
@@ -190,6 +243,37 @@ async function expectReason(operation: () => Promise<Hex>, reason: string) {
 }
 
 await expectReason(
+  () => bankChain.fundAgentWallet(deployment.ecnySim, fundingId, 1n),
+  "already funded",
+);
+await expectReason(
+  () => bankChain.fundAgentWallet(deployment.ecnySim, secondFundingId, 0n),
+  "zero amount",
+);
+await expectReason(
+  () => bankChain.fundAgentWallet(deployment.ecnySim, secondFundingId, 1n),
+  "insufficient main",
+);
+await expectReason(
+  () => chain.fundAgentWallet(deployment.ecnySim, secondFundingId, 1n),
+  "not bank",
+);
+await assert.rejects(
+  publicClient.simulateContract({
+    address: deployment.ecnySim,
+    abi: ECnySimAbi,
+    functionName: "transfer",
+    args: [deployment.agentWallet, 1n],
+    account: deployment.bank,
+  }),
+  (error: unknown) => decodeChainRevert(error, ECnySimAbi) === "funding only",
+);
+assert.equal(
+  await readonlyChain.isFundingApplied(deployment.ecnySim, secondFundingId),
+  false,
+);
+
+await expectReason(
   () => chain.pay(deployment.agentWallet, firstPaymentId, merchantId, 100n),
   "already paid",
 );
@@ -279,6 +363,35 @@ await expectReason(
   () => chain.pay(deployment.agentWallet, secondPaymentId, merchantId, 1n),
   "frozen",
 );
+const sweepHash = await bankChain.sweepToMain(
+  deployment.agentWallet,
+  sweepId,
+  10_000n,
+);
+const sweepEvidence = await readonlyChain.getTransactionEvidence(sweepHash);
+assert.equal(sweepEvidence.sweptEvents.length, 1);
+assert.equal(sweepEvidence.sweptEvents[0]?.amount, 10_000n);
+assert.equal(
+  sweepEvidence.sweptEvents[0]?.main.toLowerCase(),
+  deployment.bank.toLowerCase(),
+);
+assert.equal(
+  await readonlyChain.getTokenBalance(deployment.ecnySim, deployment.bank),
+  10_000n,
+);
+await expectReason(
+  () => bankChain.sweepToMain(deployment.agentWallet, sweepId, 1n),
+  "already swept",
+);
+await expectReason(
+  () =>
+    chain.sweepToMain(
+      deployment.agentWallet,
+      keccak256(stringToHex("unauthorized-sweep")),
+      1n,
+    ),
+  "not bank",
+);
 
 const merchantBalance = await publicClient.readContract({
   address: deployment.ecnySim,
@@ -287,6 +400,52 @@ const merchantBalance = await publicClient.readContract({
   args: [merchantPayout],
 });
 assert.equal(merchantBalance, 27_900n);
+
+const priorEvidence = await readonlyChain.getTransactionEvidence(paymentHash);
+await assert.rejects(
+  stageFundingMigration({
+    bankPrivateKey,
+    old: { ...deployment, deploymentFingerprint: "isolated-rehearsal" },
+    rpcUrl,
+    priorReceiptHash: sweepHash,
+  }),
+  /Prior receipt is not a Paid event from old wallet/,
+);
+const staged = await stageFundingMigration({
+  bankPrivateKey,
+  old: { ...deployment, deploymentFingerprint: "isolated-rehearsal" },
+  rpcUrl,
+  priorReceiptHash: paymentHash,
+});
+const preservedEvidence =
+  await readonlyChain.getTransactionEvidence(paymentHash);
+assert.deepEqual(preservedEvidence.paidEvents, priorEvidence.paidEvents);
+assert.equal(preservedEvidence.status, "success");
+assert.notEqual(
+  staged.agentWallet.toLowerCase(),
+  deployment.agentWallet.toLowerCase(),
+);
+assert.notEqual(staged.ecnySim.toLowerCase(), deployment.ecnySim.toLowerCase());
+assert.equal(
+  staged.merchantRegistry.toLowerCase(),
+  deployment.merchantRegistry.toLowerCase(),
+);
+assert.equal(
+  staged.auditAnchor.toLowerCase(),
+  deployment.auditAnchor.toLowerCase(),
+);
+assert.equal(
+  await readonlyChain.getTokenBalance(staged.ecnySim, staged.agentWallet),
+  0n,
+);
+assert.equal(
+  await readonlyChain.getTokenBalance(staged.ecnySim, staged.bank),
+  866_000n,
+);
+assert.equal(
+  await readonlyChain.getTokenBalance(deployment.ecnySim, merchantPayout),
+  27_900n,
+);
 
 async function indexFor(
   functionName: "dayIndexFor" | "monthIndexFor",
@@ -396,7 +555,13 @@ console.log(
       paymentTx: paymentHash,
       denialAuditTx: auditHash,
       paidAmount: merchantBalance.toString(),
+      fundingTx: fundingHash,
       checks: [
+        "main opening balance and empty wallet",
+        "bank-only one-time funding with verified Funded event",
+        "funding recovery by ID from starting block",
+        "duplicate, zero, and insufficient-main funding rejection",
+        "direct wallet deposit blocked outside funding ID",
         "merchant registry",
         "licence registry",
         "payment receipt and event",
@@ -409,7 +574,9 @@ console.log(
         "denial audit anchor",
         "duplicate anchor",
         "freeze",
+        "bank-only one-time sweep back to main with receipt evidence",
         "ledger settlement",
+        "isolated same-chain staged migration preserves prior Paid receipt and registry",
         "calendar month boundary",
         "millisecond and second day boundary",
         "millisecond and second calendar month boundary",

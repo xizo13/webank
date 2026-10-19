@@ -4,6 +4,8 @@ import {
   randomInt,
   randomUUID,
 } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
+import { ChainRevertError } from "@webank/chain";
 import {
   type Agent,
   AgentSchema,
@@ -21,15 +23,19 @@ import {
   DeviceAuthorizationResponseSchema,
   DeviceTokenErrorSchema,
   decodePaymentRequestUri,
+  demoVariantBySku,
   GuardianInputSchema,
   GuardianVerdictSchema,
+  type Mandate,
   MandateResponseSchema,
   MandateSchema,
   PaidPaymentResponseSchema,
   PaymentHistoryResponseSchema,
   type PaymentRequest,
   PaymentStatusResponseSchema,
+  PendingMandatePaymentResponseSchema,
   PolicySchema,
+  PositiveMoneySchema,
   type Receipt,
   ReceiptSchema,
   TokenRequestSchema,
@@ -47,10 +53,14 @@ import {
   type Result,
   strictest,
 } from "./decision.js";
+import { denial, denialFromChecks } from "./denials.js";
+import { DurableState } from "./durable-state.js";
 import type {
   GatewayDependencies,
   GatewaySeed,
+  Merchant,
   StoredPayment,
+  WalletSnapshot,
 } from "./types.js";
 
 type Response = { statusCode: number; body: unknown };
@@ -75,12 +85,141 @@ type PairingEntry = {
   status: "pending" | "processing" | "approved" | "denied" | "consumed";
   mismatches: number;
   agentId?: string;
+  userId?: string;
+  requestNumberExpiresAt: number;
+  previousRequestNumber?: string;
+  replacementAgentId?: string | null;
+  replacementResolved?: boolean;
+  ticketAgentId?: string;
+  replacementPriorStatus?: Agent["status"];
 };
 type AppEvent = {
   id: number;
   type: string;
   data: unknown;
   created_at: string;
+};
+type FundingRecord = {
+  fundingId: string;
+  userId: string;
+  amount: number;
+  status:
+    | "prepared"
+    | "settling"
+    | "completed"
+    | "reconciliation_required"
+    | "failed";
+  deployment: string;
+  startingBlock: string;
+  txHash?: `0x${string}`;
+  blockNumber?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+type FundingChallenge = {
+  challengeId: string;
+  fundingId: string;
+  userId: string;
+  sessionBinding: string;
+  amount: number;
+  actionHash: string;
+  expiresAt: number;
+  consumed: boolean;
+};
+type SweepRecord = {
+  sweepId: string;
+  userId: string;
+  amount: number;
+  status: "settling" | "completed" | "reconciliation_required";
+  deployment: string;
+  startingBlock: string;
+  txHash?: `0x${string}`;
+  blockNumber?: string;
+  createdAt: string;
+  completedAt?: string;
+};
+type HumanPaymentRecord = {
+  confirmationId: string;
+  challengeId: string;
+  userId: string;
+  sessionBinding: string;
+  merchantId: string;
+  merchantLegalName: string;
+  merchantUscc: string;
+  merchantPublicKey: `0x${string}`;
+  payout: `0x${string}`;
+  orderId: string;
+  nonceKey: string;
+  paymentRequestHash: string;
+  paymentRequestExpiresAt: number;
+  amount: number;
+  actionHash: string;
+  expiresAt: number;
+  consumed: boolean;
+  status:
+    | "prepared"
+    | "settling"
+    | "completed"
+    | "reconciliation_required"
+    | "failed";
+  deployment: string;
+  startingBlock: string;
+  txHash?: `0x${string}`;
+  blockNumber?: string;
+  shopNotified?: boolean;
+  createdAt: string;
+  completedAt?: string;
+};
+type GatewayState = {
+  context: string;
+  agents: Agent[];
+  policies: ReturnType<typeof PolicySchema.parse>[];
+  mandates: ReturnType<typeof MandateSchema.parse>[];
+  approvals: Array<[string, ApprovalEntry]>;
+  pairings: PairingEntry[];
+  /** Agent spending fences held while owner-approved replacement releases mandates. */
+  replacingAgents?: string[];
+  replacementTickets: Array<
+    [
+      string,
+      { agentId: string; expiresAt: number; priorStatus: Agent["status"] },
+    ]
+  >;
+  actionChallenges: Array<
+    [
+      string,
+      {
+        userId: string;
+        agentId: string;
+        action: "unfreeze" | "relicense";
+        actionHash: string;
+        sessionBinding: string;
+        challenge: string;
+        expiresAt: number;
+        used: boolean;
+      },
+    ]
+  >;
+  payments: StoredPayment[];
+  usedMerchantNonces: string[];
+  audits: AuditRecord[];
+  eventsByUser: Array<[string, AppEvent[]]>;
+  idempotency: Array<
+    [
+      string,
+      { bodyHash: string; response: Response | null; paymentId?: string },
+    ]
+  >;
+  fundingRecords?: FundingRecord[];
+  fundingChallenges?: FundingChallenge[];
+  fundingKeys?: Array<[string, { bodyHash: string; fundingId: string }]>;
+  sweepRecords?: SweepRecord[];
+  sweepKeys?: Array<[string, { bodyHash: string; sweepId: string }]>;
+  humanPaymentRecords?: HumanPaymentRecord[];
+  humanPaymentKeys?: Array<
+    [string, { bodyHash: string; confirmationId: string }]
+  >;
+  auth: ReturnType<AgentAuth["snapshot"]>;
 };
 
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll("-", "")}`;
@@ -92,12 +231,18 @@ const error = (
   statusCode,
   body: { error: { code, ...(decisionId ? { decision_id: decisionId } : {}) } },
 });
+const agentDenied = (
+  rule: Parameters<typeof denial>[0],
+  detail: Record<string, unknown> = {},
+): Response => ({ statusCode: 403, body: { error: denial(rule, detail) } });
 
-/** In-memory vertical slice. Inject real authentication, funds, chain and signing adapters. */
+/** Gateway vertical slice. Inject real authentication, funds, chain and signing adapters. */
 export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   if (process.env.NODE_ENV === "production" && deps.demoApprovalsEnabled)
     throw new Error("Demo approval proofs are forbidden in production");
-  const app = Fastify({ logger: false });
+  const app = Fastify({
+    logger: process.env.WEBANK_LOCAL_DEMO === "1" ? { level: "error" } : false,
+  });
   if (deps.appCorsOrigin) {
     const allowedOrigin = new URL(deps.appCorsOrigin).origin;
     app.addHook("onRequest", async (request, reply) => {
@@ -169,18 +314,285 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   const approvals = new Map<string, ApprovalEntry>();
   const pairingByDevice = new Map<string, PairingEntry>();
   const pairingByUserCode = new Map<string, PairingEntry>();
+  const replacementTickets = new Map<
+    string,
+    { agentId: string; expiresAt: number; priorStatus: Agent["status"] }
+  >();
+  const actionChallenges = new Map<
+    string,
+    {
+      userId: string;
+      agentId: string;
+      action: "unfreeze" | "relicense";
+      actionHash: string;
+      sessionBinding: string;
+      challenge: string;
+      expiresAt: number;
+      used: boolean;
+    }
+  >();
   const payments = new Map<string, StoredPayment>();
+  const fundingRecords = new Map<string, FundingRecord>();
+  const fundingChallenges = new Map<string, FundingChallenge>();
+  const fundingKeys = new Map<
+    string,
+    { bodyHash: string; fundingId: string }
+  >();
+  const sweepRecords = new Map<string, SweepRecord>();
+  const sweepKeys = new Map<string, { bodyHash: string; sweepId: string }>();
+  const humanPaymentRecords = new Map<string, HumanPaymentRecord>();
+  const humanPaymentKeys = new Map<
+    string,
+    { bodyHash: string; confirmationId: string }
+  >();
+  const replacingAgents = new Set<string>();
   const usedMerchantNonces = new Set<string>();
   const audits: AuditRecord[] = [];
   const eventsByUser = new Map<string, AppEvent[]>();
   const idempotency = new Map<
     string,
-    { bodyHash: string; result: Promise<Response> }
+    {
+      bodyHash: string;
+      result: Promise<Response>;
+      response?: Response;
+      paymentId?: string;
+    }
   >();
+  const paymentSubmissionTails = new Map<string, Promise<void>>();
+  let recoveredIntents = false;
+  let restoredFromDisk = false;
+  const stateStore = deps.statePath
+    ? new DurableState<GatewayState>(deps.statePath)
+    : null;
+  try {
+    const restored = stateStore?.load();
+    if (restored) {
+      restoredFromDisk = true;
+      if (restored.context !== (deps.stateContext ?? "test"))
+        throw new Error("Gateway state belongs to another deployment");
+      if (
+        !Array.isArray(restored.agents) ||
+        !Array.isArray(restored.policies) ||
+        !Array.isArray(restored.mandates) ||
+        !Array.isArray(restored.approvals) ||
+        !Array.isArray(restored.pairings) ||
+        (restored.replacingAgents !== undefined &&
+          !Array.isArray(restored.replacingAgents)) ||
+        !Array.isArray(restored.payments) ||
+        !Array.isArray(restored.usedMerchantNonces) ||
+        !Array.isArray(restored.audits) ||
+        !Array.isArray(restored.eventsByUser) ||
+        !Array.isArray(restored.idempotency) ||
+        !Array.isArray(restored.replacementTickets) ||
+        !Array.isArray(restored.actionChallenges) ||
+        !restored.auth ||
+        !Array.isArray(restored.auth.access) ||
+        !Array.isArray(restored.auth.refresh) ||
+        !Array.isArray(restored.auth.nonces)
+      )
+        throw new Error("Gateway state payload is incompatible");
+      agents.clear();
+      for (const value of restored.agents) {
+        const item = AgentSchema.parse(value);
+        agents.set(item.agent_id, item);
+      }
+      policies.clear();
+      for (const value of restored.policies) {
+        const item = PolicySchema.parse(value);
+        policies.set(item.user_id, item);
+      }
+      mandates.clear();
+      for (const value of restored.mandates) {
+        const item = MandateSchema.parse(value);
+        mandates.set(item.mandate_id, item);
+      }
+      for (const [key, value] of restored.approvals)
+        approvals.set(key, {
+          ...value,
+          card: ApprovalSchema.parse(value.card),
+        });
+      for (const value of restored.pairings) {
+        const item = { ...value, card: ApprovalSchema.parse(value.card) };
+        if (item.status === "processing") item.status = "pending";
+        if (item.status === "pending") ensureIndependentPairing(item);
+        pairingByDevice.set(item.deviceCode, item);
+        pairingByUserCode.set(item.userCode, item);
+      }
+      for (const agentId of restored.replacingAgents ?? []) {
+        if (typeof agentId !== "string" || !agents.has(agentId))
+          throw new Error("Gateway replacement fence is incompatible");
+        replacingAgents.add(agentId);
+      }
+      for (const [key, value] of restored.replacementTickets)
+        replacementTickets.set(key, value);
+      for (const [key, value] of restored.actionChallenges)
+        actionChallenges.set(key, value);
+      for (const value of restored.payments) {
+        if (
+          !value ||
+          typeof value.paymentId !== "string" ||
+          typeof value.mandateId !== "string"
+        )
+          throw new Error("Gateway payment state is incompatible");
+        payments.set(value.paymentId, value);
+      }
+      for (const value of restored.fundingRecords ?? []) {
+        if (value.status === "settling") {
+          value.status = "reconciliation_required";
+          recoveredIntents = true;
+        }
+        fundingRecords.set(value.fundingId, value);
+      }
+      for (const value of restored.fundingChallenges ?? [])
+        fundingChallenges.set(value.challengeId, value);
+      for (const [key, value] of restored.fundingKeys ?? [])
+        fundingKeys.set(key, value);
+      for (const value of restored.sweepRecords ?? []) {
+        if (value.status === "settling") {
+          value.status = "reconciliation_required";
+          recoveredIntents = true;
+        }
+        sweepRecords.set(value.sweepId, value);
+      }
+      for (const [key, value] of restored.sweepKeys ?? [])
+        sweepKeys.set(key, value);
+      for (const value of restored.humanPaymentRecords ?? []) {
+        if (value.status === "settling") {
+          value.status = "reconciliation_required";
+          recoveredIntents = true;
+        }
+        humanPaymentRecords.set(value.confirmationId, value);
+      }
+      for (const [key, value] of restored.humanPaymentKeys ?? [])
+        humanPaymentKeys.set(key, value);
+      for (const value of restored.usedMerchantNonces)
+        usedMerchantNonces.add(value);
+      for (const value of restored.audits)
+        audits.push(AuditRecordSchema.parse(value));
+      for (const [key, value] of restored.eventsByUser)
+        eventsByUser.set(key, value);
+      for (const [key, value] of restored.idempotency) {
+        const payment = value.paymentId
+          ? payments.get(value.paymentId)
+          : undefined;
+        const response =
+          value.response ??
+          (payment
+            ? reconciliationError(payment)
+            : error("policy_denied", 503));
+        idempotency.set(key, {
+          bodyHash: value.bodyHash,
+          result: Promise.resolve(response),
+          response,
+          paymentId: value.paymentId,
+        });
+      }
+      agentAuth.restore(restored.auth);
+      for (const payment of payments.values()) {
+        if (payment.status === "settling") {
+          payment.status = "reconciliation_required";
+          const events = eventsByUser.get(payment.userId) ?? [];
+          events.push({
+            id: events.length + 1,
+            type: "payment.reconciliation_required",
+            data: {
+              payment_id: payment.paymentId,
+              ...(payment.settlementTx
+                ? { payment_tx: payment.settlementTx }
+                : {}),
+            },
+            created_at: now().toISOString(),
+          });
+          eventsByUser.set(payment.userId, events);
+          recoveredIntents = true;
+        }
+      }
+      deps.restoreReservations?.([...mandates.values()]);
+    }
+  } catch (failure) {
+    stateStore?.close();
+    throw failure;
+  }
+  function snapshot(): GatewayState {
+    return {
+      context: deps.stateContext ?? "test",
+      agents: [...agents.values()],
+      policies: [...policies.values()],
+      mandates: [...mandates.values()],
+      approvals: [...approvals],
+      pairings: [...pairingByDevice.values()],
+      replacingAgents: [...replacingAgents],
+      replacementTickets: [...replacementTickets],
+      actionChallenges: [...actionChallenges],
+      payments: [...payments.values()],
+      usedMerchantNonces: [...usedMerchantNonces],
+      audits,
+      eventsByUser: [...eventsByUser],
+      idempotency: [...idempotency].map(([key, value]) => [
+        key,
+        {
+          bodyHash: value.bodyHash,
+          response: value.response ?? null,
+          ...(value.paymentId ? { paymentId: value.paymentId } : {}),
+        },
+      ]),
+      fundingRecords: [...fundingRecords.values()],
+      fundingChallenges: [...fundingChallenges.values()],
+      fundingKeys: [...fundingKeys],
+      sweepRecords: [...sweepRecords.values()],
+      sweepKeys: [...sweepKeys],
+      humanPaymentRecords: [...humanPaymentRecords.values()],
+      humanPaymentKeys: [...humanPaymentKeys],
+      auth: agentAuth.snapshot(),
+    };
+  }
+  function persist(): void {
+    stateStore?.save(snapshot());
+  }
+  if (stateStore && (!restoredFromDisk || recoveredIntents)) {
+    try {
+      persist();
+    } catch (failure) {
+      stateStore?.close();
+      throw failure;
+    }
+  }
+  if (stateStore) {
+    app.addHook("onSend", async (_request, _reply, payload) => {
+      persist();
+      return payload;
+    });
+  }
   const expiryTimers = new Set<ReturnType<typeof setTimeout>>();
   app.addHook("onClose", async () => {
     for (const timer of expiryTimers) clearTimeout(timer);
     expiryTimers.clear();
+    stateStore?.close();
+  });
+  app.addHook("onReady", async () => {
+    for (const mandate of mandates.values()) {
+      if (mandate.status !== "active" && mandate.status !== "pending_user")
+        continue;
+      const owner = agents.get(mandate.agent_id);
+      if (!owner) throw new Error("Gateway mandate references a missing agent");
+      if (owner.status !== "revoked" && !owner.deleted_at) continue;
+      // An uncertain payment keeps its hold until the rail is reconciled.
+      if (mandate.in_flight_payment_id !== null) continue;
+      if (mandate.status === "active") await deps.releaseMandate(mandate);
+      mandate.status = "cancelled";
+      for (const entry of approvals.values()) {
+        if (
+          entry.mandateId === mandate.mandate_id &&
+          entry.card.status === "pending"
+        )
+          entry.card.status = "rejected";
+      }
+      emitEvent(owner.user_id, "mandate.cancelled", {
+        mandate_id: mandate.mandate_id,
+        reason: "revoked_agent_recovery",
+      });
+      persist();
+    }
   });
 
   function emitEvent(userId: string, type: string, data: unknown): void {
@@ -192,6 +604,177 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       created_at: now().toISOString(),
     });
     eventsByUser.set(userId, events);
+  }
+
+  async function cancelRevokedAgentMandates(
+    agent: Agent,
+    reason: string,
+  ): Promise<boolean> {
+    persist();
+    const cancel = (mandate: Mandate) => {
+      mandate.status = "cancelled";
+      for (const entry of approvals.values()) {
+        if (
+          entry.mandateId === mandate.mandate_id &&
+          entry.card.status === "pending"
+        ) {
+          entry.card.status = "rejected";
+          emitEvent(agent.user_id, "approval.resolved", {
+            approval_id: entry.card.approval_id,
+            status: "rejected",
+          });
+        }
+      }
+      emitEvent(agent.user_id, "mandate.cancelled", {
+        mandate_id: mandate.mandate_id,
+        reason,
+      });
+    };
+    for (const mandate of mandates.values()) {
+      if (
+        mandate.agent_id === agent.agent_id &&
+        mandate.status === "pending_user"
+      )
+        cancel(mandate);
+    }
+    for (const entry of approvals.values()) {
+      const payment = entry.paymentId ? payments.get(entry.paymentId) : null;
+      if (
+        payment?.agentId === agent.agent_id &&
+        entry.card.status === "pending"
+      ) {
+        entry.card.status = "rejected";
+        emitEvent(agent.user_id, "approval.resolved", {
+          approval_id: entry.card.approval_id,
+          status: "rejected",
+        });
+      }
+    }
+    for (const payment of payments.values()) {
+      if (
+        payment.agentId !== agent.agent_id ||
+        payment.status !== "awaiting_user"
+      )
+        continue;
+      const response = await settle(
+        payment,
+        "DENIED",
+        "The agent's access was revoked before approval.",
+      );
+      if (response.statusCode >= 500) return false;
+    }
+    const outstanding = [...mandates.values()].filter(
+      (mandate) =>
+        mandate.agent_id === agent.agent_id && mandate.status === "active",
+    );
+    try {
+      for (const mandate of outstanding) {
+        if (mandate.status === "active" && !mandate.in_flight_payment_id)
+          await deps.releaseMandate(mandate);
+      }
+    } catch {
+      return false;
+    }
+    for (const mandate of outstanding) {
+      if (mandate.in_flight_payment_id) continue;
+      cancel(mandate);
+    }
+    return true;
+  }
+
+  function pairingStatus(pairing: PairingEntry) {
+    if (pairing.status === "approved" || pairing.status === "consumed")
+      return "approved";
+    if (pairing.status === "denied") return "rejected";
+    if (pairing.expiresAt <= now().getTime()) return "expired";
+    return "pending";
+  }
+
+  function rotatePairingNumber(pairing: PairingEntry) {
+    if (pairingStatus(pairing) !== "pending") return;
+    if (pairing.requestNumberExpiresAt > now().getTime()) return;
+    pairing.previousRequestNumber = pairing.requestNumber;
+    do {
+      pairing.requestNumber = randomInt(0, 1_000_000)
+        .toString()
+        .padStart(6, "0");
+    } while (pairing.requestNumber === pairing.previousRequestNumber);
+    pairing.requestNumberExpiresAt = Math.min(
+      now().getTime() + 180_000,
+      pairing.expiresAt,
+    );
+  }
+
+  function replacementSummary(agent: Agent) {
+    return {
+      agent_id: agent.agent_id,
+      display_name: agent.display_name,
+      provider: agent.provider,
+      prior_status: agent.status,
+      prior_licence_level: agent.licence.level,
+      points: agent.licence.points,
+      demerit_count: Math.max(0, -agent.licence.points),
+      latest_reason:
+        audits.filter((item) => item.subject_id === agent.agent_id).at(-1)
+          ?.summary ?? null,
+      root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
+      deleted_at: agent.deleted_at ?? null,
+    };
+  }
+
+  function pairingSummary(pairing: PairingEntry) {
+    const prior = pairing.replacementAgentId
+      ? agents.get(pairing.replacementAgentId)
+      : null;
+    return {
+      schema: "pairing.v1",
+      user_code: pairing.userCode,
+      client_name: pairing.clientName,
+      provider: pairing.provider,
+      requested_scopes: pairing.scopes,
+      status: pairingStatus(pairing),
+      agent_id: pairing.agentId ?? null,
+      expires_at: new Date(pairing.expiresAt).toISOString(),
+      request_number_expires_at:
+        pairingStatus(pairing) === "pending"
+          ? new Date(pairing.requestNumberExpiresAt).toISOString()
+          : null,
+      replacement: prior
+        ? {
+            ...replacementSummary(prior),
+            ...(pairing.replacementPriorStatus
+              ? { status_before_revoke: pairing.replacementPriorStatus }
+              : {}),
+          }
+        : null,
+    };
+  }
+
+  function ensureIndependentPairing(pairing: PairingEntry): void {
+    if (
+      pairing.replacementResolved === true &&
+      !pairing.replacementAgentId &&
+      !pairing.ticketAgentId
+    )
+      return;
+    pairing.replacementAgentId = null;
+    pairing.replacementResolved = true;
+    pairing.ticketAgentId = undefined;
+    pairing.replacementPriorStatus = undefined;
+    pairing.card.lines = [
+      `Agent request: ${pairing.clientName}`,
+      `Provider claim: ${pairing.provider}`,
+      `Requested scopes: ${pairing.scopes.join(", ")}`,
+      `Public key: ${pairing.publicKey}`,
+    ];
+    // A pending legacy consent must acquire a new hash before it can approve
+    // an independent identity. A prior lineage choice cannot carry over.
+    pairing.card.payload_hash = sha256({
+      schema: "pairing_consent.v2",
+      userCode: pairing.userCode,
+      publicKey: pairing.publicKey,
+      lines: pairing.card.lines,
+    });
   }
 
   async function agentFor(
@@ -208,6 +791,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           rawBodies.get(request) ?? Buffer.alloc(0),
           agents,
           now().getTime(),
+          true,
         );
         if ("error" in result) return { response: error(result.error, 401) };
         authenticated = result.agent;
@@ -221,11 +805,29 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       return { response: error("bad_signature", 401) };
     if (
       registered.status !== "active" ||
-      registered.licence.level === "SUSPENDED"
+      registered.licence.level === "SUSPENDED" ||
+      replacingAgents.has(registered.agent_id)
     )
       return { response: error("agent_frozen", 401) };
+    if (!deps.authenticateAgent) {
+      const token = request.headers.authorization?.match(
+        /^Bearer ([A-Za-z0-9_-]+)$/,
+      )?.[1];
+      const status = agentAuth.accessStatus(
+        token,
+        registered.agent_id,
+        now().getTime(),
+      );
+      if (status !== "valid")
+        return {
+          response: error(
+            status === "expired" ? "token_expired" : "bad_signature",
+            401,
+          ),
+        };
+    }
     if (!registered.scopes.includes(scope))
-      return { response: error("scope_missing", 403) };
+      return { response: agentDenied("scope_missing", { scope }) };
     return { agent: registered };
   }
 
@@ -235,6 +837,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     } catch {
       return null;
     }
+  }
+
+  function appSessionBinding(request: FastifyRequest): string {
+    return sha256(
+      request.headers.cookie ?? request.headers.authorization ?? "",
+    );
   }
 
   async function idem(
@@ -252,11 +860,229 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       return existing.bodyHash === bodyHash
         ? existing.result
         : error("idempotency_conflict", 409);
+    const entry: {
+      bodyHash: string;
+      result: Promise<Response>;
+      response?: Response;
+      paymentId?: string;
+    } = {
+      bodyHash,
+      result: Promise.resolve(error("reconciliation_required", 503)),
+    };
     const result = Promise.resolve()
       .then(run)
-      .catch(() => error("policy_denied", 503));
-    idempotency.set(mapKey, { bodyHash, result });
+      .catch(() => error("policy_denied", 503))
+      .then((response) => {
+        entry.response = response;
+        return response;
+      });
+    entry.result = result;
+    idempotency.set(mapKey, entry);
     return result;
+  }
+
+  async function serializePaymentSubmission<T>(
+    userId: string,
+    run: () => Promise<T>,
+  ): Promise<T> {
+    const prior = paymentSubmissionTails.get(userId);
+    let release!: () => void;
+    const current = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    paymentSubmissionTails.set(userId, current);
+    if (prior) await prior;
+    try {
+      return await run();
+    } finally {
+      release();
+      if (paymentSubmissionTails.get(userId) === current)
+        paymentSubmissionTails.delete(userId);
+    }
+  }
+
+  const walletMoney = (amount: number) => ({
+    amount,
+    currency: "CNY" as const,
+  });
+  const walletDeployment = deps.walletFunding
+    ? JSON.stringify(deps.walletFunding.deployment)
+    : null;
+  function reservedWalletFunds(userId: string): number {
+    return [...mandates.values()].reduce((total, mandate) => {
+      if (
+        mandate.status !== "active" ||
+        agents.get(mandate.agent_id)?.user_id !== userId
+      )
+        return total;
+      const budget = mandate.constraints.find((item) => item.type === "budget");
+      return (
+        total +
+        (budget ? Math.max(0, budget.max.amount - mandate.spent.amount) : 0)
+      );
+    }, 0);
+  }
+  function balanceChangePending(userId: string): boolean {
+    return (
+      [...fundingRecords.values()].some(
+        (item) =>
+          item.userId === userId &&
+          (item.status === "settling" ||
+            item.status === "reconciliation_required"),
+      ) ||
+      [...sweepRecords.values()].some(
+        (item) =>
+          item.userId === userId &&
+          (item.status === "settling" ||
+            item.status === "reconciliation_required"),
+      ) ||
+      [...humanPaymentRecords.values()].some(
+        (item) =>
+          item.userId === userId &&
+          (item.status === "settling" ||
+            item.status === "reconciliation_required"),
+      ) ||
+      [...payments.values()].some(
+        (item) =>
+          item.userId === userId &&
+          (item.status === "settling" ||
+            item.status === "reconciliation_required"),
+      )
+    );
+  }
+  function humanPaymentPublic(item: HumanPaymentRecord) {
+    return {
+      schema: "human_payment.v1" as const,
+      confirmation_id: item.confirmationId,
+      order_id: item.orderId,
+      merchant_id: item.merchantId,
+      amount: walletMoney(item.amount),
+      source_account: "main" as const,
+      status: item.status,
+      chain: {
+        network: "FISCO BCOS local",
+        ...(item.txHash ? { tx_hash: item.txHash } : {}),
+        ...(item.blockNumber ? { block_number: Number(item.blockNumber) } : {}),
+      },
+      created_at: item.createdAt,
+      ...(item.completedAt ? { completed_at: item.completedAt } : {}),
+    };
+  }
+  function orderCommitted(
+    merchantId: string,
+    orderId: string,
+    excludeAgentPaymentId?: string,
+  ): boolean {
+    return (
+      [...payments.values()].some(
+        (item) =>
+          item.paymentId !== excludeAgentPaymentId &&
+          item.request.merchant_id === merchantId &&
+          item.request.order_id === orderId &&
+          item.status !== "denied",
+      ) ||
+      [...humanPaymentRecords.values()].some(
+        (item) =>
+          item.merchantId === merchantId &&
+          item.orderId === orderId &&
+          item.status !== "prepared" &&
+          item.status !== "failed",
+      )
+    );
+  }
+  function fundingPublic(item: FundingRecord) {
+    return {
+      schema: "funding.v1" as const,
+      funding_id: item.fundingId,
+      user_id: item.userId,
+      amount: walletMoney(item.amount),
+      source: "main" as const,
+      destination: "agent_wallet" as const,
+      status: item.status,
+      chain: {
+        network: "FISCO BCOS local",
+        ...(item.txHash ? { tx_hash: item.txHash } : {}),
+        ...(item.blockNumber ? { block_number: Number(item.blockNumber) } : {}),
+      },
+      created_at: item.createdAt,
+      ...(item.completedAt ? { completed_at: item.completedAt } : {}),
+    };
+  }
+  function safeFen(value: bigint): number {
+    const number = Number(value);
+    if (value < 0n || !Number.isSafeInteger(number))
+      throw new Error("Chain balance exceeds supported money range");
+    return number;
+  }
+  function sweepPublic(item: SweepRecord) {
+    return {
+      schema: "sweep.v1" as const,
+      sweep_id: item.sweepId,
+      user_id: item.userId,
+      amount: walletMoney(item.amount),
+      status: item.status,
+      chain: {
+        network: "FISCO BCOS local",
+        ...(item.txHash ? { tx_hash: item.txHash } : {}),
+        ...(item.blockNumber ? { block_number: Number(item.blockNumber) } : {}),
+      },
+      created_at: item.createdAt,
+      ...(item.completedAt ? { completed_at: item.completedAt } : {}),
+    };
+  }
+  function transferMatches(
+    evidence: { amount: bigint; main: string; wallet: string },
+    amount: number,
+  ): boolean {
+    const deployment = deps.walletFunding?.deployment;
+    return (
+      !!deployment &&
+      evidence.amount === BigInt(amount) &&
+      evidence.main.toLowerCase() === deployment.main.toLowerCase() &&
+      evidence.wallet.toLowerCase() === deployment.wallet.toLowerCase()
+    );
+  }
+  async function reconcileFunding(item: FundingRecord): Promise<void> {
+    const rail = deps.walletFunding;
+    if (!rail || item.status !== "reconciliation_required") return;
+    if (item.deployment !== walletDeployment) return;
+    if (!(await rail.fundingApplied(item.fundingId))) return;
+    const evidence = item.txHash
+      ? await rail.fundingEvidence(item.txHash, item.fundingId)
+      : await rail.findFundingEvidence(
+          item.fundingId,
+          BigInt(item.startingBlock),
+        );
+    if (!evidence || !transferMatches(evidence, item.amount)) return;
+    item.txHash = evidence.hash;
+    item.blockNumber = evidence.blockNumber.toString();
+    item.status = "completed";
+    item.completedAt = now().toISOString();
+    emitEvent(item.userId, "wallet.funded", {
+      funding_id: item.fundingId,
+      amount: walletMoney(item.amount),
+      chain_tx: evidence.hash,
+    });
+    persist();
+  }
+  async function reconcileSweep(item: SweepRecord): Promise<void> {
+    const rail = deps.walletFunding;
+    if (!rail || item.status !== "reconciliation_required") return;
+    if (item.deployment !== walletDeployment) return;
+    const evidence = item.txHash
+      ? await rail.sweepEvidence(item.txHash, item.sweepId)
+      : await rail.findSweepEvidence(item.sweepId, BigInt(item.startingBlock));
+    if (!evidence || !transferMatches(evidence, item.amount)) return;
+    item.txHash = evidence.hash;
+    item.blockNumber = evidence.blockNumber.toString();
+    item.status = "completed";
+    item.completedAt = now().toISOString();
+    emitEvent(item.userId, "wallet.swept", {
+      sweep_id: item.sweepId,
+      amount: walletMoney(item.amount),
+      chain_tx: evidence.hash,
+    });
+    persist();
   }
 
   async function writeAudit(input: {
@@ -320,19 +1146,27 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   function storeApproval(entry: ApprovalEntry): void {
     approvals.set(entry.card.approval_id, entry);
     emitEvent(entry.userId, "approval.created", { approval: entry.card });
+    scheduleApprovalExpiry(entry);
+  }
+
+  function scheduleApprovalExpiry(entry: ApprovalEntry): void {
+    if (entry.card.status !== "pending") return;
     const delay = Math.max(
       0,
       Date.parse(entry.card.expires_at) - now().getTime(),
     );
     const timer = setTimeout(() => {
       expiryTimers.delete(timer);
-      void expireApproval(entry).catch((failure: unknown) => {
-        app.log.error({ failure }, "Approval expiry requires reconciliation");
-      });
+      void expireApproval(entry)
+        .then(() => persist())
+        .catch((failure: unknown) => {
+          app.log.error({ failure }, "Approval expiry requires reconciliation");
+        });
     }, delay);
     timer.unref();
     expiryTimers.add(timer);
   }
+  for (const entry of approvals.values()) scheduleApprovalExpiry(entry);
 
   async function makeReceipt(
     payment: StoredPayment,
@@ -381,10 +1215,17 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     payment: StoredPayment,
     outcome: "APPROVED" | "DENIED",
     explanation: string,
+    explicitDenial?: Parameters<typeof denial>[0],
   ): Promise<Response> {
     const mandate = mandates.get(payment.mandateId);
-    if (!mandate) return error("mandate_not_found", 403);
+    if (!mandate) return agentDenied("mandate_not_found");
     try {
+      if (
+        outcome === "APPROVED" &&
+        deps.walletFunding &&
+        balanceChangePending(payment.userId)
+      )
+        return error("reconciliation_required", 503);
       if (outcome === "APPROVED") {
         const currentAgent = agents.get(payment.agentId);
         const currentMerchant = await deps.lookupMerchant(
@@ -392,6 +1233,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         );
         if (
           currentAgent?.status !== "active" ||
+          replacingAgents.has(payment.agentId) ||
           currentAgent.licence.level === "SUSPENDED" ||
           mandate.in_flight_payment_id !== payment.paymentId ||
           Date.parse(payment.request.expires_at) <= now().getTime() ||
@@ -405,9 +1247,28 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           explanation =
             "The agent, merchant, or mandate changed before settlement.";
         }
+        if (
+          outcome === "APPROVED" &&
+          orderCommitted(
+            payment.request.merchant_id,
+            payment.request.order_id,
+            payment.paymentId,
+          )
+        ) {
+          outcome = "DENIED";
+          explanation = "This merchant order is already being paid.";
+          explicitDenial = "duplicate_payment";
+        }
       }
+      if (payment.status !== "awaiting_user")
+        return payment.status === "settling" ||
+          payment.status === "reconciliation_required"
+          ? reconciliationError(payment)
+          : error("action_changed", 409);
       let paymentTx: `0x${string}` | undefined;
       if (outcome === "APPROVED") {
+        payment.status = "settling";
+        persist();
         paymentTx = await deps.executePayment({
           paymentId: payment.paymentId,
           mandate,
@@ -415,6 +1276,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           merchant: payment.merchant,
         });
         payment.settlementTx = paymentTx;
+        persist();
       }
       payment.decision = DecisionSchema.parse({
         ...payment.decision,
@@ -476,6 +1338,22 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           }),
         };
       }
+      const denialError = explicitDenial
+        ? denial(explicitDenial)
+        : payment.decision.checks.some((check) => check.result === "deny")
+          ? denialFromChecks(payment.decision.checks)
+          : undefined;
+      payment.denialError = denialError;
+      if (!denialError)
+        return {
+          statusCode: 200,
+          body: PaymentStatusResponseSchema.parse({
+            payment_id: payment.paymentId,
+            status: "denied",
+            decision: payment.decision,
+            receipt: payment.receipt,
+          }),
+        };
       return {
         statusCode: 403,
         body: DeniedPaymentResponseSchema.parse({
@@ -483,9 +1361,43 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           status: "denied",
           decision: payment.decision,
           receipt: payment.receipt,
+          error: denialError,
         }),
       };
-    } catch {
+    } catch (failure) {
+      if (
+        failure instanceof ChainRevertError &&
+        failure.reason === "insufficient" &&
+        payment.status === "settling" &&
+        !payment.settlementTx
+      ) {
+        try {
+          const explanation =
+            "The Agent Wallet does not hold enough confirmed funds.";
+          payment.decision = DecisionSchema.parse({
+            ...payment.decision,
+            outcome: "DENIED",
+            user_explanation: explanation,
+          });
+          payment.receipt = await makeReceipt(payment, "DENIED");
+          payment.denialError = denial("insufficient_wallet_funds");
+          payment.status = "denied";
+          mandate.in_flight_payment_id = null;
+          persist();
+          return {
+            statusCode: 403,
+            body: DeniedPaymentResponseSchema.parse({
+              payment_id: payment.paymentId,
+              status: "denied",
+              decision: payment.decision,
+              receipt: payment.receipt,
+              error: payment.denialError,
+            }),
+          };
+        } catch {
+          // Receipt or audit failure remains uncertain to the caller.
+        }
+      }
       payment.status = "reconciliation_required";
       emitEvent(payment.userId, "payment.reconciliation_required", {
         payment_id: payment.paymentId,
@@ -522,7 +1434,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     });
     if (entry.mandateId) {
       const mandate = mandates.get(entry.mandateId);
-      if (mandate) mandate.status = "cancelled";
+      if (mandate) mandate.status = "expired";
     }
     if (entry.paymentId) {
       const payment = payments.get(entry.paymentId);
@@ -543,7 +1455,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     agent: Agent,
     code: string,
     statusCode: number,
-    data: unknown,
+    data: Record<string, unknown>,
   ): Promise<Response> {
     const decisionId = id("dec");
     await writeAudit({
@@ -553,13 +1465,66 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       summary: `DENIED before a verified payment request: ${code}`,
       data,
     });
+    if (statusCode === 403 && code === "merchant_unknown")
+      return agentDenied("merchant_unknown");
+    if (statusCode === 403 && code === "variant_sku_mismatch")
+      return agentDenied("variant_sku_mismatch", data);
+    if (statusCode === 403 && code === "duplicate_payment")
+      return agentDenied("duplicate_payment", data);
     return error(code, statusCode, decisionId);
   }
 
-  async function submitPayment(agent: Agent, raw: unknown): Promise<Response> {
+  async function submitPayment(
+    agent: Agent,
+    raw: unknown,
+    request?: FastifyRequest,
+  ): Promise<Response> {
+    if (deps.walletFunding && balanceChangePending(agent.user_id))
+      return error("reconciliation_required", 503);
     const parsed = CreatePaymentRequestSchema.safeParse(raw);
     if (!parsed.success) return error("payreq_invalid", 400);
     const body = parsed.data;
+    if (!body.mandate_id)
+      return agentDenied("mandate_required", {
+        required_fields: [
+          "description",
+          "user_text",
+          "intent_level",
+          "constraints",
+        ],
+      });
+    await expireDueApprovals();
+    const mandate = mandates.get(body.mandate_id);
+    if (!mandate || mandate.agent_id !== agent.agent_id)
+      return agentDenied("mandate_not_found");
+    if (mandate.agent_key_binding !== agent.public_key)
+      return agentDenied("agent_key_mismatch");
+    if (mandate.status === "pending_user") {
+      const pending = [...approvals.values()].find(
+        (entry) =>
+          entry.mandateId === mandate.mandate_id &&
+          entry.card.status === "pending",
+      );
+      if (!pending) return agentDenied("mandate_not_found");
+      return {
+        statusCode: 202,
+        body: PendingMandatePaymentResponseSchema.parse({
+          mandate_id: mandate.mandate_id,
+          status: "awaiting_user",
+          approval_id: pending.card.approval_id,
+          level: pending.card.level,
+          expires_at: pending.card.expires_at,
+        }),
+      };
+    }
+    if (mandate.status === "cancelled") return agentDenied("mandate_cancelled");
+    if (mandate.status === "exhausted") return agentDenied("mandate_exhausted");
+    if (mandate.status === "expired") return agentDenied("mandate_expired");
+    const window = mandate.constraints.find(
+      (constraint) => constraint.type === "execution_window",
+    );
+    if (window && Date.parse(window.not_after) <= now().getTime())
+      return agentDenied("execution_window_closed");
     let paymentRequest: PaymentRequest;
     try {
       paymentRequest = decodePaymentRequestUri(body.payment_request);
@@ -580,6 +1545,26 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         order_id: paymentRequest.order_id,
         reason: "merchant_signature_invalid",
       });
+    for (const item of paymentRequest.line_items) {
+      if (item.type !== "product") continue;
+      const known = deps.lookupVariant
+        ? await deps.lookupVariant(item.sku)
+        : (demoVariantBySku(item.sku) ?? null);
+      if (
+        !known ||
+        known.merchant_id !== paymentRequest.merchant_id ||
+        known.gtin !== item.gtin ||
+        known.variant !== item.variant ||
+        known.options.colour !== item.options.colour ||
+        known.options.size !== item.options.size ||
+        Object.keys(known.options).length !== Object.keys(item.options).length
+      )
+        return rejectedAttempt(agent, "variant_sku_mismatch", 403, {
+          merchant_id: paymentRequest.merchant_id,
+          order_id: paymentRequest.order_id,
+          sku: item.sku,
+        });
+    }
     if (Date.parse(paymentRequest.expires_at) <= now().getTime())
       return rejectedAttempt(agent, "payreq_invalid", 400, {
         merchant_id: merchant.merchant_id,
@@ -599,16 +1584,42 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         order_id: paymentRequest.order_id,
         reason: "signed_line_total_mismatch",
       });
-    const mandate = mandates.get(body.mandate_id);
+    const policy = policies.get(agent.user_id);
+    const budgetLimit = mandate.constraints.find(
+      (constraint) => constraint.type === "budget",
+    );
+    const amountLimit = mandate.constraints.find(
+      (constraint) => constraint.type === "amount_range",
+    );
+    const recurrenceLimit = mandate.constraints.find(
+      (constraint) => constraint.type === "recurrence",
+    );
+    const categoryLimit = mandate.constraints.find(
+      (constraint) => constraint.type === "categories",
+    );
     if (
-      !mandate ||
-      mandate.agent_id !== agent.agent_id ||
-      mandate.agent_key_binding !== agent.public_key
+      !policy ||
+      !budgetLimit ||
+      !amountLimit ||
+      !recurrenceLimit ||
+      !categoryLimit ||
+      !window
     )
-      return rejectedAttempt(agent, "mandate_not_found", 403, {
-        mandate_id: body.mandate_id,
-      });
+      return error("service_unavailable", 503);
+    if (
+      budgetLimit.max.currency !== policy.per_payment_max.currency ||
+      amountLimit.max.currency !== policy.per_payment_max.currency ||
+      mandate.spent.currency !== policy.per_payment_max.currency
+    )
+      return error("service_unavailable", 503);
+    if (paymentRequest.amount.currency !== policy.per_payment_max.currency)
+      return error("payreq_invalid", 400);
     if (mandate.in_flight_payment_id) return error("mandate_in_flight", 409);
+    if (orderCommitted(paymentRequest.merchant_id, paymentRequest.order_id))
+      return rejectedAttempt(agent, "duplicate_payment", 403, {
+        merchant_id: paymentRequest.merchant_id,
+        order_id: paymentRequest.order_id,
+      });
     const nonceKey = `${paymentRequest.merchant_id}:${paymentRequest.nonce}`;
     if (usedMerchantNonces.has(nonceKey))
       return rejectedAttempt(agent, "payreq_invalid", 400, {
@@ -619,6 +1630,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     usedMerchantNonces.add(nonceKey);
 
     const paymentId = id("pay");
+    if (request) {
+      const mapKey = `${agent.agent_id}:${request.method}:${request.url}:${request.headers["idempotency-key"]}`;
+      const entry = idempotency.get(mapKey);
+      if (entry) entry.paymentId = paymentId;
+    }
     mandate.in_flight_payment_id = paymentId;
     try {
       const checks: Check[] = [
@@ -640,15 +1656,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         ? { name: "mandate", result: "skipped" }
         : checkMandate(mandate, paymentRequest, merchant, now());
       checks.push(mandateCheck);
-      const policy = policies.get(agent.user_id);
       let policyCheck: Check = checks.some((check) => check.result === "deny")
         ? { name: "policy_licence", result: "skipped" }
-        : {
-            name: "policy_licence",
-            result: "deny",
-            detail: { reason: "policy_missing" },
-          };
-      if (policy && policyCheck.result !== "skipped") {
+        : { name: "policy_licence", result: "pass" };
+      if (policyCheck.result !== "skipped") {
         const paid = [...payments.values()].filter(
           (item) => item.userId === agent.user_id && item.status === "paid",
         );
@@ -691,11 +1702,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       let riskCheck: Check = { name: "risk", result: "skipped" };
       let riskSignals: { type: string; score: number; action: string }[] = [];
       if (!checks.some((check) => check.result === "deny")) {
-        const duplicate = [...payments.values()].some(
-          (item) =>
-            item.request.merchant_id === paymentRequest.merchant_id &&
-            item.request.order_id === paymentRequest.order_id &&
-            item.status !== "denied",
+        const duplicate = orderCommitted(
+          paymentRequest.merchant_id,
+          paymentRequest.order_id,
         );
         if (duplicate) {
           riskCheck = {
@@ -718,7 +1727,13 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             riskCheck = {
               name: "risk",
               result: assessment.result,
-              detail: { explanation: assessment.explanation },
+              detail: {
+                explanation: assessment.explanation,
+                ...(assessment.result === "deny" &&
+                assessment.signals.some((signal) => signal.type === "velocity")
+                  ? { reason: "velocity_blocked" }
+                  : {}),
+              },
               signals: assessment.signals.map((signal) => signal.type),
             };
           } catch {
@@ -827,6 +1842,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       });
       const payment: StoredPayment = {
         paymentId,
+        deployment: deps.stateContext,
         mandateId: mandate.mandate_id,
         agentId: agent.agent_id,
         userId: agent.user_id,
@@ -850,7 +1866,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         `${agent.display_name} wants to pay ${paymentRequest.amount.amount / 100} ${paymentRequest.amount.currency}`,
         [
           `To: ${merchant.legal_name} (${merchant.uscc})`,
-          `For: ${paymentRequest.line_items.map((item) => `${item.qty} x ${item.name}`).join(", ")}`,
+          `For: ${paymentRequest.line_items
+            .filter((item) => item.type === "product")
+            .map((item) => `${item.qty} x ${item.name} (${item.variant})`)
+            .join(", ")}`,
+          `Delivery: ${(paymentRequest.line_items.find((item) => item.type === "shipping")?.unit_price.amount ?? 0) / 100} ${paymentRequest.amount.currency}`,
           `Why asking: ${checks
             .filter((check) => check.result === "step_up")
             .map((check) => check.name)
@@ -884,6 +1904,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           status: "awaiting_user",
           decision,
           approval_id: card.approval_id,
+          level: card.level,
+          expires_at: card.expires_at,
           approval_level: card.level,
           poll_after: 3,
           ...(requestNumber ? { request_number: requestNumber } : {}),
@@ -899,10 +1921,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   }
 
   async function createMandate(agent: Agent, raw: unknown): Promise<Response> {
+    if (deps.walletFunding && balanceChangePending(agent.user_id))
+      return error("reconciliation_required", 503);
     const parsed = CreateMandateRequestSchema.safeParse(raw);
-    if (!parsed.success) return error("policy_denied", 400);
+    if (!parsed.success) return error("invalid_mandate", 400);
     const policy = policies.get(agent.user_id);
-    if (!policy) return error("policy_denied", 403);
+    if (!policy) return error("policy_denied", 503);
     const constraints = parsed.data.constraints;
     const budget = constraints.find((item) => item.type === "budget");
     const amountRange = constraints.find(
@@ -912,13 +1936,30 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     const window = constraints.find((item) => item.type === "execution_window");
     const categories = constraints.find((item) => item.type === "categories");
     if (!budget || !amountRange || !recurrence || !window || !categories)
-      return error("policy_denied", 403);
+      return error("invalid_mandate", 400);
     if (
       budget.max.currency !== policy.per_payment_max.currency ||
       amountRange.max.currency !== policy.per_payment_max.currency ||
       Date.parse(window.not_after) <= now().getTime()
     )
-      return error("policy_denied", 403);
+      return error("invalid_mandate", 400);
+    if (mandateIntentLevel(constraints) !== parsed.data.intent_level)
+      return error("invalid_mandate", 400);
+    if (amountRange.max.amount > policy.per_payment_max.amount)
+      return agentDenied("over_per_payment_cap", {
+        requested_fen: amountRange.max.amount,
+        cap_fen: policy.per_payment_max.amount,
+      });
+    if (budget.max.amount > policy.monthly_max.amount)
+      return agentDenied("over_monthly_cap", {
+        requested_fen: budget.max.amount,
+        cap_fen: policy.monthly_max.amount,
+      });
+    const blockedCategory = categories.allowed.find((category) =>
+      policy.blocked_categories.includes(category),
+    );
+    if (blockedCategory)
+      return agentDenied("category_blocked", { category: blockedCategory });
     const autoCap =
       agent.licence.level === "L"
         ? 0
@@ -931,14 +1972,14 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       amountRange.max.amount <= autoCap &&
       recurrence.max_occurrences === 1;
     const mandateId = id("mdt");
-    const mandate = MandateSchema.parse({
+    const mandateResult = MandateSchema.safeParse({
       schema: "mandate.v1",
       mandate_id: mandateId,
       agent_id: agent.agent_id,
       agent_key_binding: agent.public_key,
       description: parsed.data.description,
-      intent_level: mandateIntentLevel(constraints),
-      user_text: parsed.data.description,
+      intent_level: parsed.data.intent_level,
+      user_text: parsed.data.user_text,
       user_text_source: "agent_reported",
       constraints,
       status: auto ? "active" : "pending_user",
@@ -948,9 +1989,16 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       approved_by: auto ? "auto_threshold" : null,
       created_at: now().toISOString(),
     });
+    if (!mandateResult.success) return error("invalid_mandate", 400);
+    const mandate = mandateResult.data;
     if (auto) {
-      if (!(await deps.reserveMandate(mandate)))
-        return error("policy_denied", 403);
+      let reserved: boolean;
+      try {
+        reserved = await deps.reserveMandate(mandate);
+      } catch {
+        return error("chain_unavailable", 503);
+      }
+      if (!reserved) return agentDenied("insufficient_reserved_funds");
       try {
         await writeAudit({
           kind: "mandate",
@@ -969,13 +2017,23 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         body: CreateMandateResponseSchema.parse({ mandate }),
       };
     }
+    const firstMandate =
+      agent.licence.level === "L" &&
+      ![...mandates.values()].some(
+        (item) => item.agent_id === agent.agent_id && item.approved_by !== null,
+      );
+    const level = firstMandate ? "zero_trust" : "everyday";
+    const requestNumber = firstMandate
+      ? randomInt(0, 1_000_000).toString().padStart(6, "0")
+      : undefined;
     const card = approvalCard(
       "mandate",
-      "everyday",
+      level,
       mandateId,
       `${agent.display_name} requests a spending mandate`,
       [
-        `Agent request: ${parsed.data.description}`,
+        `User request (agent-reported until approved): ${parsed.data.user_text}`,
+        `Agent summary: ${parsed.data.description}`,
         `Maximum reserved budget: ${budget.max.amount / 100} ${budget.max.currency}`,
         `Lock level: ${mandate.intent_level}`,
         `Expires: ${window.not_after}`,
@@ -987,6 +2045,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         mandateId,
         agentId: agent.agent_id,
         description: parsed.data.description,
+        userText: parsed.data.user_text,
         constraints,
       },
     );
@@ -995,6 +2054,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       card,
       userId: agent.user_id,
       mandateId,
+      requestNumber,
       numberMismatches: 0,
     });
     return {
@@ -1002,6 +2062,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       body: CreateMandateResponseSchema.parse({
         mandate,
         approval_id: card.approval_id,
+        level: card.level,
+        expires_at: card.expires_at,
+        ...(requestNumber ? { request_number: requestNumber } : {}),
       }),
     };
   }
@@ -1017,7 +2080,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     if (!entry || entry.userId !== userId) return error("policy_denied", 403);
     if (entry.paymentId) {
       const uncertain = payments.get(entry.paymentId);
-      if (uncertain?.status === "reconciliation_required")
+      if (
+        uncertain?.status === "reconciliation_required" ||
+        uncertain?.status === "settling"
+      )
         return reconciliationError(uncertain);
     }
     await expireApproval(entry);
@@ -1039,6 +2105,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             payment,
             "DENIED",
             "You rejected the payment in the WeBank app.",
+            "user_rejected",
           );
       }
       return { statusCode: 200, body: { approval: entry.card } };
@@ -1070,6 +2137,16 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
               );
             }
           }
+          if (entry.mandateId) {
+            const mandate = mandates.get(entry.mandateId);
+            if (mandate) {
+              mandate.status = "cancelled";
+              await deps.recordNumberMatchFailure(
+                mandate.agent_id,
+                entry.card.approval_id,
+              );
+            }
+          }
         }
         return error("bad_signature", 401);
       }
@@ -1085,19 +2162,47 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     await expireApproval(entry);
     if (entry.card.status !== "pending") return error("policy_denied", 403);
     if (entry.mandateId) {
+      if (deps.walletFunding && balanceChangePending(userId))
+        return error("reconciliation_required", 503);
       const mandate = mandates.get(entry.mandateId);
       if (mandate?.status !== "pending_user")
         return error("mandate_not_found", 403);
+      const window = mandate.constraints.find(
+        (constraint) => constraint.type === "execution_window",
+      );
+      if (!window || Date.parse(window.not_after) <= now().getTime()) {
+        mandate.status = "expired";
+        entry.card.status = "expired";
+        return error("mandate_expired", 403);
+      }
       mandate.status = "active";
       mandate.approved_by = verifiedBy;
       mandate.user_text_source = "webank_screen";
       entry.card.status = "approved";
-      if (!(await deps.reserveMandate(mandate))) {
+      let reserved: boolean;
+      try {
+        reserved = await deps.reserveMandate(mandate);
+      } catch {
         mandate.status = "pending_user";
         mandate.approved_by = null;
         mandate.user_text_source = "agent_reported";
         entry.card.status = "pending";
-        return error("policy_denied", 403);
+        return error("chain_unavailable", 503);
+      }
+      if (!reserved) {
+        mandate.status = "cancelled";
+        mandate.approved_by = null;
+        mandate.user_text_source = "agent_reported";
+        entry.card.status = "rejected";
+        emitEvent(userId, "approval.resolved", {
+          approval_id: entry.card.approval_id,
+          status: "rejected",
+        });
+        emitEvent(userId, "mandate.cancelled", {
+          mandate_id: mandate.mandate_id,
+          reason: "insufficient_reserved_funds",
+        });
+        return agentDenied("insufficient_reserved_funds");
       }
       try {
         await writeAudit({
@@ -1128,6 +2233,22 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       const payment = payments.get(entry.paymentId);
       if (payment?.status !== "awaiting_user")
         return error("policy_denied", 403);
+      if (
+        orderCommitted(
+          payment.request.merchant_id,
+          payment.request.order_id,
+          payment.paymentId,
+        )
+      ) {
+        entry.card.status = "rejected";
+        await settle(
+          payment,
+          "DENIED",
+          "This merchant order is already being paid.",
+          "duplicate_payment",
+        );
+        return agentDenied("duplicate_payment");
+      }
       const agent = agents.get(payment.agentId);
       const mandate = mandates.get(payment.mandateId);
       const policy = policies.get(userId);
@@ -1196,7 +2317,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         approval_id: entry.card.approval_id,
         status: "approved",
       });
-      if (response.statusCode === 503) return response;
+      if (response.statusCode !== 200) return response;
       return {
         statusCode: 200,
         body: { approval: entry.card, payment: response.body },
@@ -1254,7 +2375,13 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         `Requested scopes: ${parsed.data.requested_scopes.join(", ")}`,
         `Public key: ${parsed.data.agent_public_key}`,
       ],
-      { userCode, ...parsed.data },
+      {
+        userCode,
+        client_name: parsed.data.client_name,
+        provider: parsed.data.provider,
+        agent_public_key: parsed.data.agent_public_key,
+        requested_scopes: parsed.data.requested_scopes,
+      },
       600,
     );
     const pairing: PairingEntry = {
@@ -1269,6 +2396,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       expiresAt: now().getTime() + 600_000,
       status: "pending",
       mismatches: 0,
+      requestNumberExpiresAt: now().getTime() + 180_000,
+      replacementAgentId: null,
+      replacementResolved: true,
     };
     pairingByDevice.set(deviceCode, pairing);
     pairingByUserCode.set(userCode, pairing);
@@ -1279,6 +2409,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         verification_uri: verificationUri,
         qr_payload: qrPayload,
         request_number: requestNumber,
+        request_number_expires_at: new Date(
+          pairing.requestNumberExpiresAt,
+        ).toISOString(),
         expires_in: 600,
         interval: 3,
       }),
@@ -1290,6 +2423,13 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     if (!parsed.success)
       return reply.code(400).send({ error: "invalid_request" });
     if (parsed.data.grant_type === "refresh_token") {
+      const agentId = agentAuth.refreshAgentId(
+        parsed.data.refresh_token,
+        now().getTime(),
+      );
+      const agent = agentId ? agents.get(agentId) : null;
+      if (agent?.status !== "active" || agent.licence.level === "SUSPENDED")
+        return reply.code(400).send({ error: "invalid_grant" });
       const rotated = agentAuth.rotate(
         parsed.data.refresh_token,
         now().getTime(),
@@ -1322,6 +2462,154 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     );
   });
 
+  app.get("/v1/agent/session", async (request, reply) => {
+    const deviceCode = request.headers.authorization?.match(
+      /^Device ([A-Za-z0-9_-]+)$/,
+    )?.[1];
+    if (deviceCode) {
+      const pairing = pairingByDevice.get(deviceCode);
+      if (!pairing) return send(reply, error("bad_signature", 401));
+      rotatePairingNumber(pairing);
+      return reply.send({
+        state:
+          pairingStatus(pairing) === "expired"
+            ? "pairing_expired"
+            : pairingStatus(pairing) === "rejected"
+              ? "not_paired"
+              : "pairing_pending",
+        pairing: {
+          user_code: pairing.userCode,
+          expires_at: new Date(pairing.expiresAt).toISOString(),
+          request_number_expires_at: new Date(
+            pairing.requestNumberExpiresAt,
+          ).toISOString(),
+        },
+      });
+    }
+    const auth = agentAuth.verify(
+      request,
+      Buffer.alloc(0),
+      agents,
+      now().getTime(),
+      true,
+    );
+    if ("error" in auth) return send(reply, error(auth.error, 401));
+    const agent = auth.agent;
+    const state =
+      agent.status === "revoked"
+        ? "revoked"
+        : agent.status === "frozen"
+          ? "frozen"
+          : agent.licence.level === "SUSPENDED"
+            ? "suspended"
+            : "connected";
+    let accessTokenValid = agentAuth.hasAccess(
+      request.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]+)$/)?.[1],
+      agent.agent_id,
+      now().getTime(),
+    );
+    if (deps.authenticateAgent) {
+      try {
+        accessTokenValid =
+          (await deps.authenticateAgent(request))?.agent_id === agent.agent_id;
+      } catch {
+        accessTokenValid = false;
+      }
+    }
+    return reply.send({
+      state,
+      agent_id: agent.agent_id,
+      access_token_valid: accessTokenValid,
+      licence: agent.licence,
+      active_mandates: [...mandates.values()]
+        .filter(
+          (item) =>
+            item.agent_id === agent.agent_id && item.status === "active",
+        )
+        .map((item) => item.mandate_id),
+    });
+  });
+
+  app.post("/v1/agent/session/revoke", async (request, reply) => {
+    const auth = agentAuth.verify(
+      request,
+      rawBodies.get(request) ?? Buffer.alloc(0),
+      agents,
+      now().getTime(),
+      true,
+    );
+    if ("error" in auth) return send(reply, error(auth.error, 401));
+    return send(
+      reply,
+      await idem(auth.agent.agent_id, request, () =>
+        serializePaymentSubmission(auth.agent.user_id, async () => {
+          const agent = auth.agent;
+          const rePair =
+            (request.body as { re_pair?: unknown } | null)?.re_pair === true;
+          agent.status = "revoked";
+          agentAuth.revokeAgent(agent.agent_id);
+          if (!(await cancelRevokedAgentMandates(agent, "agent_disconnected")))
+            return error("service_unavailable", 503);
+          await writeAudit({
+            kind: "freeze",
+            actor: agent.user_id,
+            subjectId: agent.agent_id,
+            summary: "Agent disconnected its own key",
+            data: { agent_id: agent.agent_id, re_pair: rePair },
+          });
+          emitEvent(agent.user_id, "agent.revoked", {
+            agent_id: agent.agent_id,
+          });
+          return {
+            statusCode: 200,
+            body: { state: "revoked" },
+          };
+        }),
+      ),
+    );
+  });
+
+  app.get<{ Params: { deviceCode: string } }>(
+    "/v1/oauth/device_authorization/:deviceCode",
+    async (request, reply) => {
+      const pairing = pairingByDevice.get(request.params.deviceCode);
+      if (!pairing) return send(reply, error("bad_signature", 401));
+      rotatePairingNumber(pairing);
+      const wait = Math.min(
+        55,
+        Math.max(0, Number((request.query as { wait?: string }).wait ?? 0)),
+      );
+      const deadline = Date.now() + wait * 1000;
+      const oldNumber = pairing.requestNumber;
+      while (
+        pairingStatus(pairing) === "pending" &&
+        oldNumber === pairing.requestNumber &&
+        Date.now() < deadline
+      ) {
+        await delay(Math.min(200, Math.max(1, deadline - Date.now())));
+        rotatePairingNumber(pairing);
+      }
+      const status = pairingStatus(pairing);
+      return reply.send({
+        status:
+          status === "pending"
+            ? "still_pending"
+            : status === "rejected"
+              ? "rejected"
+              : status,
+        expires_at: new Date(pairing.expiresAt).toISOString(),
+        ...(status === "pending"
+          ? {
+              request_number: pairing.requestNumber,
+              request_number_expires_at: new Date(
+                pairing.requestNumberExpiresAt,
+              ).toISOString(),
+            }
+          : {}),
+      });
+    },
+  );
+
   app.get<{ Params: { userCode: string } }>(
     "/v1/app/pairing/:userCode",
     async (request, reply) => {
@@ -1334,14 +2622,41 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         pairing.status !== "pending"
       )
         return send(reply, error("policy_denied", 403));
+      if (pairing.userId && pairing.userId !== userId)
+        return send(reply, error("policy_denied", 403));
+      pairing.userId = userId;
+      ensureIndependentPairing(pairing);
       return reply.send({
         approval: pairing.card,
+        pairing: pairingSummary(pairing),
+        public_key: pairing.publicKey,
+        replacement_candidates: [],
         client_name: pairing.clientName,
         provider: pairing.provider,
         requested_scopes: pairing.scopes,
-        public_key: pairing.publicKey,
       });
     },
+  );
+
+  app.get("/v1/app/pairings", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const requested = (request.query as { status?: string }).status;
+    if (
+      requested &&
+      !["pending", "approved", "rejected", "expired"].includes(requested)
+    )
+      return send(reply, error("invalid_request", 400));
+    const items = [...pairingByUserCode.values()]
+      .filter((pairing) => pairing.userId === userId)
+      .map(pairingSummary)
+      .filter((pairing) => !requested || pairing.status === requested);
+    return reply.send({ items, next_cursor: null });
+  });
+
+  app.post<{ Params: { userCode: string } }>(
+    "/v1/app/pairing/:userCode/select-replacement",
+    async (_request, reply) => send(reply, error("invalid_request", 410)),
   );
 
   app.post<{ Params: { userCode: string } }>(
@@ -1359,6 +2674,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             pairing.status !== "pending"
           )
             return error("policy_denied", 403);
+          if (pairing.userId !== userId) return error("policy_denied", 403);
+          ensureIndependentPairing(pairing);
           if (!demoProofAvailable) return error("policy_denied", 503);
           const parsed = ApprovalDecisionRequestSchema.safeParse({
             decision: "approve",
@@ -1369,9 +2686,16 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             parsed.data.verification?.action_hash !== pairing.card.payload_hash
           )
             return error("bad_signature", 401);
+          rotatePairingNumber(pairing);
           if (
             parsed.data.verification.request_number !== pairing.requestNumber
           ) {
+            if (
+              pairing.previousRequestNumber &&
+              parsed.data.verification.request_number ===
+                pairing.previousRequestNumber
+            )
+              return error("request_number_expired", 409);
             pairing.mismatches++;
             if (pairing.mismatches >= 3) {
               pairing.status = "denied";
@@ -1411,6 +2735,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
               drills_passed: 0,
             },
             status: "active",
+            lineage: {
+              root_agent_id: agentId,
+              replaces_agent_id: null,
+              replaced_by_agent_id: null,
+            },
+            deleted_at: null,
             created_at: now().toISOString(),
             last_used_at: null,
           });
@@ -1427,11 +2757,17 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
                 agent_id: agentId,
                 key: pairing.publicKey,
                 scopes: pairing.scopes,
+                replaces_agent_id: null,
+                prior_key_revoked: false,
               },
             });
-          } catch {
+          } catch (failure) {
             pairing.status = "pending";
-            return error("policy_denied", 503);
+            app.log.error(
+              { err: failure, userCode: pairing.userCode },
+              "Pairing audit anchor failed; pairing remains pending",
+            );
+            return error("service_unavailable", 503);
           }
           agents.set(agentId, record);
           pairing.agentId = agentId;
@@ -1480,7 +2816,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return send(
       reply,
       await idem(auth.agent.agent_id, request, () =>
-        createMandate(auth.agent, request.body),
+        serializePaymentSubmission(auth.agent.user_id, () =>
+          createMandate(auth.agent, request.body),
+        ),
       ),
     );
   });
@@ -1493,7 +2831,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       await expireDueApprovals();
       const mandate = mandates.get(request.params.id);
       if (!mandate || mandate.agent_id !== auth.agent.agent_id)
-        return send(reply, error("mandate_not_found", 403));
+        return send(reply, agentDenied("mandate_not_found"));
       return reply.send(MandateResponseSchema.parse({ mandate }));
     },
   );
@@ -1504,7 +2842,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return send(
       reply,
       await idem(auth.agent.agent_id, request, () =>
-        submitPayment(auth.agent, request.body),
+        serializePaymentSubmission(auth.agent.user_id, () =>
+          submitPayment(auth.agent, request.body, request),
+        ),
       ),
     );
   });
@@ -1517,8 +2857,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       await expireDueApprovals();
       const payment = payments.get(request.params.id);
       if (!payment || payment.agentId !== auth.agent.agent_id)
-        return send(reply, error("policy_denied", 403));
-      if (payment.status === "reconciliation_required")
+        return send(reply, error("not_found", 404));
+      if (
+        payment.status === "reconciliation_required" ||
+        payment.status === "settling"
+      )
         return send(reply, reconciliationError(payment));
       return reply.send(
         PaymentStatusResponseSchema.parse({
@@ -1526,6 +2869,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           status: payment.status,
           decision: payment.decision,
           ...(payment.receipt ? { receipt: payment.receipt } : {}),
+          ...(payment.denialError ? { error: payment.denialError } : {}),
         }),
       );
     },
@@ -1536,7 +2880,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     if (!auth.agent) return send(reply, auth.response as Response);
     const items = [...payments.values()]
       .filter((payment) => payment.agentId === auth.agent.agent_id)
-      .filter((payment) => payment.status !== "reconciliation_required")
+      .filter(
+        (payment) =>
+          payment.status !== "reconciliation_required" &&
+          payment.status !== "settling",
+      )
       .map((payment) => ({
         payment_id: payment.paymentId,
         status: payment.status,
@@ -1548,6 +2896,41 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       PaymentHistoryResponseSchema.parse({ items, next_cursor: null }),
     );
   });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/agent/approvals/:id",
+    async (request, reply) => {
+      const auth = await agentFor(request, "wallet:history:self");
+      if (!auth.agent) return send(reply, auth.response as Response);
+      const entry = approvals.get(request.params.id);
+      if (
+        !entry ||
+        (entry.mandateId &&
+          mandates.get(entry.mandateId)?.agent_id !== auth.agent.agent_id) ||
+        (entry.paymentId &&
+          payments.get(entry.paymentId)?.agentId !== auth.agent.agent_id) ||
+        (!entry.mandateId && !entry.paymentId)
+      )
+        return send(reply, error("not_found", 404));
+      const wait = Math.min(
+        55,
+        Math.max(0, Number((request.query as { wait?: string }).wait ?? 0)),
+      );
+      const deadline = Date.now() + wait * 1000;
+      await expireDueApprovals();
+      while (entry.card.status === "pending" && Date.now() < deadline) {
+        await delay(Math.min(200, Math.max(1, deadline - Date.now())));
+        await expireDueApprovals();
+      }
+      return reply.send({
+        approval_id: entry.card.approval_id,
+        status:
+          entry.card.status === "pending" ? "still_pending" : entry.card.status,
+        expires_at: entry.card.expires_at,
+        subject_id: entry.card.subject_id,
+      });
+    },
+  );
 
   app.get("/v1/app/approvals", async (request, reply) => {
     const userId = await appUser(request);
@@ -1590,10 +2973,951 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     const userId = await appUser(request);
     if (!userId) return send(reply, error("bad_signature", 401));
     const items = [...agents.values()].filter(
-      (agent) => agent.user_id === userId,
+      (agent) => agent.user_id === userId && !agent.deleted_at,
     );
     return reply.send({ items, next_cursor: null });
   });
+
+  app.get("/v1/app/home", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const rail = deps.walletFunding;
+    if (!rail) return send(reply, error("chain_unavailable", 503));
+    try {
+      const snapshot = await rail.snapshot();
+      const reserved = reservedWalletFunds(userId);
+      return reply.send({
+        schema: "home.v1",
+        simulated: true,
+        main_account: { balance: walletMoney(safeFen(snapshot.mainBalance)) },
+        agent_wallet: {
+          balance: walletMoney(safeFen(snapshot.walletBalance)),
+          reserved: walletMoney(reserved),
+          available: walletMoney(
+            Math.max(0, safeFen(snapshot.walletBalance) - reserved),
+          ),
+          address: rail.deployment.wallet,
+          frozen: snapshot.walletFrozen,
+        },
+        block_number: Number(snapshot.blockNumber),
+        observed_at: snapshot.observedAt,
+        alerts: [],
+      });
+    } catch {
+      return send(reply, error("chain_unavailable", 503));
+    }
+  });
+
+  async function reconcileHumanPayment(
+    item: HumanPaymentRecord,
+  ): Promise<void> {
+    const rail = deps.walletFunding;
+    if (!rail || !item.txHash || item.deployment !== walletDeployment) return;
+    try {
+      const evidence = await rail.mainPaymentEvidence(
+        item.txHash,
+        item.payout,
+        BigInt(item.amount),
+      );
+      item.blockNumber = evidence.blockNumber.toString();
+      if (!item.shopNotified && deps.notifyMerchantPayment) {
+        await deps.notifyMerchantPayment({
+          orderId: item.orderId,
+          paymentTx: item.txHash,
+        });
+        item.shopNotified = true;
+      }
+      item.status = "completed";
+      item.completedAt = now().toISOString();
+      persist();
+    } catch {
+      item.status = "reconciliation_required";
+      persist();
+    }
+  }
+
+  app.post("/v1/app/scan/decode", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const qrPayload = (request.body as { qr_payload?: unknown } | null)
+      ?.qr_payload;
+    if (typeof qrPayload !== "string" || qrPayload.length > 16_384)
+      return send(reply, error("scan_invalid", 400));
+    const verificationBase = new URL(
+      deps.verificationUriBase ?? "http://127.0.0.1:3002/v1/app/pairing",
+    );
+    try {
+      const codeUrl = new URL(qrPayload);
+      const prefix = `${verificationBase.pathname.replace(/\/$/, "")}/`;
+      if (
+        codeUrl.origin === verificationBase.origin &&
+        codeUrl.pathname.startsWith(prefix) &&
+        !codeUrl.search &&
+        !codeUrl.hash &&
+        !codeUrl.username &&
+        !codeUrl.password
+      ) {
+        const userCode = codeUrl.pathname.slice(prefix.length);
+        const pairing = pairingByUserCode.get(userCode);
+        if (pairing && pairingStatus(pairing) === "pending")
+          return reply.send({ kind: "pairing", user_code: userCode });
+      }
+    } catch {
+      // Payment QR payloads use a custom URI scheme, so URL parsing is optional.
+    }
+    let paymentRequest: PaymentRequest;
+    try {
+      paymentRequest = decodePaymentRequestUri(qrPayload);
+    } catch {
+      return send(reply, error("scan_invalid", 400));
+    }
+    let merchant: Merchant | null;
+    try {
+      merchant = await deps.lookupMerchant(paymentRequest.merchant_id);
+    } catch {
+      return send(reply, error("service_unavailable", 503));
+    }
+    const rail = deps.walletFunding;
+    const lineTotal = paymentRequest.line_items.reduce(
+      (sum, item) => sum + item.qty * item.unit_price.amount,
+      0,
+    );
+    if (
+      !merchant ||
+      merchant.honeypot ||
+      !merchant.payout ||
+      !/^0x[0-9a-fA-F]{40}$/.test(merchant.payout) ||
+      merchant.payout.toLowerCase() === rail?.deployment.main.toLowerCase() ||
+      merchant.payout.toLowerCase() === rail?.deployment.wallet.toLowerCase() ||
+      !verifyMerchantSignature(paymentRequest, merchant.public_key) ||
+      Date.parse(paymentRequest.expires_at) <= now().getTime() ||
+      paymentRequest.amount.currency !== "CNY" ||
+      !Number.isSafeInteger(lineTotal) ||
+      lineTotal !== paymentRequest.amount.amount ||
+      orderCommitted(paymentRequest.merchant_id, paymentRequest.order_id) ||
+      usedMerchantNonces.has(
+        `${paymentRequest.merchant_id}:${paymentRequest.nonce}`,
+      )
+    )
+      return send(reply, error("scan_invalid", 400));
+    if (!rail || !walletDeployment)
+      return send(reply, error("chain_unavailable", 503));
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        if (orderCommitted(paymentRequest.merchant_id, paymentRequest.order_id))
+          return error("scan_invalid", 400);
+        const confirmationId = id("hpm");
+        const challengeId = id("hpc");
+        const expiresAt = Math.min(
+          now().getTime() + 60_000,
+          Date.parse(paymentRequest.expires_at),
+        );
+        const paymentRequestHash = sha256(qrPayload);
+        const sessionBinding = appSessionBinding(request);
+        const actionHash = sha256({
+          schema: "human_payment_action.v1",
+          user_id: userId,
+          session: sessionBinding,
+          confirmation_id: confirmationId,
+          challenge_id: challengeId,
+          payment_request_hash: paymentRequestHash,
+          merchant_id: merchant.merchant_id,
+          merchant_legal_name: merchant.legal_name,
+          merchant_uscc: merchant.uscc,
+          order_id: paymentRequest.order_id,
+          amount: paymentRequest.amount,
+          source_account: "main",
+          deployment: walletDeployment,
+          expires_at: new Date(expiresAt).toISOString(),
+        });
+        const record: HumanPaymentRecord = {
+          confirmationId,
+          challengeId,
+          userId,
+          sessionBinding,
+          merchantId: merchant.merchant_id,
+          merchantLegalName: merchant.legal_name,
+          merchantUscc: merchant.uscc,
+          merchantPublicKey: merchant.public_key,
+          payout: merchant.payout as `0x${string}`,
+          orderId: paymentRequest.order_id,
+          nonceKey: `${paymentRequest.merchant_id}:${paymentRequest.nonce}`,
+          paymentRequestHash,
+          paymentRequestExpiresAt: Date.parse(paymentRequest.expires_at),
+          amount: paymentRequest.amount.amount,
+          actionHash,
+          expiresAt,
+          consumed: false,
+          status: "prepared",
+          deployment: walletDeployment,
+          startingBlock: "0",
+          createdAt: now().toISOString(),
+        };
+        humanPaymentRecords.set(confirmationId, record);
+        persist();
+        return {
+          statusCode: 200,
+          body: {
+            kind: "payment",
+            confirmation_id: confirmationId,
+            challenge_id: challengeId,
+            action_hash: actionHash,
+            merchant_id: merchant.merchant_id,
+            merchant_legal_name: merchant.legal_name,
+            merchant_uscc: merchant.uscc,
+            order_id: paymentRequest.order_id,
+            amount: paymentRequest.amount,
+            source_account: "main",
+            expires_at: new Date(expiresAt).toISOString(),
+            simulated: true,
+          },
+        };
+      }),
+    );
+  });
+
+  app.get<{ Params: { confirmationId: string } }>(
+    "/v1/app/scan/payments/:confirmationId",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const record = humanPaymentRecords.get(request.params.confirmationId);
+      if (!record || record.userId !== userId)
+        return send(reply, error("not_found", 404));
+      if (record.status === "reconciliation_required")
+        await reconcileHumanPayment(record);
+      return reply.send(humanPaymentPublic(record));
+    },
+  );
+
+  app.post<{ Params: { confirmationId: string } }>(
+    "/v1/app/scan/payments/:confirmationId/confirm",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const key = request.headers["idempotency-key"];
+      if (typeof key !== "string" || key.length < 1 || key.length > 255)
+        return send(reply, error("idempotency_conflict", 409));
+      const body = request.body as {
+        challenge_id?: unknown;
+        verification?: { action_hash?: unknown; device_signature?: unknown };
+      } | null;
+      if (
+        typeof body?.challenge_id !== "string" ||
+        typeof body.verification?.action_hash !== "string" ||
+        typeof body.verification?.device_signature !== "string"
+      )
+        return send(reply, error("invalid_request", 400));
+      const verification = body.verification;
+      if (!verification) return send(reply, error("invalid_request", 400));
+      const keyId = `${userId}:human:${key}`;
+      const bodyHash = sha256(body);
+      return send(
+        reply,
+        await serializePaymentSubmission(userId, async () => {
+          const existing = humanPaymentKeys.get(keyId);
+          if (existing) {
+            if (existing.bodyHash !== bodyHash)
+              return error("idempotency_conflict", 409);
+            const record = humanPaymentRecords.get(existing.confirmationId);
+            if (!record || record.userId !== userId)
+              return error("reconciliation_required", 503);
+            if (record.status === "reconciliation_required")
+              await reconcileHumanPayment(record);
+            return record.status === "completed"
+              ? { statusCode: 200, body: humanPaymentPublic(record) }
+              : error("reconciliation_required", 503);
+          }
+          const record = humanPaymentRecords.get(request.params.confirmationId);
+          if (
+            !record ||
+            record.userId !== userId ||
+            record.challengeId !== body.challenge_id ||
+            record.actionHash !== verification.action_hash ||
+            record.sessionBinding !== appSessionBinding(request) ||
+            record.deployment !== walletDeployment ||
+            record.expiresAt <= now().getTime() ||
+            record.paymentRequestExpiresAt <= now().getTime() ||
+            record.consumed ||
+            record.status !== "prepared"
+          )
+            return error("action_changed", 409);
+          if (!deps.verifyHumanPaymentProof)
+            return error("service_unavailable", 503);
+          if (
+            !(await deps.verifyHumanPaymentProof(
+              record.actionHash,
+              verification,
+              userId,
+            ))
+          )
+            return error("bad_signature", 401);
+          const rail = deps.walletFunding;
+          if (!rail || !walletDeployment)
+            return error("chain_unavailable", 503);
+          let currentMerchant: Merchant | null;
+          try {
+            currentMerchant = await deps.lookupMerchant(record.merchantId);
+          } catch {
+            return error("service_unavailable", 503);
+          }
+          if (
+            !currentMerchant ||
+            currentMerchant.honeypot ||
+            currentMerchant.public_key !== record.merchantPublicKey ||
+            currentMerchant.legal_name !== record.merchantLegalName ||
+            currentMerchant.uscc !== record.merchantUscc ||
+            currentMerchant.payout?.toLowerCase() !==
+              record.payout.toLowerCase()
+          )
+            return error("action_changed", 409);
+          if (
+            balanceChangePending(userId) ||
+            orderCommitted(record.merchantId, record.orderId) ||
+            usedMerchantNonces.has(record.nonceKey)
+          )
+            return error("action_changed", 409);
+          let snapshot: WalletSnapshot;
+          try {
+            snapshot = await rail.snapshot();
+          } catch {
+            return error("chain_unavailable", 503);
+          }
+          if (snapshot.mainBalance < BigInt(record.amount))
+            return agentDenied("insufficient_main_funds");
+          record.consumed = true;
+          record.status = "settling";
+          record.startingBlock = snapshot.blockNumber.toString();
+          usedMerchantNonces.add(record.nonceKey);
+          humanPaymentKeys.set(keyId, {
+            bodyHash,
+            confirmationId: record.confirmationId,
+          });
+          persist();
+          try {
+            const tx = await rail.payFromMain(
+              record.confirmationId,
+              BigInt(record.amount),
+            );
+            record.txHash = tx;
+            persist();
+            await reconcileHumanPayment(record);
+            const settled = humanPaymentRecords.get(record.confirmationId);
+            if (settled?.status === "completed")
+              return { statusCode: 200, body: humanPaymentPublic(settled) };
+          } catch {
+            record.status = "reconciliation_required";
+            persist();
+          }
+          return {
+            statusCode: 503,
+            body: {
+              error: {
+                code: "reconciliation_required",
+                confirmation_id: record.confirmationId,
+                ...(record.txHash ? { payment_tx: record.txHash } : {}),
+              },
+            },
+          };
+        }),
+      );
+    },
+  );
+
+  app.post("/v1/app/agent-wallet/funding/prepare", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const rail = deps.walletFunding;
+    if (!rail || !walletDeployment)
+      return send(reply, error("chain_unavailable", 503));
+    const amount = PositiveMoneySchema.safeParse(
+      (request.body as { amount?: unknown } | null)?.amount,
+    );
+    if (!amount.success || amount.data.currency !== "CNY")
+      return send(reply, error("invalid_request", 400));
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        if (balanceChangePending(userId))
+          return error("reconciliation_required", 503);
+        let snapshot: WalletSnapshot;
+        try {
+          snapshot = await rail.snapshot();
+        } catch {
+          return error("chain_unavailable", 503);
+        }
+        if (BigInt(amount.data.amount) > snapshot.mainBalance)
+          return agentDenied("insufficient_main_funds");
+        const fundingId = id("fnd");
+        const challengeId = id("fch");
+        const expiresAt = now().getTime() + 60_000;
+        const actionHash = sha256({
+          schema: "funding_action.v1",
+          user_id: userId,
+          session: appSessionBinding(request),
+          funding_id: fundingId,
+          challenge_id: challengeId,
+          amount: amount.data,
+          source: rail.deployment.main,
+          destination: rail.deployment.wallet,
+          deployment: walletDeployment,
+          expires_at: new Date(expiresAt).toISOString(),
+        });
+        fundingRecords.set(fundingId, {
+          fundingId,
+          userId,
+          amount: amount.data.amount,
+          status: "prepared",
+          deployment: walletDeployment,
+          startingBlock: snapshot.blockNumber.toString(),
+          createdAt: now().toISOString(),
+        });
+        fundingChallenges.set(challengeId, {
+          challengeId,
+          fundingId,
+          userId,
+          sessionBinding: appSessionBinding(request),
+          amount: amount.data.amount,
+          actionHash,
+          expiresAt,
+          consumed: false,
+        });
+        return {
+          statusCode: 200,
+          body: {
+            funding_id: fundingId,
+            challenge_id: challengeId,
+            action_hash: actionHash,
+            expires_at: new Date(expiresAt).toISOString(),
+            source_balance: walletMoney(safeFen(snapshot.mainBalance)),
+            destination_balance: walletMoney(safeFen(snapshot.walletBalance)),
+            destination_address: rail.deployment.wallet,
+            simulated: true,
+          },
+        };
+      }),
+    );
+  });
+
+  app.post("/v1/app/agent-wallet/funding", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const rail = deps.walletFunding;
+    if (!rail || !walletDeployment)
+      return send(reply, error("chain_unavailable", 503));
+    const key = request.headers["idempotency-key"];
+    if (typeof key !== "string" || key.length < 1 || key.length > 255)
+      return send(reply, error("idempotency_conflict", 409));
+    const body = request.body as {
+      funding_id?: unknown;
+      challenge_id?: unknown;
+      amount?: unknown;
+      verification?: { action_hash?: unknown; device_signature?: unknown };
+    } | null;
+    const amount = PositiveMoneySchema.safeParse(body?.amount);
+    if (
+      !amount.success ||
+      amount.data.currency !== "CNY" ||
+      typeof body?.funding_id !== "string" ||
+      typeof body.challenge_id !== "string" ||
+      typeof body.verification?.action_hash !== "string"
+    )
+      return send(reply, error("invalid_request", 400));
+    const fundingId = body.funding_id;
+    const challengeId = body.challenge_id;
+    const verification = body.verification;
+    const keyId = `${userId}:${key}`;
+    const bodyHash = sha256(body);
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        const existing = fundingKeys.get(keyId);
+        if (existing) {
+          if (existing.bodyHash !== bodyHash)
+            return error("idempotency_conflict", 409);
+          const record = fundingRecords.get(existing.fundingId);
+          if (!record) return error("reconciliation_required", 503);
+          if (record.status === "completed")
+            return { statusCode: 200, body: fundingPublic(record) };
+          if (record.status === "failed")
+            return agentDenied("insufficient_main_funds");
+          return {
+            statusCode: 503,
+            body: {
+              error: {
+                code: "reconciliation_required",
+                funding_id: record.fundingId,
+                ...(record.txHash ? { funding_tx: record.txHash } : {}),
+              },
+            },
+          };
+        }
+        const challenge = fundingChallenges.get(challengeId);
+        const record = fundingRecords.get(fundingId);
+        if (
+          !challenge ||
+          !record ||
+          challenge.fundingId !== record.fundingId ||
+          challenge.userId !== userId ||
+          record.userId !== userId ||
+          challenge.consumed ||
+          challenge.expiresAt <= now().getTime() ||
+          challenge.sessionBinding !== appSessionBinding(request) ||
+          challenge.amount !== amount.data.amount ||
+          record.amount !== amount.data.amount ||
+          challenge.actionHash !== verification.action_hash ||
+          record.deployment !== walletDeployment
+        )
+          return error("action_changed", 409);
+        if (!deps.verifyFundingProof) return error("policy_denied", 503);
+        const verified = await deps.verifyFundingProof(
+          challenge.actionHash,
+          verification,
+          userId,
+        );
+        if (!verified) return error("bad_signature", 401);
+        if (balanceChangePending(userId))
+          return error("reconciliation_required", 503);
+        let snapshot: WalletSnapshot;
+        try {
+          snapshot = await rail.snapshot();
+        } catch {
+          return error("chain_unavailable", 503);
+        }
+        fundingKeys.set(keyId, { bodyHash, fundingId: record.fundingId });
+        challenge.consumed = true;
+        if (BigInt(record.amount) > snapshot.mainBalance) {
+          record.status = "failed";
+          persist();
+          return agentDenied("insufficient_main_funds");
+        }
+        record.status = "settling";
+        record.startingBlock = snapshot.blockNumber.toString();
+        persist();
+        try {
+          const tx = await rail.fund(record.fundingId, BigInt(record.amount));
+          record.txHash = tx;
+          persist();
+          const evidence = await rail.fundingEvidence(tx, record.fundingId);
+          if (!transferMatches(evidence, record.amount))
+            throw new Error("Funding evidence mismatch");
+          record.blockNumber = evidence.blockNumber.toString();
+          record.completedAt = now().toISOString();
+          record.status = "completed";
+          emitEvent(userId, "wallet.funded", {
+            funding_id: record.fundingId,
+            amount: walletMoney(record.amount),
+            chain_tx: tx,
+          });
+          persist();
+          return { statusCode: 200, body: fundingPublic(record) };
+        } catch {
+          record.status = "reconciliation_required";
+          persist();
+          return {
+            statusCode: 503,
+            body: {
+              error: {
+                code: "reconciliation_required",
+                funding_id: record.fundingId,
+                ...(record.txHash ? { funding_tx: record.txHash } : {}),
+              },
+            },
+          };
+        }
+      }),
+    );
+  });
+
+  app.get<{ Params: { fundingId: string } }>(
+    "/v1/app/agent-wallet/funding/:fundingId",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const record = fundingRecords.get(request.params.fundingId);
+      if (!record || record.userId !== userId)
+        return send(reply, error("not_found", 404));
+      try {
+        await reconcileFunding(record);
+      } catch {
+        /* Keep uncertain intent blocked. */
+      }
+      return reply.send(fundingPublic(record));
+    },
+  );
+
+  app.get("/v1/app/agent-wallet/funding", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    return reply.send({
+      items: [...fundingRecords.values()]
+        .filter((item) => item.userId === userId)
+        .map(fundingPublic),
+      next_cursor: null,
+    });
+  });
+
+  app.post("/v1/app/agent-wallet/sweep", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const rail = deps.walletFunding;
+    if (!rail || !walletDeployment)
+      return send(reply, error("chain_unavailable", 503));
+    const key = request.headers["idempotency-key"];
+    if (typeof key !== "string" || key.length < 1 || key.length > 255)
+      return send(reply, error("idempotency_conflict", 409));
+    const amount = PositiveMoneySchema.safeParse(
+      (request.body as { amount?: unknown } | null)?.amount,
+    );
+    if (!amount.success || amount.data.currency !== "CNY")
+      return send(reply, error("invalid_request", 400));
+    const keyId = `${userId}:${key}`;
+    const bodyHash = sha256(request.body);
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        const existing = sweepKeys.get(keyId);
+        if (existing) {
+          if (existing.bodyHash !== bodyHash)
+            return error("idempotency_conflict", 409);
+          const record = sweepRecords.get(existing.sweepId);
+          if (!record) return error("reconciliation_required", 503);
+          try {
+            await reconcileSweep(record);
+          } catch {
+            /* Keep uncertain intent blocked. */
+          }
+          return record.status === "completed"
+            ? { statusCode: 200, body: sweepPublic(record) }
+            : {
+                statusCode: 503,
+                body: {
+                  error: {
+                    code: "reconciliation_required",
+                    sweep_id: record.sweepId,
+                  },
+                },
+              };
+        }
+        if (
+          balanceChangePending(userId) ||
+          [...mandates.values()].some(
+            (mandate) =>
+              agents.get(mandate.agent_id)?.user_id === userId &&
+              mandate.in_flight_payment_id,
+          )
+        )
+          return error("reconciliation_required", 503);
+        let snapshot: WalletSnapshot;
+        try {
+          snapshot = await rail.snapshot();
+        } catch {
+          return error("chain_unavailable", 503);
+        }
+        if (
+          BigInt(amount.data.amount + reservedWalletFunds(userId)) >
+          snapshot.walletBalance
+        )
+          return agentDenied("insufficient_wallet_funds");
+        const record: SweepRecord = {
+          sweepId: id("swp"),
+          userId,
+          amount: amount.data.amount,
+          status: "settling",
+          deployment: walletDeployment,
+          startingBlock: snapshot.blockNumber.toString(),
+          createdAt: now().toISOString(),
+        };
+        sweepRecords.set(record.sweepId, record);
+        sweepKeys.set(keyId, { bodyHash, sweepId: record.sweepId });
+        persist();
+        try {
+          const tx = await rail.sweep(record.sweepId, BigInt(record.amount));
+          record.txHash = tx;
+          persist();
+          const evidence = await rail.sweepEvidence(tx, record.sweepId);
+          if (!transferMatches(evidence, record.amount))
+            throw new Error("Sweep evidence mismatch");
+          record.blockNumber = evidence.blockNumber.toString();
+          record.completedAt = now().toISOString();
+          record.status = "completed";
+          emitEvent(userId, "wallet.swept", {
+            sweep_id: record.sweepId,
+            amount: walletMoney(record.amount),
+            chain_tx: tx,
+          });
+          persist();
+          return { statusCode: 200, body: sweepPublic(record) };
+        } catch {
+          record.status = "reconciliation_required";
+          persist();
+          return {
+            statusCode: 503,
+            body: {
+              error: {
+                code: "reconciliation_required",
+                sweep_id: record.sweepId,
+                ...(record.txHash ? { sweep_tx: record.txHash } : {}),
+              },
+            },
+          };
+        }
+      }),
+    );
+  });
+
+  app.get<{ Params: { sweepId: string } }>(
+    "/v1/app/agent-wallet/sweep/:sweepId",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const record = sweepRecords.get(request.params.sweepId);
+      if (!record || record.userId !== userId)
+        return send(reply, error("not_found", 404));
+      try {
+        await reconcileSweep(record);
+      } catch {
+        /* Keep uncertain intent blocked. */
+      }
+      return reply.send(sweepPublic(record));
+    },
+  );
+
+  app.get("/v1/app/agent-wallet/sweep", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    return reply.send({
+      items: [...sweepRecords.values()]
+        .filter((item) => item.userId === userId)
+        .map(sweepPublic),
+      next_cursor: null,
+    });
+  });
+
+  app.get("/v1/app/mandates", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    await expireDueApprovals();
+    const items = [...mandates.values()]
+      .filter((mandate) => agents.get(mandate.agent_id)?.user_id === userId)
+      .map((mandate) => {
+        const window = mandate.constraints.find(
+          (constraint) => constraint.type === "execution_window",
+        );
+        return mandate.status === "active" &&
+          window &&
+          Date.parse(window.not_after) <= now().getTime()
+          ? { ...mandate, status: "expired" as const }
+          : mandate;
+      });
+    return reply.send({ items, next_cursor: null });
+  });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/history",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const agent = agents.get(request.params.id);
+      if (!agent || agent.user_id !== userId)
+        return send(reply, error("not_found", 404));
+      const root = agent.lineage?.root_agent_id ?? agent.agent_id;
+      const lineage = new Set(
+        [...agents.values()]
+          .filter(
+            (item) =>
+              item.user_id === userId &&
+              (item.lineage?.root_agent_id ?? item.agent_id) === root,
+          )
+          .map((item) => item.agent_id),
+      );
+      const items = audits
+        .filter(
+          (item) => lineage.has(item.subject_id) || lineage.has(item.actor),
+        )
+        .map((item) => ({
+          event_id: item.audit_id,
+          agent_id: lineage.has(item.subject_id) ? item.subject_id : item.actor,
+          kind: item.kind,
+          summary: item.summary,
+          created_at: item.created_at,
+          audit_tx: item.chain_tx,
+        }));
+      return reply.send({ root_agent_id: root, items, next_cursor: null });
+    },
+  );
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/prepare-action",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      if (typeof request.headers["idempotency-key"] !== "string")
+        return send(reply, error("idempotency_conflict", 409));
+      const agent = agents.get(request.params.id);
+      const action = (request.body as { action?: unknown } | null)?.action;
+      if (
+        !agent ||
+        agent.user_id !== userId ||
+        agent.deleted_at ||
+        (action !== "unfreeze" && action !== "relicense")
+      )
+        return send(reply, error("policy_denied", 403));
+      if (
+        (action === "unfreeze" && agent.status !== "frozen") ||
+        (action === "relicense" && agent.licence.level !== "SUSPENDED")
+      )
+        return send(reply, error("action_changed", 409));
+      const actionHash = sha256({
+        schema: "agent_action.v1",
+        action,
+        user_id: userId,
+        agent_id: agent.agent_id,
+        expected_status: agent.status,
+        expected_licence_level: agent.licence.level,
+        root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
+        demerit_count: Math.max(0, -agent.licence.points),
+      });
+      const challengeId = id("chg");
+      const challenge = randomBytes(32).toString("base64url");
+      const expiresAt = now().getTime() + 60_000;
+      actionChallenges.set(challengeId, {
+        userId,
+        agentId: agent.agent_id,
+        action,
+        actionHash,
+        sessionBinding: appSessionBinding(request),
+        challenge,
+        expiresAt,
+        used: false,
+      });
+      return reply.send({
+        action,
+        agent_id: agent.agent_id,
+        action_hash: actionHash,
+        challenge_id: challengeId,
+        challenge,
+        expires_at: new Date(expiresAt).toISOString(),
+        agent_summary: replacementSummary(agent),
+      });
+    },
+  );
+
+  for (const action of ["unfreeze", "relicense"] as const) {
+    app.post<{ Params: { id: string } }>(
+      `/v1/app/agents/:id/${action}`,
+      async (request, reply) => {
+        const userId = await appUser(request);
+        if (!userId) return send(reply, error("bad_signature", 401));
+        return send(
+          reply,
+          await idem(userId, request, async () => {
+            const body = request.body as {
+              challenge_id?: string;
+              verification?: {
+                action_hash?: string;
+                device_signature?: string;
+              };
+            } | null;
+            const challenge = body?.challenge_id
+              ? actionChallenges.get(body.challenge_id)
+              : null;
+            const agent = agents.get(request.params.id);
+            if (
+              !agent ||
+              agent.user_id !== userId ||
+              !challenge ||
+              challenge.userId !== userId ||
+              challenge.sessionBinding !== appSessionBinding(request) ||
+              challenge.agentId !== agent.agent_id ||
+              challenge.action !== action ||
+              challenge.used ||
+              challenge.expiresAt <= now().getTime()
+            )
+              return error("action_changed", 409);
+            const currentHash = sha256({
+              schema: "agent_action.v1",
+              action,
+              user_id: userId,
+              agent_id: agent.agent_id,
+              expected_status: agent.status,
+              expected_licence_level: agent.licence.level,
+              root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
+              demerit_count: Math.max(0, -agent.licence.points),
+            });
+            if (currentHash !== challenge.actionHash)
+              return error("action_changed", 409);
+            if (body?.verification?.action_hash !== challenge.actionHash)
+              return error("bad_signature", 401);
+            if (!demoProofAvailable) return error("policy_denied", 503);
+            const card = approvalCard(
+              "pairing",
+              "everyday",
+              agent.agent_id,
+              `${action} ${agent.display_name}`,
+              [challenge.challenge],
+              { actionHash: challenge.actionHash },
+            );
+            card.payload_hash = challenge.actionHash;
+            if (!(await verifyDemoProof(card, body.verification, userId)))
+              return error("bad_signature", 401);
+            challenge.used = true;
+            if (action === "unfreeze") agent.status = "active";
+            else agent.licence.level = "L";
+            await writeAudit({
+              kind: action === "unfreeze" ? "freeze" : "licence_change",
+              actor: userId,
+              subjectId: agent.agent_id,
+              summary: `Local demo simulated ${action} approved by user`,
+              data: { action, agent_id: agent.agent_id },
+            });
+            emitEvent(userId, `agent.${action}`, { agent_id: agent.agent_id });
+            return { statusCode: 200, body: { agent, simulated: true } };
+          }),
+        );
+      },
+    );
+  }
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/revoke",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      return send(
+        reply,
+        await idem(userId, request, () =>
+          serializePaymentSubmission(userId, async () => {
+            const agent = agents.get(request.params.id);
+            if (!agent || agent.user_id !== userId || agent.deleted_at)
+              return error("not_found", 404);
+            if (
+              (request.body as { confirmation_agent_id?: unknown } | null)
+                ?.confirmation_agent_id !== agent.agent_id
+            )
+              return error("invalid_request", 400);
+            agent.status = "revoked";
+            agentAuth.revokeAgent(agent.agent_id);
+            if (
+              !(await cancelRevokedAgentMandates(agent, "owner_revoked_agent"))
+            )
+              return error("service_unavailable", 503);
+            await writeAudit({
+              kind: "freeze",
+              actor: userId,
+              subjectId: agent.agent_id,
+              summary: "User deleted agent access; history retained",
+              data: { agent_id: agent.agent_id },
+            });
+            agent.deleted_at = now().toISOString();
+            emitEvent(userId, "agent.deleted", { agent_id: agent.agent_id });
+            return { statusCode: 200, body: { agent } };
+          }),
+        ),
+      );
+    },
+  );
 
   app.get("/v1/app/payments", async (request, reply) => {
     const userId = await appUser(request);
@@ -1622,8 +3946,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           const agent = agents.get(request.params.id);
           if (!agent || agent.user_id !== userId)
             return error("policy_denied", 403);
+          if (agent.status === "revoked" || agent.deleted_at)
+            return error("action_changed", 409);
           agent.status = "frozen";
-          agentAuth.revokeAgent(agent.agent_id);
+          agentAuth.revokeAccess(agent.agent_id);
           emitEvent(userId, "agent.frozen", {
             agent_id: agent.agent_id,
             reason: "user",
@@ -1649,7 +3975,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       return send(
         reply,
         await idem(userId, request, () =>
-          decideApproval(userId, request.params.id, request.body),
+          serializePaymentSubmission(userId, () =>
+            decideApproval(userId, request.params.id, request.body),
+          ),
         ),
       );
     },
@@ -1664,7 +3992,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       const payment = payments.get(request.params.id);
       if (!payment || payment.userId !== userId)
         return send(reply, error("policy_denied", 403));
-      if (payment.status === "reconciliation_required")
+      if (
+        payment.status === "reconciliation_required" ||
+        payment.status === "settling"
+      )
         return send(reply, reconciliationError(payment));
       return reply.send(
         PaymentStatusResponseSchema.parse({

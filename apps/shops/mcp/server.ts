@@ -95,7 +95,7 @@ server.registerTool(
   "add_to_cart",
   {
     description:
-      "Add a product to the shared demo cart. A cart can contain items from one merchant only.",
+      "Add the exact variant SKU returned by get_product to the shared demo cart. Options must match that SKU. A cart can contain items from one merchant only.",
     inputSchema: {
       sku: z.string().min(1),
       qty: z.number().int().min(1).max(10),
@@ -132,12 +132,20 @@ server.registerTool(
   "checkout",
   {
     description:
-      "Create a merchant-signed e-CNY simulation payment request. Pass the URI unchanged to WeBank; the merchant does not authorize a payment.",
-    inputSchema: { shipping_profile: z.literal("default") },
+      "Create a merchant-signed e-CNY simulation payment request using the user's shipping address.",
+    inputSchema: {
+      shipping_address: z.object({
+        name: z.string().min(1),
+        phone: z.string().min(6),
+        address_line: z.string().min(1),
+        city: z.string().min(1),
+        postcode: z.string().min(1),
+      }),
+    },
   },
-  async ({ shipping_profile }) => {
+  async ({ shipping_address }) => {
     try {
-      return output(await shopPost("checkout", { shipping_profile }));
+      return output(await shopPost("checkout", { shipping_address }));
     } catch (error) {
       return fail(error);
     }
@@ -147,7 +155,7 @@ server.registerTool(
 server.registerTool(
   "get_order",
   {
-    description: "Read simulated order status after WeBank settles a payment.",
+    description: "Read the simulated order status after checkout.",
     inputSchema: { order_id: z.string().min(1) },
   },
   async ({ order_id }) => {

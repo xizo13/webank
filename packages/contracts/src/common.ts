@@ -81,6 +81,9 @@ export const ErrorCodeSchema = z.enum([
   "agent_frozen",
   "scope_missing",
   "mandate_not_found",
+  "mandate_required",
+  "mandate_cancelled",
+  "mandate_mismatch",
   "mandate_expired",
   "mandate_exhausted",
   "mandate_in_flight",
@@ -89,9 +92,57 @@ export const ErrorCodeSchema = z.enum([
   "idempotency_conflict",
   "policy_denied",
   "reconciliation_required",
+  "service_unavailable",
   "guardian_denied",
+  "risk_denied",
+  "approval_rejected",
   "rate_limited",
 ]);
+export const DenialRuleSchema = z.enum([
+  "scope_missing",
+  "mandate_required",
+  "mandate_not_found",
+  "mandate_expired",
+  "execution_window_closed",
+  "mandate_exhausted",
+  "budget_exceeded",
+  "occurrences_exceeded",
+  "mandate_cancelled",
+  "agent_key_mismatch",
+  "category_mismatch",
+  "merchant_mismatch",
+  "product_mismatch",
+  "variant_mismatch",
+  "variant_sku_mismatch",
+  "sku_mismatch",
+  "quantity_mismatch",
+  "merchant_unknown",
+  "merchant_honeypot",
+  "category_blocked",
+  "over_per_payment_cap",
+  "over_daily_cap",
+  "over_monthly_cap",
+  "over_licence_cap",
+  "licence_suspended",
+  "insufficient_reserved_funds",
+  "insufficient_wallet_funds",
+  "insufficient_main_funds",
+  "duplicate_payment",
+  "velocity_blocked",
+  "intent_mismatch",
+  "user_rejected",
+]);
+export type DenialRule = z.infer<typeof DenialRuleSchema>;
+export const RuleDeniedErrorSchema = z
+  .object({
+    code: ErrorCodeSchema,
+    rule: DenialRuleSchema,
+    detail: z.record(z.unknown()),
+    user_explanation: NonEmptyStringSchema,
+    fixable: z.boolean(),
+  })
+  .strict();
+export type RuleDeniedError = z.infer<typeof RuleDeniedErrorSchema>;
 export const ErrorResponseSchema = z
   .object({
     error: z

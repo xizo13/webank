@@ -121,6 +121,16 @@ const deps: GatewayDependencies = {
   },
   recordNumberMatchFailure: async () => {},
   lookupMerchant: async (id) => (id === merchant.merchant_id ? merchant : null),
+  lookupVariant: async (sku) =>
+    sku === "HEADPHONES-DEMO"
+      ? {
+          sku,
+          gtin: "6901234567001",
+          merchant_id: merchant.merchant_id,
+          variant: "Black",
+          options: { colour: "Black", size: "One size" },
+        }
+      : null,
   reserveMandate: async () => true,
   releaseMandate: async () => {},
   assessRisk: async () => ({
@@ -164,12 +174,21 @@ const unsigned = {
   amount: { amount: 27_900, currency: "CNY" as const },
   line_items: [
     {
+      type: "product" as const,
       sku: "HEADPHONES-DEMO",
       gtin: "6901234567001",
       name: "Mock headphones",
       condition: "new" as const,
+      variant: "Black",
+      options: { colour: "Black", size: "One size" },
       qty: 1,
       unit_price: { amount: 27_900, currency: "CNY" as const },
+    },
+    {
+      type: "shipping" as const,
+      name: "Standard delivery",
+      qty: 1 as const,
+      unit_price: { amount: 0, currency: "CNY" as const },
     },
   ],
   expires_at: new Date(Date.now() + 15 * 60_000).toISOString(),

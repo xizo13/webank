@@ -1,9 +1,12 @@
-import { createHash, createPublicKey, verify } from "node:crypto";
+import { createHash, createPublicKey, randomUUID, verify } from "node:crypto";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import type { Agent } from "@webank/contracts";
 import { afterEach, describe, expect, it } from "vitest";
+import { createGateway } from "../../../services/gateway/src/app.js";
 import { WeBankConnector } from "../src/client.js";
 import { createConnectorServer } from "../src/index.js";
+import { newAgentKey, signAgentRequest } from "../src/signing.js";
 import type { CredentialStore, Credentials } from "../src/storage.js";
 
 class MemoryStore implements CredentialStore {
@@ -46,7 +49,7 @@ describe("WeBank MCP connector", () => {
     for (const close of open.splice(0)) await close();
   });
 
-  it("pairs, calls all five tools, signs each request, and rejects replay", async () => {
+  it("pairs, calls all six tools, signs each request, and rejects replay", async () => {
     const store = new MemoryStore();
     const notifications: string[] = [];
     const nonces = new Set<string>();
@@ -54,6 +57,7 @@ describe("WeBank MCP connector", () => {
     let approved = false;
     let publicKey = "";
     let replay: { url: URL; init: RequestInit } | undefined;
+    let refreshed = 0;
 
     const gatewayFetch = async (
       input: URL | RequestInfo,
@@ -70,6 +74,7 @@ describe("WeBank MCP connector", () => {
       paths.push(`${init.method} ${url.pathname}`);
       if (url.pathname === "/v1/oauth/device_authorization") {
         const data = JSON.parse(body);
+        expect(data.provider).toBe("Anthropic");
         expect(data.requested_scopes).toEqual([
           "wallet:pay",
           "wallet:mandate",
@@ -87,6 +92,15 @@ describe("WeBank MCP connector", () => {
         });
       }
       if (url.pathname === "/v1/oauth/token") {
+        if (JSON.parse(body).grant_type === "refresh_token") {
+          refreshed++;
+          return reply(200, {
+            access_token: "new-access-token",
+            refresh_token: "new-refresh-token",
+            expires_in: 900,
+            agent_id: "agt_test",
+          });
+        }
         if (!approved) return reply(400, { error: "authorization_pending" });
         return reply(200, {
           access_token: "secret-access-token",
@@ -132,6 +146,21 @@ describe("WeBank MCP connector", () => {
       ).toBe(true);
       replay = { url, init };
 
+      if (url.pathname === "/v1/agent/session") {
+        return reply(200, {
+          state: "connected",
+          agent_id: "agt_test",
+          access_token_valid: false,
+          licence: {
+            level: "L",
+            points: 0,
+            clean_purchases: 0,
+            drills_passed: 0,
+          },
+          active_mandates: [],
+        });
+      }
+
       if (url.pathname === "/v1/agent/mandates") {
         return reply(202, {
           mandate: {
@@ -152,6 +181,30 @@ describe("WeBank MCP connector", () => {
             created_at: "2026-10-14T00:00:00Z",
           },
           approval_id: "apr_mandate",
+          level: "zero_trust",
+          expires_at: "2026-10-14T00:03:00Z",
+          request_number: "345678",
+        });
+      }
+      if (url.pathname === "/v1/agent/mandates/mdt_test") {
+        return reply(200, {
+          mandate: {
+            schema: "mandate.v1",
+            mandate_id: "mdt_test",
+            agent_id: "agt_test",
+            agent_key_binding: publicKey,
+            description: "Buy headphones",
+            intent_level: "open",
+            user_text: "Buy headphones",
+            user_text_source: "agent_reported",
+            constraints,
+            status: "pending_user",
+            spent: { amount: 0, currency: "CNY" },
+            occurrences: 0,
+            in_flight_payment_id: null,
+            approved_by: null,
+            created_at: "2026-10-14T00:00:00Z",
+          },
         });
       }
       if (url.pathname === "/v1/agent/payments" && init.method === "POST") {
@@ -160,6 +213,8 @@ describe("WeBank MCP connector", () => {
           status: "awaiting_user",
           decision,
           approval_id: "apr_payment",
+          level: "zero_trust",
+          expires_at: "2026-10-14T00:03:00Z",
           poll_after: 3,
           approval_level: "zero_trust",
           request_number: "654321",
@@ -211,7 +266,11 @@ describe("WeBank MCP connector", () => {
     const tools = await client.listTools();
     expect(tools.tools.map((tool) => tool.name)).toEqual([
       "connect_webank",
+      "get_wallet_status",
+      "wait_for_approval",
+      "disconnect_webank",
       "create_mandate",
+      "get_mandate_status",
       "request_payment",
       "get_payment_status",
       "list_my_payments",
@@ -233,9 +292,31 @@ describe("WeBank MCP connector", () => {
 
     const mandate = await call("create_mandate", {
       description: "Buy headphones",
+      user_text: "Buy headphones",
+      intent_level: "open",
       constraints,
     });
     expect(mandate.status).toBe("pending_user");
+    expect(mandate.level).toBe("zero_trust");
+    expect(mandate.request_number).toBe("345678");
+    expect(notifications).toContain("Request number 345678");
+    expect(
+      (await call("get_mandate_status", { mandate_id: "mdt_test" })).status,
+    ).toBe("pending_user");
+    const pathsBeforeBadInput = paths.length;
+    const loose = await client.callTool({
+      name: "create_mandate",
+      arguments: {
+        description: "Buy headphones",
+        user_text: "Buy headphones",
+        intent_level: "open",
+        constraints: [
+          { type: "amount_range", max: { amount: 279.5, currency: "CNY" } },
+        ],
+      },
+    });
+    expect(loose.isError).toBe(true);
+    expect(paths).toHaveLength(pathsBeforeBadInput);
     const payment = await call("request_payment", {
       mandate_id: "mdt_test",
       payment_request: "ecny://pay?d=abc",
@@ -248,12 +329,16 @@ describe("WeBank MCP connector", () => {
     expect(
       (await call("get_payment_status", { payment_id: "pay_test" })).status,
     ).toBe("awaiting_user");
-    expect((await call("list_my_payments", { limit: 10 })).items).toHaveLength(
-      1,
-    );
+    const history = await call("list_my_payments", { limit: 10 });
+    expect(history.items).toHaveLength(1);
+    expect((history.items as Array<{ amount: unknown }>)[0].amount).toEqual({
+      amount: 27900,
+      currency: "CNY",
+      display: "¥279.00",
+    });
     expect(
       paths.filter((path) => path.startsWith("GET /v1/agent/")),
-    ).toHaveLength(2);
+    ).toHaveLength(3);
     expect(store.value?.privateKeyPem).toContain("PRIVATE KEY");
     expect(
       JSON.stringify({ pairing, connected, mandate, payment }),
@@ -261,5 +346,157 @@ describe("WeBank MCP connector", () => {
     if (!replay) throw new Error("No signed request captured for replay");
     const replayed = await gatewayFetch(replay.url, replay.init);
     expect(replayed.status).toBe(401);
+    const recovered = await call("get_wallet_status", {});
+    expect(recovered.state).toBe("connected");
+    expect(refreshed).toBe(1);
+    expect(store.value?.refreshToken).toBe("new-refresh-token");
+  });
+
+  it("keeps a lost credential until explicit re-pair and owner consent", async () => {
+    const priorKey = newAgentKey();
+    const prior: Agent = {
+      schema: "agent.v1",
+      agent_id: "agt_prior",
+      user_id: "usr_test",
+      display_name: "Claude prior",
+      provider: "Anthropic",
+      public_key: priorKey.publicKey,
+      scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
+      licence: { level: "L", points: 0, clean_purchases: 0, drills_passed: 0 },
+      status: "active",
+      created_at: new Date().toISOString(),
+      last_used_at: null,
+    };
+    const gateway = createGateway(
+      {
+        authenticateApp: async (request) =>
+          request.headers.authorization === "Bearer app" ? "usr_test" : null,
+        demoApprovalsEnabled: true,
+        demoApprovalVerifier: async (approval, proof) =>
+          (proof as { action_hash?: string; device_signature?: string })
+            .action_hash === approval.payload_hash &&
+          (proof as { device_signature?: string }).device_signature ===
+            "test-biometric-proof"
+            ? "user_biometric"
+            : false,
+        recordNumberMatchFailure: async () => {},
+        lookupMerchant: async () => null,
+        reserveMandate: async () => true,
+        releaseMandate: async () => {},
+        assessRisk: async () => ({
+          result: "deny",
+          signals: [],
+          explanation: "No merchant",
+        }),
+        evaluateGuardian: async () => ({
+          verdict: "deny",
+          reasons: [],
+          user_explanation: "No merchant",
+        }),
+        executePayment: async () => {
+          throw new Error("unreachable");
+        },
+        anchorAudit: async () => `0x${"1".repeat(64)}`,
+        signReceipt: async () => "unused",
+      },
+      { agents: [prior], policies: [] },
+    );
+    open.push(() => gateway.close());
+    const old = {
+      ...newAgentKey(),
+      agentId: "agt_lost",
+      accessToken: "old-token",
+    };
+    const store = new MemoryStore();
+    store.value = old;
+    const connector = new WeBankConnector(
+      new URL("http://127.0.0.1:8787"),
+      store,
+      async (input, init = {}) => {
+        const url = new URL(String(input));
+        const response = await gateway.inject({
+          method: (init.method || "GET") as "GET" | "POST",
+          url: `${url.pathname}${url.search}`,
+          headers: Object.fromEntries(new Headers(init.headers).entries()),
+          ...(init.body ? { payload: String(init.body) } : {}),
+        });
+        return new Response(response.body, { status: response.statusCode });
+      },
+      async () => {},
+    );
+    const server = createConnectorServer(connector);
+    const client = new Client({ name: "lost-key-test", version: "1.0.0" });
+    const [clientTransport, serverTransport] =
+      InMemoryTransport.createLinkedPair();
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    open.push(async () => {
+      await client.close();
+      await server.close();
+    });
+    const call = async (name: string, args: Record<string, unknown> = {}) => {
+      const result = await client.callTool({ name, arguments: args });
+      expect(result.isError).not.toBe(true);
+      return result.structuredContent as Record<string, unknown>;
+    };
+    expect(await call("get_wallet_status")).toMatchObject({
+      state: "not_paired",
+    });
+    expect(await call("connect_webank")).toMatchObject({
+      status: "not_paired",
+    });
+    expect(await call("disconnect_webank")).toMatchObject({
+      state: "revocation_required",
+    });
+    expect(store.value?.privateKeyPem).toBe(old.privateKeyPem);
+    const pending = await call("connect_webank", { re_pair: true });
+    expect(pending.status).toBe("awaiting_user");
+    expect(store.value?.quarantined?.privateKeyPem).toBe(old.privateKeyPem);
+    expect(store.value?.privateKeyPem).not.toBe(old.privateKeyPem);
+    const claimed = await gateway.inject({
+      method: "GET",
+      url: `/v1/app/pairing/${pending.user_code}`,
+      headers: { authorization: "Bearer app" },
+    });
+    expect(claimed.statusCode).toBe(200);
+    const retiredSelection = await gateway.inject({
+      method: "POST",
+      url: `/v1/app/pairing/${pending.user_code}/select-replacement`,
+      headers: { authorization: "Bearer app", "idempotency-key": randomUUID() },
+      payload: { replaces_agent_id: null },
+    });
+    expect(retiredSelection.statusCode).toBe(410);
+    const approved = await gateway.inject({
+      method: "POST",
+      url: `/v1/app/pairing/${pending.user_code}/approve`,
+      headers: { authorization: "Bearer app", "idempotency-key": randomUUID() },
+      payload: {
+        verification: {
+          action_hash: claimed.json().approval.payload_hash,
+          device_signature: "test-biometric-proof",
+          request_number: pending.request_number,
+        },
+      },
+    });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().agent.lineage).toMatchObject({
+      root_agent_id: approved.json().agent.agent_id,
+      replaces_agent_id: null,
+    });
+    const oldSession = await gateway.inject({
+      method: "GET",
+      url: "/v1/agent/session",
+      headers: signAgentRequest({
+        method: "GET",
+        path: "/v1/agent/session",
+        body: "",
+        idempotencyKey: randomUUID(),
+        agentId: prior.agent_id,
+        privateKeyPem: priorKey.privateKeyPem,
+      }),
+    });
+    expect(oldSession.json().state).toBe("connected");
+    expect(await call("connect_webank")).toMatchObject({ status: "connected" });
+    expect(store.value?.quarantined).toBeUndefined();
   });
 });

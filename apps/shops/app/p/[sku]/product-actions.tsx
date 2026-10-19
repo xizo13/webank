@@ -1,22 +1,35 @@
 "use client";
 
+import type { DemoVariant } from "@webank/contracts";
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 export function ProductActions({
-  sku,
+  initialSku,
+  variants,
   sizes,
   colours,
 }: {
-  sku: string;
+  initialSku: string;
+  variants: DemoVariant[];
   sizes: string[];
   colours: string[];
 }) {
   const router = useRouter();
-  const [size, setSize] = useState(sizes[0] || "");
-  const [colour, setColour] = useState(colours[0] || "");
+  const initialVariant = variants.find((item) => item.sku === initialSku);
+  const [size, setSize] = useState(
+    initialVariant?.options.size ?? sizes[0] ?? "",
+  );
+  const [colour, setColour] = useState(
+    initialVariant?.options.colour ?? colours[0] ?? "",
+  );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const selected = variants.find(
+    (variant) =>
+      variant.options.size === (size || undefined) &&
+      variant.options.colour === (colour || undefined),
+  );
   async function add() {
     setBusy(true);
     setError("");
@@ -26,7 +39,7 @@ export function ProductActions({
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           operation: "add_to_cart",
-          sku,
+          sku: selected?.sku,
           qty: 1,
           options: { ...(size ? { size } : {}), ...(colour ? { colour } : {}) },
         }),
@@ -71,11 +84,16 @@ export function ProductActions({
           </select>
         </label>
       )}
+      {selected && (
+        <p>
+          Selected variant: {selected.sku} · GTIN {selected.gtin}
+        </p>
+      )}
       <button
         type="button"
         className="button primary full"
         onClick={add}
-        disabled={busy}
+        disabled={busy || !selected}
       >
         {busy ? "Adding..." : "Add to cart"} <span>↗</span>
       </button>

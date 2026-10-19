@@ -6,6 +6,7 @@
   "main": "./dist/index.js",
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "build:extension": "node scripts/build-extension.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "vitest run",
     "start": "node dist/index.js"
@@ -16,6 +17,7 @@
     "zod": "^3.25.76"
   },
   "devDependencies": {
+    "esbuild": "0.25.12",
     "vitest": "^3.2.4"
   }
 }

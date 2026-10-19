@@ -1,0 +1,60 @@
+{
+  "manifest_version": "0.3",
+  "name": "webank-agent-wallet",
+  "display_name": "WeBank Agent Wallet",
+  "version": "0.1.0",
+  "description": "Pair an AI agent with a local simulated WeBank Agent Wallet and request scoped payments for owner review.",
+  "author": {
+    "name": "WeBank Agent Wallet Project"
+  },
+  "server": {
+    "type": "node",
+    "entry_point": "server/index.mjs",
+    "mcp_config": {
+      "command": "node",
+      "args": ["${__dirname}/server/index.mjs"]
+    }
+  },
+  "tools": [
+    {
+      "name": "connect_webank",
+      "description": "Start or check owner-approved pairing."
+    },
+    {
+      "name": "get_wallet_status",
+      "description": "Check this agent's Gateway session and wallet state."
+    },
+    {
+      "name": "wait_for_approval",
+      "description": "Wait for a pairing, mandate, or payment decision."
+    },
+    {
+      "name": "disconnect_webank",
+      "description": "Revoke this agent's local WeBank connection."
+    },
+    {
+      "name": "create_mandate",
+      "description": "Propose a scoped spending mandate for owner approval."
+    },
+    {
+      "name": "get_mandate_status",
+      "description": "Read this agent's mandate status."
+    },
+    {
+      "name": "request_payment",
+      "description": "Submit a signed shop payment request under an active mandate."
+    },
+    {
+      "name": "get_payment_status",
+      "description": "Read this agent's payment status."
+    },
+    {
+      "name": "list_my_payments",
+      "description": "Read this agent's payment history."
+    }
+  ],
+  "compatibility": {
+    "platforms": ["darwin"],
+    "runtimes": { "node": ">=22 <23" }
+  }
+}

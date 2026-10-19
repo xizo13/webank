@@ -8,6 +8,7 @@
     "build": "node scripts/compile.mjs",
     "typecheck": "corepack pnpm --filter @webank/chain build && tsc -p tsconfig.json",
     "deploy": "node scripts/compile.mjs && tsx scripts/deploy.ts",
+    "stage:funding": "node scripts/compile.mjs && corepack pnpm --filter @webank/chain build && tsx scripts/stage-funding.ts",
     "seed:merchants": "node scripts/compile.mjs && corepack pnpm --filter @webank/chain build && tsx scripts/seed-merchants.ts",
     "smoke": "node scripts/compile.mjs && corepack pnpm --filter @webank/chain build && tsx test/smoke.ts"
   },
