@@ -31,7 +31,10 @@ export default function CartPage() {
       active = false;
     };
   }, []);
-  async function act(operation: string) {
+  async function act(
+    operation: "checkout" | "clear_cart" | "remove_from_cart",
+    sku?: string,
+  ) {
     setBusy(true);
     setError("");
     try {
@@ -40,6 +43,7 @@ export default function CartPage() {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           operation,
+          ...(operation === "remove_from_cart" ? { sku } : {}),
           ...(operation === "checkout" ? { shipping_address: address } : {}),
         }),
       });
@@ -97,7 +101,18 @@ export default function CartPage() {
                   </p>
                   <small>{item.product.sku}</small>
                 </div>
-                <strong>{formatCny(item.line_total.amount)}</strong>
+                <div className="cart-line-action">
+                  <strong>{formatCny(item.line_total.amount)}</strong>
+                  <button
+                    type="button"
+                    className="cart-remove"
+                    onClick={() => void act("remove_from_cart", item.sku)}
+                    disabled={busy}
+                    aria-label={`Remove ${item.product.name} (${item.sku}) from cart`}
+                  >
+                    Remove
+                  </button>
+                </div>
               </div>
             ))}
           </div>

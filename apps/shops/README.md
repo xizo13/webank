@@ -21,13 +21,14 @@ SHOP_URL=http://127.0.0.1:3001 corepack pnpm --filter @webank/shops mcp
 ```
 
 The MCP server uses stdio and should be launched by Claude or an MCP client.
-It exposes `search_products`, `get_product`, `add_to_cart`, `get_cart`, `checkout` and `get_order`.
+It exposes `search_products`, `get_product`, `add_to_cart`, `get_cart`, `remove_from_cart`, `checkout` and `get_order`.
 The shop returns a signed payment request at checkout and does not give wallet or mandate instructions.
 The storefront is at `http://127.0.0.1:3001` and demo controls are at `/demo`.
 `get_product` lists each mock variant with its own SKU, GTIN, and exact colour and size options.
 Search puts the requested model first with `match: "exact"`; alternatives carry `match: "related"`.
 Agent-facing money objects include a `display` string next to canonical integer fen.
 `add_to_cart` requires the SKU and matching options.
+`remove_from_cart` takes one exact variant SKU and removes that cart line while keeping the others.
 `checkout` requires a shipping address supplied by the user: `name`, `phone`, `address_line`, `city`, and `postcode`.
 The human storefront pre-fills an explicitly mock address and requires confirmation before it creates the payment request.
 

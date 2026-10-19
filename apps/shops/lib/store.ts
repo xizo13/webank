@@ -243,6 +243,15 @@ export function addToCart(
   return getCart();
 }
 
+export function removeFromCart(sku: string): Cart {
+  const state = readState();
+  if (!state.cart.some((item) => item.sku === sku))
+    throw new Error("Item not in cart");
+  state.cart = state.cart.filter((item) => item.sku !== sku);
+  saveState(state);
+  return getCart();
+}
+
 export function clearCart(): Cart {
   const state = readState();
   state.cart = [];

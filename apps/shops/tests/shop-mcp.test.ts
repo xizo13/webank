@@ -37,8 +37,8 @@ beforeAll(async () => {
   if (!address || typeof address === "string") throw new Error("No test port");
   baseUrl = `http://127.0.0.1:${address.port}`;
   const transport = new StdioClientTransport({
-    command: "corepack",
-    args: ["pnpm", "mcp"],
+    command: process.execPath,
+    args: ["--import", "tsx", "mcp/server.ts"],
     cwd: shopDir,
     env: { ...process.env, SHOP_URL: baseUrl },
   });
@@ -137,6 +137,19 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
   });
   const readCart = (await tool("get_cart", {})).cart as Record<string, unknown>;
   expect(readCart.total).toEqual(cart.total);
+  const removed = (await tool("remove_from_cart", { sku: "NOVA-Q3-BLK" }))
+    .cart as Record<string, unknown>;
+  expect(removed.items).toEqual([]);
+  expect(removed.total).toEqual({
+    amount: 0,
+    currency: "CNY",
+    display: "¥0.00",
+  });
+  await tool("add_to_cart", {
+    sku: "NOVA-Q3-BLK",
+    qty: 1,
+    options: { colour: "Black", size: "One size" },
+  });
   const order = await tool("checkout", {
     shipping_address: {
       name: "Lin Demo",

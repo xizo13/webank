@@ -17,6 +17,7 @@ import {
   getCart,
   getOrder,
   listProducts,
+  removeFromCart,
   resetDemo,
   setDemoPrice,
   setDemoScenario,
@@ -43,6 +44,18 @@ afterAll(() => {
 });
 
 describe("mock shop checkout", () => {
+  it("removes one exact variant without changing the other cart line", () => {
+    addToCart("NOVA-Q3-BLK", 1, { colour: "Black", size: "One size" });
+    addToCart("NOVA-Q3-STN", 2, { colour: "Stone", size: "One size" });
+    const cart = removeFromCart("NOVA-Q3-BLK");
+    expect(cart.items.map((item) => [item.sku, item.qty])).toEqual([
+      ["NOVA-Q3-STN", 2],
+    ]);
+    expect(cart.total.amount).toBe(55_800);
+    expect(() => removeFromCart("NOVA-Q3-BLK")).toThrow("Item not in cart");
+    expect(getCart().items.map((item) => item.sku)).toEqual(["NOVA-Q3-STN"]);
+  });
+
   it("rejects a colour under the wrong SKU and requires a shipping address before signing", () => {
     expect(() =>
       addToCart("NOVA-Q3-BLK", 1, { colour: "Stone", size: "One size" }),

@@ -642,6 +642,27 @@ button:disabled {
   font-size: 10px;
   color: #a199a5;
 }
+.cart-line-action {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: 10px;
+}
+.cart-remove {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  color: #6b36bd;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.cart-remove:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
 .cart-thumbnail {
   height: 85px;
   background: #dfceee;

@@ -129,6 +129,22 @@ server.registerTool(
 );
 
 server.registerTool(
+  "remove_from_cart",
+  {
+    description:
+      "Remove the complete cart line for the exact variant SKU. Other items remain in the shared demo cart.",
+    inputSchema: { sku: z.string().min(1) },
+  },
+  async ({ sku }) => {
+    try {
+      return output(await shopPost("remove_from_cart", { sku }));
+    } catch (error) {
+      return fail(error);
+    }
+  },
+);
+
+server.registerTool(
   "checkout",
   {
     description:

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { NextRequest } from "next/server";
-import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GET, POST } from "../app/api/shop/route";
 import { decodePaymentUri, verifyLocalPaymentUri } from "../lib/signing";
 import { resetDemo } from "../lib/store";
@@ -19,8 +19,8 @@ const shipping_address = {
 
 beforeAll(() => {
   process.env.SHOP_DATA_DIR = dataDir;
-  resetDemo();
 });
+beforeEach(() => resetDemo());
 afterAll(() => {
   delete process.env.SHOP_DATA_DIR;
   rmSync(dataDir, { recursive: true, force: true });
@@ -47,6 +47,28 @@ async function get(operation: string, params: Record<string, string> = {}) {
 }
 
 describe("shop HTTP checkout path used by MCP", () => {
+  it("removes a chosen SKU and returns the updated cart", async () => {
+    await post("add_to_cart", {
+      sku: "NOVA-Q3-BLK",
+      qty: 1,
+      options: { colour: "Black", size: "One size" },
+    });
+    await post("add_to_cart", {
+      sku: "NOVA-Q3-STN",
+      qty: 2,
+      options: { colour: "Stone", size: "One size" },
+    });
+    const removed = await post("remove_from_cart", { sku: "NOVA-Q3-BLK" });
+    expect(removed.status).toBe(200);
+    expect(
+      removed.body.cart.items.map((item: { sku: string }) => item.sku),
+    ).toEqual(["NOVA-Q3-STN"]);
+    expect(removed.body.cart.total.display).toBe("¥558.00");
+    const missing = await post("remove_from_cart", { sku: "NOVA-Q3-BLK" });
+    expect(missing.status).toBe(400);
+    expect(missing.body.error.message).toBe("Item not in cart");
+  });
+
   it("locks the selected SKU, requires an address, and returns a signed item-plus-shipping order", async () => {
     const initial = await get("search_products", { query: "Nova Quiet 2" });
     expect(

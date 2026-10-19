@@ -11,6 +11,7 @@ import {
   getOrder,
   listProducts,
   productBySku,
+  removeFromCart,
   resetDemo,
   setDemoPrice,
   setDemoScenario,
@@ -121,6 +122,8 @@ export async function POST(request: NextRequest) {
             (body.options || {}) as { size?: string; colour?: string },
           ),
         });
+      case "remove_from_cart":
+        return agentResponse({ cart: removeFromCart(String(body.sku || "")) });
       case "clear_cart":
         return NextResponse.json({ cart: clearCart() });
       case "checkout":
