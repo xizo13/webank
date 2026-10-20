@@ -1929,51 +1929,209 @@ describe("Gateway HTTP decision slice", () => {
     expect(readState(statePath).activeDrill).not.toBeNull();
   });
 
-  it("fails closed and reconciles from disk when a drill save fails after replacement", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "webank-drill-ambiguous-"));
+  for (const action of ["start", "stop"] as const) {
+    it(`fails closed with a stable 503 and reconciles from disk when a drill ${action} save fails after replacement`, async () => {
+      const directory = mkdtempSync(join(tmpdir(), "webank-drill-ambiguous-"));
+      temporaryDirs.push(directory);
+      const statePath = join(directory, "gateway.json");
+      const visibility: boolean[] = [];
+      const first = fixture({
+        statePath,
+        demoTrustControlsEnabled: true,
+        setDrillVisibility: async (enabled) => {
+          visibility.push(enabled);
+        },
+      });
+      if (action === "stop")
+        expect(
+          (await first.app.inject(drillRequest("start", "start-first")))
+            .statusCode,
+        ).toBe(200);
+      const priorDrill = readState(statePath).activeDrill ?? null;
+      breakStateAfterReplacement(statePath);
+      const attempted = await first.app.inject(
+        drillRequest(action, `${action}-ambiguous`),
+      );
+      expect(attempted.statusCode).toBeGreaterThanOrEqual(500);
+      const durableDrill = readState(statePath).activeDrill ?? null;
+      expect(durableDrill === null).toBe(action === "stop");
+      expect(durableDrill).not.toEqual(action === "stop" ? priorDrill : null);
+      const recorded = readState(statePath).audits.filter(
+        (item: { kind: string }) => item.kind === "drill",
+      );
+      expect(recorded.at(-1).summary).toBe(
+        `Owner requested to ${action} local demo fire drill`,
+      );
+
+      const anchoredBefore = first.anchored.length;
+      const visibilityBefore = visibility.length;
+      const fenced = await first.app.inject(
+        drillRequest(action === "start" ? "stop" : "start", "while-fenced"),
+      );
+      expect(fenced.statusCode).toBe(503);
+      expect(fenced.json()).toEqual({ error: { code: "service_unavailable" } });
+      expect(first.anchored).toHaveLength(anchoredBefore);
+      expect(visibility).toHaveLength(visibilityBefore);
+      await first.app.close();
+      rmSync(`${statePath}.initialized`, { force: true });
+      writeFileSync(`${statePath}.initialized`, "1\n");
+
+      const restartedVisibility: boolean[] = [];
+      const restarted = fixture({
+        statePath,
+        demoTrustControlsEnabled: true,
+        setDrillVisibility: async (enabled) => {
+          restartedVisibility.push(enabled);
+        },
+      });
+      openApps.push(restarted.app);
+      const status = await restarted.app.inject({
+        method: "GET",
+        url: "/v1/app/demo/drills",
+        headers: { authorization: "Bearer test-app" },
+      });
+      expect(status.json()).toEqual({
+        active: durableDrill !== null,
+        drill_id: durableDrill?.drillId ?? null,
+      });
+      expect(restartedVisibility).toEqual([durableDrill !== null]);
+    });
+  }
+
+  it("fails closed and reconciles an owner AMBER-to-GREEN fast-forward whose final snapshot save fails after replacement", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-green-ambiguous-"));
     temporaryDirs.push(directory);
     const statePath = join(directory, "gateway.json");
+    const amber = AgentSchema.parse({
+      ...agent,
+      licence: {
+        level: "AMBER",
+        clean_purchases: 0,
+        drills_passed: 0,
+        drills_failed: 0,
+        flags_30d: 0,
+        reason: "New agent",
+        updated_at: "2026-10-14T00:00:00Z",
+      },
+    });
+    let bankWrites = 0;
     const first = fixture({
+      agent: amber,
       statePath,
       demoTrustControlsEnabled: true,
-      setDrillVisibility: async () => {},
+      setTrustLight: async () => {
+        bankWrites++;
+        return `0x${"c".repeat(64)}`;
+      },
     });
-    breakStateAfterReplacement(statePath);
-    const started = await first.app.inject(
-      drillRequest("start", "start-ambiguous"),
-    );
-    expect(started.statusCode).toBeGreaterThanOrEqual(500);
-    const refused = await first.app.inject({
+    openApps.push(first.app);
+    const prepared = await first.app.inject({
+      method: "POST",
+      url: `/v1/app/demo/agents/${amber.agent_id}/prepare-fast-forward-green`,
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "prepare-green-ambiguous",
+      },
+      payload: {},
+    });
+    expect(prepared.statusCode).toBe(200);
+    const original = DurableState.prototype.save;
+    let finalSaveReached = 0;
+    const arm = vi
+      .spyOn(DurableState.prototype, "save")
+      .mockImplementation(function (this: unknown, payload: unknown) {
+        const state = payload as {
+          trustEvents?: unknown[];
+          agents?: { licence: { level: string } }[];
+        };
+        if (
+          (state.trustEvents ?? []).length > 0 &&
+          state.agents?.some((item) => item.licence.level === "GREEN")
+        ) {
+          finalSaveReached++;
+          breakStateAfterReplacement(statePath);
+        }
+        return original.call(this as DurableState<unknown>, payload);
+      });
+    const attempted = await first.app.inject({
+      method: "POST",
+      url: `/v1/app/demo/agents/${amber.agent_id}/fast-forward-green`,
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "approve-green-ambiguous",
+      },
+      payload: {
+        simulated: true,
+        challenge_id: prepared.json().challenge_id,
+        verification: {
+          action_hash: prepared.json().action_hash,
+          device_signature: "test-biometric-proof",
+        },
+      },
+    });
+    arm.mockRestore();
+    expect(finalSaveReached).toBe(1);
+    expect(bankWrites).toBe(1);
+    expect(attempted.statusCode).toBe(503);
+    expect(attempted.json()).toEqual({
+      error: { code: "reconciliation_required" },
+    });
+
+    const anchoredBefore = first.anchored.length;
+    const fenced = await first.app.inject({
       method: "GET",
-      url: "/v1/app/demo/drills",
+      url: "/v1/app/agents",
       headers: { authorization: "Bearer test-app" },
     });
-    expect(refused.statusCode).toBeGreaterThanOrEqual(500);
-    const durableDrill = readState(statePath).activeDrill;
-    expect(durableDrill).not.toBeNull();
+    expect(fenced.statusCode).toBe(503);
+    expect(fenced.json()).toEqual({ error: { code: "service_unavailable" } });
+    const fencedPayment = await first.app.inject({
+      method: "POST",
+      url: "/v1/agent/payments",
+      headers: {
+        authorization: "Bearer test-agent",
+        "idempotency-key": "green-pay-while-fenced",
+      },
+      payload: {},
+    });
+    expect(fencedPayment.statusCode).toBe(503);
+    expect(first.anchored).toHaveLength(anchoredBefore);
+    expect(first.executed).toEqual([]);
+    expect(bankWrites).toBe(1);
     await first.app.close();
+    openApps.splice(openApps.indexOf(first.app), 1);
     rmSync(`${statePath}.initialized`, { force: true });
     writeFileSync(`${statePath}.initialized`, "1\n");
 
-    const visibility: boolean[] = [];
     const restarted = fixture({
+      agent: amber,
       statePath,
       demoTrustControlsEnabled: true,
-      setDrillVisibility: async (enabled) => {
-        visibility.push(enabled);
+      setTrustLight: async () => {
+        bankWrites++;
+        return `0x${"d".repeat(64)}`;
       },
     });
     openApps.push(restarted.app);
-    const status = await restarted.app.inject({
+    const agents = await restarted.app.inject({
       method: "GET",
-      url: "/v1/app/demo/drills",
+      url: "/v1/app/agents",
       headers: { authorization: "Bearer test-app" },
     });
-    expect(status.json()).toEqual({
-      active: true,
-      drill_id: durableDrill.drillId,
+    expect(agents.json().items[0].licence.level).toBe("GREEN");
+    const history = await restarted.app.inject({
+      method: "GET",
+      url: `/v1/app/agents/${amber.agent_id}/trust-events`,
+      headers: { authorization: "Bearer test-app" },
     });
-    expect(visibility).toEqual([true]);
+    expect(history.json().items).toHaveLength(1);
+    expect(history.json().items[0]).toMatchObject({
+      kind: "demo_override",
+      from: "AMBER",
+      to: "GREEN",
+      chain_tx: `0x${"c".repeat(64)}`,
+    });
+    expect(bankWrites).toBe(1);
   });
 
   async function startedDecoyFixture(directory: string, statePath: string) {
@@ -2055,6 +2213,7 @@ describe("Gateway HTTP decision slice", () => {
       payload: {},
     });
     expect(refused.statusCode).toBe(503);
+    expect(refused.json()).toEqual({ error: { code: "service_unavailable" } });
     expect(first.anchored).toHaveLength(sideEffects);
     await first.app.close();
     rmSync(`${statePath}.initialized`, { force: true });

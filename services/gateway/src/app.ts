@@ -742,7 +742,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         return reply.code(503).send(error("service_unavailable", 503).body);
     });
     app.addHook("onSend", async (_request, _reply, payload) => {
-      persist();
+      if (!stateStore.isAmbiguous) persist();
       return payload;
     });
   }
