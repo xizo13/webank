@@ -192,6 +192,7 @@ function fixture(
     anchorAudit?: GatewayDependencies["anchorAudit"];
     setDrillVisibility?: GatewayDependencies["setDrillVisibility"];
     demoTrustControlsEnabled?: true;
+    pauseAuthenticatedApp?: Promise<void>;
     authenticateDrillService?: GatewayDependencies["authenticateDrillService"];
     authenticateBankOperator?: GatewayDependencies["authenticateBankOperator"];
   } = {},
@@ -260,12 +261,14 @@ function fixture(
         ? (options.agent ?? agent)
         : null;
     },
-    authenticateApp: async (request) =>
-      request.headers.authorization === "Bearer test-app"
+    authenticateApp: async (request) => {
+      if (request.headers["x-pause"]) await options.pauseAuthenticatedApp;
+      return request.headers.authorization === "Bearer test-app"
         ? "usr_test"
         : request.headers.authorization === "Bearer other-app"
           ? "usr_other"
-          : null,
+          : null;
+    },
     demoApprovalsEnabled:
       options.demoApprovalEnabled === false ? undefined : true,
     demoApprovalVerifier: async (approval, verification) => {
@@ -1948,11 +1951,17 @@ describe("Gateway HTTP decision slice", () => {
             .statusCode,
         ).toBe(200);
       const priorDrill = readState(statePath).activeDrill ?? null;
+      await first.app.ready();
+      const visibilityAfterFirst = visibility.length;
       breakStateAfterReplacement(statePath);
       const attempted = await first.app.inject(
         drillRequest(action, `${action}-ambiguous`),
       );
-      expect(attempted.statusCode).toBeGreaterThanOrEqual(500);
+      expect(attempted.statusCode).toBe(503);
+      expect(attempted.json()).toEqual({
+        error: { code: "service_unavailable" },
+      });
+      expect(visibility).toHaveLength(visibilityAfterFirst + 1);
       const durableDrill = readState(statePath).activeDrill ?? null;
       expect(durableDrill === null).toBe(action === "stop");
       expect(durableDrill).not.toEqual(action === "stop" ? priorDrill : null);
@@ -1997,6 +2006,46 @@ describe("Gateway HTTP decision slice", () => {
       expect(restartedVisibility).toEqual([durableDrill !== null]);
     });
   }
+
+  it("replaces the success response of a request admitted before the writer became ambiguous", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-inflight-ambiguous-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    let release: () => void = () => {};
+    const paused = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const { app, anchored } = fixture({
+      statePath,
+      demoTrustControlsEnabled: true,
+      setDrillVisibility: async () => {},
+      pauseAuthenticatedApp: paused,
+    });
+    openApps.push(app);
+    await app.ready();
+    const inFlight = app.inject({
+      method: "GET",
+      url: "/v1/app/demo/drills",
+      headers: { authorization: "Bearer test-app", "x-pause": "1" },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    breakStateAfterReplacement(statePath);
+    const establishing = await app.inject({
+      method: "GET",
+      url: "/v1/app/demo/drills",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(establishing.statusCode).toBe(503);
+    expect(establishing.json()).toEqual({
+      error: { code: "service_unavailable" },
+    });
+    const anchoredBefore = anchored.length;
+    release();
+    const resumed = await inFlight;
+    expect(resumed.statusCode).toBe(503);
+    expect(resumed.json()).toEqual({ error: { code: "service_unavailable" } });
+    expect(anchored).toHaveLength(anchoredBefore);
+  });
 
   it("fails closed and reconciles an owner AMBER-to-GREEN fast-forward whose final snapshot save fails after replacement", async () => {
     const directory = mkdtempSync(join(tmpdir(), "webank-green-ambiguous-"));
@@ -2074,7 +2123,7 @@ describe("Gateway HTTP decision slice", () => {
     expect(bankWrites).toBe(1);
     expect(attempted.statusCode).toBe(503);
     expect(attempted.json()).toEqual({
-      error: { code: "reconciliation_required" },
+      error: { code: "service_unavailable" },
     });
 
     const anchoredBefore = first.anchored.length;

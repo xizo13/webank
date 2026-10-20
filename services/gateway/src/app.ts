@@ -741,9 +741,17 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       if (stateStore.isAmbiguous)
         return reply.code(503).send(error("service_unavailable", 503).body);
     });
-    app.addHook("onSend", async (_request, _reply, payload) => {
-      if (!stateStore.isAmbiguous) persist();
-      return payload;
+    app.addHook("onSend", async (_request, reply, payload) => {
+      if (!stateStore.isAmbiguous) {
+        try {
+          persist();
+          return payload;
+        } catch {
+          /* fall through to the unavailable response */
+        }
+      }
+      reply.code(503).type("application/json; charset=utf-8");
+      return JSON.stringify(error("service_unavailable", 503).body);
     });
   }
   const expiryTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -5032,10 +5040,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
                 throw failure;
               }
             } catch {
-              try {
-                await synchronizeVisibility(activeDrill !== null);
-              } catch {
-                /* startup reconciliation restores bank state */
+              if (!stateStore?.isAmbiguous) {
+                try {
+                  await synchronizeVisibility(activeDrill !== null);
+                } catch {
+                  /* startup reconciliation restores bank state */
+                }
               }
               return error("service_unavailable", 503);
             }
