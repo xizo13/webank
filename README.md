@@ -17,13 +17,20 @@ All merchants and currency in this repository are simulated, and no real funds m
 
 The CLI integration driver has exercised shop checkout, the actual connector client, Gateway checks, simulated app approval and reservation, local FISCO settlement, shop confirmation, and app payment detail in one path.
 An owner browser session has also completed a fresh agent pairing with an audit anchor on the local chain.
-The completed payment path was a CLI run, not a live Claude shopping session or a bank-verifiable phone approval.
+The integration driver ran that payment path through the CLI; it did not use bank-verifiable phone approval.
 The separate limited Gateway fixture supports read, reject, and freeze demonstrations but cannot approve a card or move money.
 The owner transfer and policy limit controls are built in the browser app and Gateway, with simulated owner approval in the local demo.
 A real local FISCO cap write and refreshed owner browser acceptance of those controls remain pending.
 The source includes a recording-stage command and a state-changing Hermes and FISCO acceptance driver for a separate disposable stack.
 That driver completed a signed shop-to-app run: an Amber purchase showed one owner card, a Green ¥77.00 purchase settled on FISCO without a card, and Hermes denied a contradictory signed order without a wallet debit.
 The run used simulated currency, merchants, and owner approval proof, and it did not involve a live Claude shopping session.
+
+## Submission video evidence
+
+The submission video is scoped to three existing owner-captured segments: Agent Wallet setup and Amber pairing, a successful Amber checkout with one owner approval and Bank Console and Guardian evidence, and a mandate rejection that Claude corrects.
+The rejection segment is assembled from screenshots rather than a new live run.
+The edit must label the web biometric step and local e-CNY as simulated.
+Green auto-pay, Treasurer, and rogue merchant scenes are outside this video.
 
 ## Current owner controls
 

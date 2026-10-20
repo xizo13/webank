@@ -1,7 +1,15 @@
 # Verification and known limits
 
-This record separates the default automated gate and opt-in local FISCO evidence recorded on 2026-10-14 from the current operator limits.
-The historical results below do not constitute a fresh full workspace gate for later changes.
+This record separates current public CI, historical implementation checks, opt-in local FISCO evidence, and operator limits.
+Historical results do not constitute a fresh full workspace gate for later changes.
+
+## 2026-10-20 current public main
+
+Public `main` at `3723b04` passed the [Product checks CI run](https://github.com/xizo13/webank/actions/runs/39390196730).
+That run installed the pinned dependencies and completed `pnpm check`, which includes Biome, builds, TypeScript checks, and the default Vitest suite.
+The local FISCO and Hermes acceptance results below remain separate opt-in evidence.
+The submission video uses existing owner recordings of setup and Amber checkout, plus screenshots of a rejected mandate and Claude's correction.
+Its web biometric proof and e-CNY are simulated; Green auto-pay, Treasurer, and rogue merchant scenes are outside the video.
 
 ## 2026-10-20 section-6 review branch checks
 
@@ -16,7 +24,7 @@ The signed shop-to-app acceptance driver passed on a separate local FISCO stack 
 The run showed one Amber owner card, a Green ¥77.00 auto-payment with a verified FISCO transaction and no card, and a contradictory signed order denied by Hermes without a wallet debit.
 The Bank Console, shop order, Gateway status, and wallet readings agreed for that run.
 That acceptance used simulated currency, merchants, and owner proof; it did not test a live Claude shopping session or native biometric signing.
-This review branch has not passed a fresh dependency install, full workspace gate, or CI.
+At that review-branch checkpoint, a fresh dependency install, full workspace gate, and CI had not yet run; current public `main` passed the CI run noted above.
 No iPhone build or bank-verifiable biometric approval is claimed.
 
 ## 2026-10-20 earlier owner-control checks
@@ -28,7 +36,7 @@ An isolated web export passed, but refreshed owner browser acceptance of the tra
 The public checkout's 40 Python launcher tests passed, including private Hermes configuration isolation checks.
 Five focused Gateway token tests passed in the reviewed implementation source.
 Both standalone Gateway listeners require an absolute path for a new mode `0600` token file before listening and do not print the token.
-The public checkout has no installed workspace dependencies and has not passed its own full workspace gate or CI for this draft.
+At that earlier checkpoint, the public checkout had no installed workspace dependencies and had not passed its own full workspace gate or CI.
 At that earlier checkpoint, the dedicated zero-tool Nous Research Hermes Agent profile had passed a live synthetic smoke test with three decisions.
 The later signed shop-to-app acceptance above supersedes that earlier gap.
 The real local FISCO owner cap write remains pending acceptance.
