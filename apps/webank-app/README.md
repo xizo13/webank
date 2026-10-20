@@ -30,8 +30,8 @@ The Agents screen shows Amber, Green, or Red trust with a reason, plus a separat
 It offers Freeze, Unfreeze, Re-approve connection after seven days idle, Return to Amber after reviewing trust evidence, and Delete agent controls.
 The owner can use a clearly labelled local demo control that fast-forwards an agent to Green.
 This is a simulated override, not an earned qualification, and it does not fabricate a clean purchase history.
-In the loopback demo, these owner actions send the explicit simulated approval proof: agent and payment approvals, funding, spending-limit changes, Unfreeze, Re-approve connection, Return to Amber, and the Green override.
-Returning wallet balance to the main account, Freeze, Delete agent, rejecting or denying a request, and starting or stopping the demo drill rely on the authenticated owner session without any biometric or simulated proof.
+In the loopback demo, these owner actions send the explicit simulated approval proof: agent and payment approvals, funding, spending-limit changes that raise any limit, Unfreeze, Re-approve connection, Return to Amber, and the Green override.
+Returning wallet balance to the main account, spending-limit changes that only lower limits, Freeze, Delete agent, rejecting or denying a request, and starting or stopping the demo drill rely on the authenticated owner session without any biometric or simulated proof.
 None of these is a bank-verifiable biometric action.
 Delete confirms the named agent and retains history.
 In Gateway mode, Home and Wallet read the simulated main-account and separate Agent Wallet balances from `GET /v1/app/home` with a chain block and observation time.
