@@ -192,7 +192,7 @@ function fixture(
     anchorAudit?: GatewayDependencies["anchorAudit"];
     setDrillVisibility?: GatewayDependencies["setDrillVisibility"];
     demoTrustControlsEnabled?: true;
-    pauseAuthenticatedApp?: Promise<void>;
+    pauseAuthenticatedApp?: { entered: () => void; release: Promise<void> };
     authenticateDrillService?: GatewayDependencies["authenticateDrillService"];
     authenticateBankOperator?: GatewayDependencies["authenticateBankOperator"];
   } = {},
@@ -262,7 +262,10 @@ function fixture(
         : null;
     },
     authenticateApp: async (request) => {
-      if (request.headers["x-pause"]) await options.pauseAuthenticatedApp;
+      if (request.headers["x-pause"] && options.pauseAuthenticatedApp) {
+        options.pauseAuthenticatedApp.entered();
+        await options.pauseAuthenticatedApp.release;
+      }
       return request.headers.authorization === "Bearer test-app"
         ? "usr_test"
         : request.headers.authorization === "Bearer other-app"
@@ -2012,6 +2015,10 @@ describe("Gateway HTTP decision slice", () => {
     temporaryDirs.push(directory);
     const statePath = join(directory, "gateway.json");
     let release: () => void = () => {};
+    let markEntered: () => void = () => {};
+    const entered = new Promise<void>((resolve) => {
+      markEntered = resolve;
+    });
     const paused = new Promise<void>((resolve) => {
       release = resolve;
     });
@@ -2019,7 +2026,7 @@ describe("Gateway HTTP decision slice", () => {
       statePath,
       demoTrustControlsEnabled: true,
       setDrillVisibility: async () => {},
-      pauseAuthenticatedApp: paused,
+      pauseAuthenticatedApp: { entered: markEntered, release: paused },
     });
     openApps.push(app);
     await app.ready();
@@ -2028,7 +2035,7 @@ describe("Gateway HTTP decision slice", () => {
       url: "/v1/app/demo/drills",
       headers: { authorization: "Bearer test-app", "x-pause": "1" },
     });
-    await new Promise((resolve) => setTimeout(resolve, 20));
+    await entered;
     breakStateAfterReplacement(statePath);
     const establishing = await app.inject({
       method: "GET",
