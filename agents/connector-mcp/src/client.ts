@@ -481,10 +481,9 @@ export class WeBankConnector {
       await this.store.save(current);
     }
     const pending = current.pending;
-    const refreshed = await this.pairingWait(current, 0);
-    if (refreshed.status === "expired" || refreshed.status === "rejected") {
+    const ended = async (status: string) => {
       await this.store.save({ ...current, pending: undefined });
-      return refreshed.status === "expired"
+      return status === "expired"
         ? {
             status: "pairing_expired",
             message:
@@ -495,7 +494,10 @@ export class WeBankConnector {
             message:
               "The user rejected this pairing. Start a new pairing only if requested.",
           };
-    }
+    };
+    const refreshed = await this.pairingWait(current, 0, false);
+    if (refreshed.status === "expired" || refreshed.status === "rejected")
+      return ended(refreshed.status);
     let notificationDelivered = true;
     try {
       await this.notify(
@@ -545,7 +547,21 @@ export class WeBankConnector {
         setTimeout(resolve, pending.interval * 1000),
       );
     } while (this.now() < until);
-    await this.pairingWait(current, 0);
+    const announced = pending.requestNumber;
+    const latest = await this.pairingWait(current, 0, false);
+    if (latest.status === "expired" || latest.status === "rejected")
+      return ended(latest.status);
+    if (pending.requestNumber !== announced) {
+      try {
+        await this.notify(
+          "WeBank agent pairing",
+          `Request number ${pending.requestNumber}`,
+        );
+        notificationDelivered = true;
+      } catch {
+        notificationDelivered = false;
+      }
+    }
     return {
       status: "awaiting_user",
       user_code: pending.userCode,
@@ -674,6 +690,7 @@ export class WeBankConnector {
   private async pairingWait(
     current: Credentials,
     waitSeconds: number,
+    notifyOnChange = true,
   ): Promise<{
     status: string;
     expires_at: string;
@@ -703,10 +720,11 @@ export class WeBankConnector {
     if (data.request_number && data.request_number !== pending.requestNumber) {
       pending.requestNumber = data.request_number;
       await this.store.save(current);
-      await this.notify(
-        "WeBank agent pairing",
-        `Request number ${data.request_number}`,
-      ).catch(() => undefined);
+      if (notifyOnChange)
+        await this.notify(
+          "WeBank agent pairing",
+          `Request number ${data.request_number}`,
+        ).catch(() => undefined);
     }
     return data;
   }

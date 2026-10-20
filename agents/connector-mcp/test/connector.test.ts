@@ -63,6 +63,7 @@ describe("WeBank MCP connector", () => {
     let replay: { url: URL; init: RequestInit } | undefined;
     let refreshed = 0;
     let currentNumber = "123456";
+    const pairingStatuses: string[] = [];
 
     const gatewayFetch = async (
       input: URL | RequestInfo,
@@ -100,7 +101,7 @@ describe("WeBank MCP connector", () => {
         url.pathname === "/v1/oauth/device_authorization/secret-device-code"
       ) {
         return reply(200, {
-          status: "pending",
+          status: pairingStatuses.shift() ?? "pending",
           expires_at: new Date(Date.now() + 600_000).toISOString(),
           request_number: currentNumber,
           request_number_expires_at: new Date(
@@ -331,15 +332,31 @@ describe("WeBank MCP connector", () => {
     expect(pairing.status).toBe("awaiting_user");
     expect(pairing.request_number).toBe("123456");
     expect(JSON.stringify(pairing)).not.toContain("secret-device-code");
-    expect(notifications).toContain("Request number 123456");
+    expect(notifications).toEqual(["Request number 123456"]);
     currentNumber = "777777";
     const rotated = await call("connect_webank", {});
     expect(rotated.status).toBe("awaiting_user");
     expect(rotated.user_code).toBe(pairing.user_code);
     expect(rotated.request_number).toBe("777777");
-    expect(notifications).toContain("Request number 777777");
+    expect(notifications).toEqual([
+      "Request number 123456",
+      "Request number 777777",
+    ]);
+    expect(rotated.notification_delivered).toBe(true);
     expect((await store.load())?.pending?.requestNumber).toBe("777777");
     expect((await store.load())?.publicKey).toBe(publicKey);
+    pairingStatuses.push("pending", "expired");
+    const expiredAtEnd = await call("connect_webank", {});
+    expect(expiredAtEnd.status).toBe("pairing_expired");
+    expect(expiredAtEnd).not.toHaveProperty("request_number");
+    expect((await store.load())?.pending).toBeUndefined();
+    expect(notifications).toHaveLength(3);
+    pairingStatuses.push("rejected");
+    const rejectedAtStart = await call("connect_webank", {});
+    expect(rejectedAtStart.status).toBe("not_paired");
+    expect(rejectedAtStart).not.toHaveProperty("request_number");
+    expect(notifications).toHaveLength(3);
+    currentNumber = "123456";
     approved = true;
     const connected = await call("connect_webank", {});
     expect(connected).toEqual({ status: "connected", agent_id: "agt_test" });
