@@ -7,6 +7,8 @@ import io
 import json
 import os
 import platform
+import stat
+import sys
 import tempfile
 import types
 import unittest
@@ -103,7 +105,8 @@ class LauncherProcessIdentityTests(unittest.TestCase):
         uid = 501
         listener = f"p55385\ncnode\nu{uid}\nf24\nn127.0.0.1:3002\n"
         cwd = f"p55385\ncnode\nu{uid}\nfcwd\nn{local_demo.GATEWAY}\n"
-        with mock.patch.object(local_demo.os, "getpgid", return_value=55385), \
+        with mock.patch.object(platform, "system", return_value="Darwin"), \
+             mock.patch.object(local_demo.os, "getpgid", return_value=55385), \
              mock.patch.object(local_demo.os, "getuid", return_value=uid), \
              mock.patch.object(local_demo.subprocess, "run", side_effect=[
                  types.SimpleNamespace(returncode=0, stdout=listener),
@@ -119,6 +122,7 @@ class LauncherProcessIdentityTests(unittest.TestCase):
             ("127.0.0.1:3002", str(local_demo.SHOP)),
         ):
             with self.subTest(listener=listener_name, cwd=cwd_name), \
+                 mock.patch.object(platform, "system", return_value="Darwin"), \
                  mock.patch.object(local_demo.os, "getpgid", return_value=55385), \
                  mock.patch.object(local_demo.os, "getuid", return_value=uid), \
                  mock.patch.object(local_demo.subprocess, "run", side_effect=[
@@ -126,6 +130,103 @@ class LauncherProcessIdentityTests(unittest.TestCase):
                      types.SimpleNamespace(returncode=0, stdout=f"p55385\ncnode\nu{uid}\nfcwd\nn{cwd_name}\n"),
                  ]):
                 self.assertFalse(local_demo.owned(record, "gateway"))
+
+    def test_linux_shop_identity_uses_proc_when_lsof_is_empty(self):
+        pid = 55388
+        with tempfile.TemporaryDirectory() as directory:
+            proc_root = Path(directory)
+            process = proc_root / str(pid)
+            (process / "fd").mkdir(parents=True)
+            (process / "net").mkdir()
+            (process / "cwd").symlink_to(local_demo.SHOP, target_is_directory=True)
+            (process / "exe").symlink_to("/usr/bin/node")
+            (process / "fd" / "17").symlink_to("socket:[9191]")
+            stat_fields = ["S", "1", str(pid)] + ["0"] * 16 + ["123456"]
+            (process / "stat").write_text(f"{pid} (next-server (v16.4.0)) " + " ".join(stat_fields) + "\n")
+            (process / "status").write_text("Uid:\t501\t501\t501\t501\n")
+            (process / "net" / "tcp").write_text(
+                "sl local_address rem_address st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n"
+                "0: 0100007F:0BB9 00000000:0000 0A 00000000:00000000 00:00000000 00000000 501 0 9191\n"
+            )
+            record = {"pid": pid, "started": "fixture", "proc_start_ticks": "123456"}
+
+            def verify():
+                with mock.patch.object(local_demo.os, "getuid", return_value=501):
+                    return local_demo.linux_owned(record, 3001, local_demo.SHOP, "node", proc_root)
+
+            self.assertTrue(verify())
+            del record["proc_start_ticks"]
+            with mock.patch.object(local_demo, "ps", return_value="fixture"):
+                self.assertTrue(verify())
+            with mock.patch.object(local_demo, "ps", return_value="reused pid"):
+                self.assertFalse(verify())
+            record["proc_start_ticks"] = "different"
+            self.assertFalse(verify())
+            record["proc_start_ticks"] = "123456"
+            (process / "fd" / "17").unlink()
+            self.assertFalse(verify())
+            (process / "fd" / "17").symlink_to("socket:[different]")
+            self.assertFalse(verify())
+            (process / "fd" / "17").unlink()
+            (process / "fd" / "17").symlink_to("socket:[9191]")
+            (process / "cwd").unlink()
+            (process / "cwd").symlink_to(local_demo.GATEWAY, target_is_directory=True)
+            self.assertFalse(verify())
+            (process / "cwd").unlink()
+            (process / "cwd").symlink_to(local_demo.SHOP, target_is_directory=True)
+            (process / "status").write_text("Uid:\t502\t502\t502\t502\n")
+            self.assertFalse(verify())
+            (process / "status").write_text("Uid:\t501\t501\t501\t501\n")
+            (process / "exe").unlink()
+            (process / "exe").symlink_to("/usr/bin/foreign-node")
+            self.assertFalse(verify())
+            (process / "exe").unlink()
+            (process / "exe").symlink_to("/usr/bin/node")
+            self.assertFalse(local_demo.linux_owned(record, 9999, local_demo.SHOP, "node", proc_root))
+
+    def test_stop_refuses_changed_identity_without_signalling(self):
+        with mock.patch.object(local_demo.os, "getpgid", return_value=55388), \
+             mock.patch.object(local_demo, "owned", return_value=False), \
+             mock.patch.object(local_demo.os, "killpg") as killpg:
+            self.assertFalse(local_demo.stop_child({"pid": 55388}, "shop"))
+        killpg.assert_not_called()
+
+    def test_linux_owned_dispatch_does_not_depend_on_empty_lsof(self):
+        record = {"pid": 55388, "started": "fixture", "proc_start_ticks": "123456"}
+        with mock.patch.object(platform, "system", return_value="Linux"), \
+             mock.patch.object(local_demo.os, "getpgid", return_value=55388), \
+             mock.patch.object(local_demo, "linux_owned", return_value=True) as proc_check, \
+             mock.patch.object(local_demo, "lsof_fields", return_value=None) as lsof_check:
+            self.assertTrue(local_demo.owned(record, "shop"))
+        proc_check.assert_called_once()
+        lsof_check.assert_not_called()
+
+    def test_launcher_lock_is_owner_only_and_treasurer_can_use_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            lock = runtime / "operator.lock"
+            lock.write_text("")
+            lock.chmod(0o644)
+            with mock.patch.object(local_demo, "RUNTIME", runtime), \
+                 mock.patch.object(local_demo, "STATE", runtime / "state.json"), \
+                 mock.patch.object(local_demo, "TOKEN", runtime / "app-login-token"), \
+                 mock.patch.object(sys, "argv", ["local-demo.py", "down"]):
+                local_demo.main()
+            self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o600)
+            treasurer_simulation.append_events(runtime, [{"schema": "console_simulation.v1", "scene": "treasurer_renewal_paid"}])
+            self.assertIn("treasurer_renewal_paid", (runtime / "console-simulation.jsonl").read_text())
+
+    def test_launcher_refuses_symlinked_operator_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            target = runtime / "target"
+            target.write_text("keep")
+            (runtime / "operator.lock").symlink_to(target)
+            with mock.patch.object(local_demo, "RUNTIME", runtime), \
+                 mock.patch.object(sys, "argv", ["local-demo.py", "down"]):
+                with self.assertRaises(OSError):
+                    local_demo.main()
+            self.assertEqual(target.read_text(), "keep")
 
     def test_down_preserves_chain_when_any_child_cannot_be_verified(self):
         state = {"children": {"app": {"pid": 100, "started": "old"}}, "chain_pids": {"node0": 200}}
@@ -793,7 +894,8 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                 chain.mkdir(exist_ok=True)
                 shop.mkdir(exist_ok=True)
                 app.mkdir(exist_ok=True)
-                for name in ("fisco-bcos-v3.17.1-macOS-arm.tar.gz", "build_chain.sh", "home/.fisco/tassl-1.1.1b", "home/.fisco/get_account.sh"):
+                archive_name = local_demo.chain_artifact_paths()["FISCO_ARCHIVE_FILE"].name
+                for name in (archive_name, "build_chain.sh", "home/.fisco/tassl-1.1.1b", "home/.fisco/get_account.sh"):
                     path = chain / name
                     path.parent.mkdir(parents=True, exist_ok=True)
                     path.touch()

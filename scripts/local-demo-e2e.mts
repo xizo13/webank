@@ -166,10 +166,14 @@ async function approveCard(
   );
 }
 
-async function mandate(cookie: string, amount: number, categories: string[]) {
-  const proposed = await connector.createMandate({
-    description: "Local CLI checkout under the approved cap",
-    user_text: "Local CLI checkout under the approved cap",
+function mandateRequest(
+  amount: number,
+  categories: string[],
+  description = "Local CLI checkout under the approved cap",
+) {
+  return {
+    description,
+    user_text: description,
     intent_level: "open",
     constraints: [
       { type: "amount_range", max: { amount, currency: "CNY" } },
@@ -182,7 +186,13 @@ async function mandate(cookie: string, amount: number, categories: string[]) {
         not_after: new Date(Date.now() + 3_600_000).toISOString(),
       },
     ],
-  });
+  };
+}
+
+async function mandate(cookie: string, amount: number, categories: string[]) {
+  const proposed = await connector.createMandate(
+    mandateRequest(amount, categories),
+  );
   assert.equal(proposed.status, "pending_checkout");
   assert.equal(proposed.approval_timing, "payment");
   assert.equal("approval_id" in proposed, false);
@@ -468,15 +478,9 @@ async function main() {
   assert.equal(frozen.status, 200);
   await assert.rejects(
     () =>
-      connector.createMandate({
-        description: "Should be blocked after freeze",
-        user_text: "Should be blocked after freeze",
-        intent_level: "open",
-        constraints: [
-          { type: "budget", max: { amount: 1000, currency: "CNY" } },
-          { type: "recurrence", frequency: "NONE", max_occurrences: 1 },
-        ],
-      }),
+      connector.createMandate(
+        mandateRequest(1000, ["electronics"], "Should be blocked after freeze"),
+      ),
     { code: "agent_frozen" },
   );
   console.log("freeze: app froze agent, signed connector request rejected");

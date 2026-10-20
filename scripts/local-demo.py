@@ -133,6 +133,59 @@ def lsof_fields(pid: int, *filters: str) -> dict[str, list[str]] | None:
     return fields
 
 
+def linux_process_start_ticks(pid: int, proc_root: Path = Path("/proc")) -> str | None:
+    try:
+        # The command in parentheses can contain spaces and closing parentheses.
+        fields = (proc_root / str(pid) / "stat").read_text().rpartition(") ")[2].split()
+        return fields[19] if len(fields) > 19 else None
+    except (OSError, ValueError):
+        return None
+
+
+def linux_owned(record: dict, port: int, cwd: Path, executable: str,
+                proc_root: Path = Path("/proc")) -> bool:
+    pid = record["pid"]
+    process = proc_root / str(pid)
+    try:
+        fields = (process / "stat").read_text().rpartition(") ")[2].split()
+        if len(fields) <= 19 or int(fields[2]) != pid:
+            return False
+        recorded_ticks = record.get("proc_start_ticks")
+        if recorded_ticks is not None:
+            if fields[19] != recorded_ticks:
+                return False
+        elif not record.get("started") or ps(pid, "lstart") != record["started"]:
+            # Existing launcher records predate proc_start_ticks.
+            return False
+        status = (process / "status").read_text().splitlines()
+        uid_line = next(line for line in status if line.startswith("Uid:"))
+        if [int(value) for value in uid_line.split()[1:]] != [os.getuid()] * 4:
+            return False
+        if (process / "cwd").resolve(strict=True) != cwd.resolve(strict=True):
+            return False
+        executable_name = Path(os.readlink(process / "exe")).name.lower()
+        if executable == "node" and executable_name != "node":
+            return False
+        if executable != "node" and not executable_name.startswith(executable):
+            return False
+        sockets = set()
+        for descriptor in (process / "fd").iterdir():
+            try:
+                target = os.readlink(descriptor)
+            except FileNotFoundError:
+                continue
+            if target.startswith("socket:[") and target.endswith("]"):
+                sockets.add(target.removeprefix("socket:[").removesuffix("]"))
+        loopback = socket.inet_aton("127.0.0.1")[::-1].hex().upper() + f":{port:04X}"
+        for line in (process / "net" / "tcp").read_text().splitlines()[1:]:
+            parts = line.split()
+            if len(parts) > 9 and parts[1].upper() == loopback and parts[3] == "0A" and parts[9] in sockets:
+                return True
+    except (OSError, ValueError, StopIteration):
+        return False
+    return False
+
+
 def owned(record: dict, role: str) -> bool:
     pid = record.get("pid")
     if not isinstance(pid, int) or pid <= 0:
@@ -150,6 +203,8 @@ def owned(record: dict, role: str) -> bool:
             return False
     except (ProcessLookupError, PermissionError):
         return False
+    if platform.system() == "Linux":
+        return linux_owned(record, port, cwd, executable)
     listener = lsof_fields(pid, f"-iTCP:{port}", "-sTCP:LISTEN")
     directory = lsof_fields(pid, "-d", "cwd")
     if not listener or not directory:
@@ -509,6 +564,10 @@ def start(name: str, command: list[str], cwd: Path, env: dict, state: dict):
         fail(f"{name} failed to start")
     started = ps(process.pid, "lstart") or dt.datetime.now(dt.timezone.utc).isoformat()
     state["children"][name] = {"pid": process.pid, "started": started}
+    if platform.system() == "Linux":
+        ticks = linux_process_start_ticks(process.pid)
+        if ticks is not None:
+            state["children"][name]["proc_start_ticks"] = ticks
     write_state(state)
     return process
 
@@ -1172,7 +1231,13 @@ def main() -> None:
         stage_recording(False)
         return
     private_dir()
-    with (RUNTIME / "operator.lock").open("a+") as lock:
+    lock_flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+    lock_descriptor = os.open(RUNTIME / "operator.lock", lock_flags, 0o600)
+    with os.fdopen(lock_descriptor, "r+") as lock:
+        lock_info = os.fstat(lock.fileno())
+        if not stat.S_ISREG(lock_info.st_mode) or lock_info.st_uid != os.getuid():
+            fail("Operator lock must be an owner-owned regular file")
+        os.fchmod(lock.fileno(), 0o600)
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command == "up":
             up(args.fresh)
