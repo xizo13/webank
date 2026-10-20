@@ -4,6 +4,15 @@ This independent WeBank Fintechathon 2026 prototype explores a separate wallet f
 It is not a WeBank product or a live banking service.
 All merchants and currency in this repository are simulated, and no real funds move.
 
+## Submission documents
+
+- [Technical documentation](docs/technical-documentation.md): architecture, core algorithms, and security design.
+- [Execution evidence](docs/execution-evidence.md): local FISCO BCOS transaction hashes for payments, audit anchors, and refusals.
+- [Verification and known limits](docs/verification.md): automated checks, acceptance runs, and open gaps.
+- [Architecture](docs/architecture.md): implemented interfaces and fixture adapters.
+
+The security self-assessment is submitted as a PDF with the presentation deck.
+
 ## Implemented slices
 
 | Area | Current behavior |
