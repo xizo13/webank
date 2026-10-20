@@ -1,6 +1,6 @@
 # Technical Documentation - We-AIlowance
 
-Status: submitted for the WeBank Fintechathon 2026, 2026-10-20.
+Status: submitted 2026-10-20.
 WeBank Fintechathon 2026, International Track, Topic F (Agent Wallet).
 Student prototype; not a WeBank product.
 Currency is a simulated e-CNY token (`ECnySim`) on a local FISCO BCOS chain, merchants are mock shops, and the biometric step in the web demo is simulated.
@@ -15,7 +15,7 @@ The Agent Wallet is a separate pot of money inside the user's bank account that 
 1. The user turns on the Agent Wallet and moves money into it; the main account stays out of the agent's reach.
 2. The user pairs each client app separately, with a pairing code, a one-time request number and a biometric confirmation.
 3. For each task, the agent proposes a mandate: a locked description of what the user wants (merchant, product, variant, budget, expiry).
-4. The agent shops at any merchant and hands the merchant's ordinary signed payment request to WeBank; merchants change nothing.
+4. The agent shops at any merchant and hands the merchant's ordinary signed payment request to WeBank; merchants keep their checkout and only sign the payment request.
 5. WeBank checks the request in code, shows one approval at payment for an attended purchase, and settles on chain within hard contract caps.
 6. Settled payments get a signed receipt and an on-chain audit anchor.
    The Gateway audits decisions that reach its durable decision pipeline; early malformed requests can be rejected before a payment receipt exists.
@@ -36,7 +36,7 @@ The Agent Wallet is a separate pot of money inside the user's bank account that 
 | Mock shops | Next.js storefront + Shop MCP server | Catalogue, cart, shipping address, checkout producing an Ed25519-signed payment request and QR, order status, demo controls |
 | WeBank connector | MCP server (stdio), TypeScript | Separate credential namespace per initialized client app, pairing, mandates, payment requests, status and renewal; signs with each app's P-256 key under RFC 9421 |
 | Gateway | Fastify, TypeScript; durable local state | Agent identity and tokens, mandates, decision pipeline, approvals, reservations, settlement, receipts, audit |
-| Guardian | Nous Research Hermes Agent API-server transport implemented; dedicated authenticated zero-tool profile passed its live tool audit and synthetic decision smoke on 2026-10-19; full app acceptance is pending | Reviews one verified purchase per stateless call; a strict verdict can only make a decision stricter |
+| Guardian | Nous Research Hermes Agent API-server transport implemented; dedicated authenticated zero-tool profile passed its live tool audit on 2026-10-19 and a scripted signed shop-to-app run with a Guardian pass and a Guardian denial on 2026-10-20; acceptance in a live Claude session is pending | Reviews one verified purchase per stateless call; a strict verdict can only make a decision stricter |
 | Chain adapter | viem over FISCO BCOS Web3 RPC | Deploys and calls contracts; normalises FISCO-specific behaviour |
 | Contracts | Solidity 0.8.11, EVM target `london` | `ECnySim`, `MerchantRegistry`, `AgentWallet`, `LicenceRegistry`, `AuditAnchor` |
 | Treasurer and monitor | TypeScript (tested simulation) | Just-in-time funding proposals and invariant watchdog; not connected to the live wallet |
