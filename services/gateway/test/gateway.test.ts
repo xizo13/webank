@@ -2038,18 +2038,24 @@ describe("Gateway HTTP decision slice", () => {
     const arm = vi
       .spyOn(DurableState.prototype, "save")
       .mockImplementation(function (this: unknown, payload: unknown) {
-        const pending = (payload as { trustPending?: unknown[] }).trustPending;
-        if ((pending ?? []).length > 0) breakStateAfterReplacement(statePath);
+        const events = (payload as { trustEvents?: unknown[] }).trustEvents;
+        if ((events ?? []).length > 0) breakStateAfterReplacement(statePath);
         return original.call(this as DurableState<unknown>, payload);
       });
     await payment(first.app, "mdt_seed", signedPayreq(), "ambiguous-trust");
     arm.mockRestore();
+    const sideEffects = first.anchored.length;
     const refused = await first.app.inject({
-      method: "GET",
-      url: "/v1/app/agents",
-      headers: { authorization: "Bearer test-app" },
+      method: "POST",
+      url: "/v1/app/demo/drills/stop",
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "stop-after-ambiguous",
+      },
+      payload: {},
     });
-    expect(refused.statusCode).toBeGreaterThanOrEqual(500);
+    expect(refused.statusCode).toBe(503);
+    expect(first.anchored).toHaveLength(sideEffects);
     await first.app.close();
     rmSync(`${statePath}.initialized`, { force: true });
     writeFileSync(`${statePath}.initialized`, "1\n");

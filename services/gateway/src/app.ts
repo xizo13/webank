@@ -737,6 +737,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     }
   }
   if (stateStore) {
+    app.addHook("onRequest", async (_request, reply) => {
+      if (stateStore.isAmbiguous)
+        return reply.code(503).send(error("service_unavailable", 503).body);
+    });
     app.addHook("onSend", async (_request, _reply, payload) => {
       persist();
       return payload;
@@ -5016,7 +5020,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
                 kind: "drill",
                 actor: userId,
                 subjectId: drillSubjectId,
-                summary: `Owner ${action === "start" ? "started" : "stopped"} local demo fire drill`,
+                summary: `Owner requested to ${action} local demo fire drill`,
                 data: { action, prior: activeDrill, next },
               });
               const prior = activeDrill;

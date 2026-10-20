@@ -65,6 +65,10 @@ export class DurableState<T> {
     }
   }
 
+  get isAmbiguous(): boolean {
+    return this.ambiguous;
+  }
+
   load(): T | null {
     if (!existsSync(this.path)) return null;
     if ((statSync(this.path).mode & 0o077) !== 0)
