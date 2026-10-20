@@ -6,6 +6,7 @@ All merchants and currency in this repository are simulated, and no real funds m
 
 ## Submission documents
 
+- [Design rationale](docs/design-rationale.md): what the product is for, and why it uses Hermes as the stand-in internal AI reviewer, a browser app instead of iOS, a local FISCO BCOS chain, and mock shops.
 - [Technical documentation](docs/technical-documentation.md): architecture, core algorithms, and security design.
 - [Execution evidence](docs/execution-evidence.md): local FISCO BCOS transaction hashes for payments, audit anchors, and refusals.
 - [Verification and known limits](docs/verification.md): automated checks, acceptance runs, and open gaps.
