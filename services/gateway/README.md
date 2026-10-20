@@ -148,7 +148,7 @@ The test observed matching `Paid` and `Anchored` events, verified the signed rec
 The opt-in loopback Gateway persists its local state across a single-process restart and does not support replicas.
 The separate limited `demo` fixture keeps state in memory.
 No production biometric challenge verifier, persistent reservation hold, risk service, SSE delivery, or recovery worker is wired here yet.
-The local action verifier accepts only the explicit demo proof and is not Face ID or a bank-verifiable device signature.
+The local action verifier accepts only the explicit demo proof and is not a phone biometric or a bank-verifiable device signature.
 Merchant fulfillment confirmation is wired only in the opt-in loopback composition.
 The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable.
 The dedicated isolated Hermes profile passed three synthetic live decisions and a full signed local shop-to-app acceptance run with an Amber owner card, a Green ¥77.00 auto-payment on FISCO without a card, and a contradictory signed order denied by Hermes without a wallet debit.

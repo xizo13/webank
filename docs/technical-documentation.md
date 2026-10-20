@@ -181,7 +181,7 @@ The red-team and Gateway suites cover the attacks listed in the Security Self-As
 
 | Built and tested | Designed, not built yet |
 |---|---|
-| Separate Agent Wallet, funding and sweeping | Native iPhone build with Secure Enclave approval signing |
+| Separate Agent Wallet, funding and sweeping | Native iOS and Android builds with hardware-backed biometric approval signing (Secure Enclave; Android Keystore) |
 | Pairing with request numbers, re-pair and disconnect | Production biometric and app attestation |
 | Mandates with intent locking (GTIN, SKU, variant) | Transaction push notifications |
 | Decision pipeline with fail-closed Hermes transport tests; dedicated zero-tool Hermes profile passed a synthetic live smoke | Full shop-to-app Hermes acceptance and Treasurer connected to the wallet |

@@ -75,7 +75,8 @@ The same run showed Hermes denying a contradictory order.
 ## Limits
 
 - The biometric step is simulated in the browser.
-- The iOS app has not been built or tested on an iPhone.
+- The mobile apps are designed but not built.
+  We intended iOS (Face ID or Touch ID with a Secure Enclave key) and Android (BiometricPrompt with an Android Keystore key), but neither has been built or tested on a device.
 - The connector keeps its private key in a local file, so another process run by the same user could read it.
 - The chain is local and permissioned, and its token is a test token, not e-CNY.
 - The Treasurer is a tested simulation and does not move live funds.

@@ -25,7 +25,7 @@ The run showed one Amber owner card, a Green ¥77.00 auto-payment with a verifie
 The Bank Console, shop order, Gateway status, and wallet readings agreed for that run.
 That acceptance used simulated currency, merchants, and owner proof; it did not test a live Claude shopping session or native biometric signing.
 At that review-branch checkpoint, a fresh dependency install, full workspace gate, and CI had not yet run; current public `main` passed the CI run noted above.
-No iPhone build or bank-verifiable biometric approval is claimed.
+No mobile (iOS or Android) build or bank-verifiable biometric approval is claimed.
 
 ## 2026-10-20 earlier owner-control checks
 
@@ -40,7 +40,7 @@ At that earlier checkpoint, the public checkout had no installed workspace depen
 At that earlier checkpoint, the dedicated zero-tool Nous Research Hermes Agent profile had passed a live synthetic smoke test with three decisions.
 The later signed shop-to-app acceptance above supersedes that earlier gap.
 The real local FISCO owner cap write remains pending acceptance.
-The browser app still uses simulated approval proof, and no iPhone build or on-device test is claimed.
+The browser app still uses simulated approval proof, and no mobile (iOS or Android) build or on-device test is claimed.
 
 ## 2026-10-19 earlier source publication checks
 
@@ -53,7 +53,7 @@ The public checkout still needs a clean dependency install and its own full CI r
 
 In an owner browser session, a fresh pairing created an independent agent and anchored its audit record on the preserved local FISCO chain.
 The owner has not completed the shopping payment portion of the latest interactive demo run.
-The browser approval remains simulated, and no iPhone build or on-device test is claimed.
+The browser approval remains simulated, and no mobile (iOS or Android) build or on-device test is claimed.
 
 ## Default workspace gate
 
@@ -93,14 +93,14 @@ The current `callback-failure` CLI mode only chooses a different product and doe
 
 These hashes belong to a local permissioned chain and are not independently resolvable in a public explorer.
 The CLI driver used an in-memory connector credential store, simulated app approval and reservation, a fixture risk result, and an unavailable Guardian.
-It did not use a live Claude session, native Face ID signer, bank account, actual e-CNY, or real merchant.
+It did not use a live Claude session, native biometric signer, bank account, actual e-CNY, or real merchant.
 The [local demo guide](../scripts/local-demo-README.md) explains the bounded operator path and preserved private runtime.
 The separate `spike-fisco/REPORT.md` in the public checkout records the earlier compatibility proof.
 
 ## Acceptance and deployment limits
 
-- The owner visually inspected the browser pairing flow; full screen and iPhone acceptance remain pending.
-- A local Face ID prompt is not a bank-verifiable approval signature; the Secure Enclave action signer is not implemented.
+- The owner visually inspected the browser pairing flow; full screen and mobile (iOS and Android) acceptance remain pending.
+- A local biometric prompt is not a bank-verifiable approval signature; the hardware-backed action signers (Secure Enclave on iOS, Android Keystore on Android) are not implemented.
 - The limited Gateway fixture keeps state in memory; the opt-in loopback local-demo Gateway persists private sessions, tokens, nonces, mandates, reservations, approvals, payment intents, receipts, and its receipt signing identity across an ordinary restart.
 - The local-demo launcher preserves its chain deployment and shop state across an ordinary restart; `--fresh` archives both the prior Gateway state and shop state with the old address manifest, then starts a new funded deployment with a zero-balance Agent Wallet.
 - The current CLI driver does not fund that new wallet, so a funded run needs an owner app funding step before creating a mandate.

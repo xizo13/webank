@@ -65,8 +65,8 @@ The local chain's transaction hashes are not publicly resolvable without access 
 
 ## Current limits
 
-The browser approval proof is a demo marker, not a biometric or Secure Enclave signature.
-The iOS source has not been built and tested on an iPhone for this release.
+The browser approval proof is a demo marker, not a hardware-backed biometric signature.
+The intended iOS (Secure Enclave) and Android (Android Keystore) builds have not been made or tested on a device for this release.
 The connector's local software key is readable by a same-user process with filesystem access.
 The loopback Gateway persists private state across an ordinary restart but supports only one process and no replicas.
 The mock shop's operator controls require a separate local token and remain on loopback.

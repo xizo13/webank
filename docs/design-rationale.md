@@ -50,21 +50,23 @@ The Guardian is swappable.
 The Gateway calls it through one transport function (`GuardianTransport` in `services/guardian`).
 WeBank could replace Hermes with its own model without changing any payment rule.
 
-### 2.2 The app runs in a browser instead of on an iPhone
+### 2.2 The app runs in a browser instead of on a phone
 
-The WeBank app is written in Expo (React Native), which also targets iOS.
+The WeBank app is written in Expo (React Native), which also targets iOS and Android.
 For the prototype, it runs as a web export in the browser.
 
 We chose the browser for three reasons:
 
-- Anyone can reproduce the demo on one computer, without an Apple developer account or an iPhone.
+- Anyone can reproduce the demo on one computer, without a developer account or a phone.
 - The security rules live in the Gateway and the smart contract, not in the app screen.
   The browser app exercises the same rules a phone app would.
-- Real Face ID needs a native build tested on a device, which we did not complete.
+- Real biometric approval needs a native build tested on a device, which we did not complete.
   The browser shows a clearly labelled simulated biometric step instead.
 
-In production, each approval would be signed by a biometric-only Secure Enclave key bound to the exact action.
-The iOS source has not been built or tested on an iPhone for this release.
+In production, each approval would be signed on the phone by a key that only unlocks with the owner's biometric, bound to the exact action.
+On iOS, this is Face ID or Touch ID with a Secure Enclave key.
+On Android, this is BiometricPrompt with an Android Keystore key, backed by StrongBox or the device's secure hardware.
+We intended both, but neither mobile build has been made or tested on a device for this release.
 
 ### 2.3 Settlement runs on a local FISCO BCOS chain
 
@@ -105,5 +107,5 @@ An app pairs once, using a one-time request number shown on the computer and ent
 | Biometric approval | Simulated and labelled in the browser app |
 | Green fast-forward in the demo | A labelled simulated owner control; it does not invent purchase history |
 | Treasurer and its monitor | Tested simulation, not connected to the live wallet |
-| Native iOS app with Secure Enclave signing | Designed, not built |
+| Native iOS and Android apps with hardware-backed biometric signing | Designed, not built |
 | Payment notifications and refunds routed by reason | Designed, not built |
