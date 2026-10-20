@@ -60,7 +60,15 @@ const agent: Agent = {
   provider: "mock",
   public_key: "p256:demo-agent-key",
   scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
-  licence: { level: "L", points: 0, clean_purchases: 0, drills_passed: 0 },
+  licence: {
+    level: "AMBER",
+    clean_purchases: 0,
+    drills_passed: 0,
+    drills_failed: 0,
+    flags_30d: 0,
+    reason: "New agent, no history yet",
+    updated_at: new Date().toISOString(),
+  },
   status: "active",
   created_at: now.toISOString(),
   last_used_at: null,
@@ -127,6 +135,8 @@ const deps: GatewayDependencies = {
           sku,
           gtin: "6901234567001",
           merchant_id: merchant.merchant_id,
+          brand: "Nova",
+          model: "Quiet 3",
           variant: "Black",
           options: { colour: "Black", size: "One size" },
         }
@@ -138,7 +148,13 @@ const deps: GatewayDependencies = {
     signals: [],
     explanation: "Mock risk pass",
   }),
-  evaluateGuardian: createGuardianEvaluator({ apiKey: "" }),
+  evaluateGuardian: createGuardianEvaluator({
+    baseUrl: process.env.WEBANK_GUARDIAN_HERMES_URL ?? "",
+    apiKey: process.env.WEBANK_GUARDIAN_HERMES_KEY ?? "",
+    model: process.env.WEBANK_GUARDIAN_HERMES_MODEL,
+    operatorVerified:
+      process.env.WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED === "1",
+  }),
   executePayment: async () => {
     throw new Error("Mock demo listener cannot pay");
   },

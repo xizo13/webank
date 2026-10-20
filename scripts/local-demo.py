@@ -12,10 +12,12 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -62,6 +64,9 @@ COREPACK = shutil.which("corepack")
 
 def runtime_env(base: dict[str, str] | None = None) -> dict[str, str]:
     env = dict(os.environ if base is None else base)
+    for name in tuple(env):
+        if name.startswith("WEBANK_GUARDIAN_HERMES_"):
+            env.pop(name)
     if NODE:
         env["PATH"] = str(Path(NODE).parent) + os.pathsep + env.get("PATH", "")
     return env
@@ -507,18 +512,36 @@ def run_build(name: str, command: list[str], cwd: Path, env: dict) -> None:
         fail(f"{name} build failed; see {RUNTIME / ('build-' + name + '.log')}")
 
 
+def build_workspace_package(name: str, location: Path, env: dict, extras: list[str] | None = None) -> str:
+    sources = [
+        location / "src",
+        location / "package.json",
+        location / "tsconfig.json",
+        ROOT / "tsconfig.base.json",
+        ROOT / "pnpm-lock.yaml",
+    ]
+    source_hash = fingerprint(sources, extras)
+    output = location / "dist/index.js"
+    marker = RUNTIME / f"{name}-build.sha256"
+    if not output.is_file() or not marker.is_file() or marker.read_text().strip() != source_hash:
+        run_build(name, [COREPACK, "pnpm", "--filter", f"@webank/{name}", "build"], ROOT, env)
+        if not output.is_file():
+            fail(f"{name} build did not produce dist/index.js")
+        if fingerprint(sources, extras) != source_hash:
+            fail(f"{name} sources changed during build; retry after edits finish")
+        marker.write_text(source_hash + "\n")
+    return source_hash
+
+
 def prepare_builds() -> None:
     common = runtime_env()
     common["NEXT_TELEMETRY_DISABLED"] = "1"
     common["EXPO_NO_TELEMETRY"] = "1"
-    for package, output in (
-        ("@webank/contracts", ROOT / "packages/contracts/dist/index.js"),
-        ("@webank/chain", ROOT / "packages/chain/dist/index.js"),
-        ("@webank/guardian", ROOT / "services/guardian/dist/index.js"),
-    ):
-        if not output.is_file():
-            run_build(package.replace("@webank/", ""), [COREPACK, "pnpm", "--filter", package, "build"], ROOT, common)
-    shop_hash = fingerprint([SHOP / "app", SHOP / "lib", SHOP / "package.json"])
+    contracts_hash = build_workspace_package("contracts", ROOT / "packages/contracts", common)
+    build_workspace_package("chain", ROOT / "packages/chain", common)
+    build_workspace_package("guardian", ROOT / "services/guardian", common, [contracts_hash])
+    build_workspace_package("connector-mcp", ROOT / "agents/connector-mcp", common, [contracts_hash])
+    shop_hash = fingerprint([SHOP / "app", SHOP / "lib", SHOP / "package.json"], [contracts_hash])
     shop_marker = RUNTIME / "shop-build.sha256"
     if not (SHOP / ".next/BUILD_ID").is_file() or not shop_marker.is_file() or shop_marker.read_text().strip() != shop_hash:
         run_build("shop", [NODE, str(SHOP / "node_modules/next/dist/bin/next"), "build"], SHOP, common)
@@ -556,6 +579,76 @@ def read_gateway_env() -> dict:
             values[name] = value
     if not re.fullmatch(r"0x[0-9a-fA-F]{64}", values.get("FISCO_GATEWAY_PRIVATE_KEY", "")):
         fail("Private Gateway signer file is invalid")
+    return values
+
+
+def read_guardian_env() -> dict[str, str]:
+    path = RUNTIME / "guardian-hermes.env"
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return {}
+    except OSError:
+        fail("Private Guardian configuration is unsafe or unreadable")
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+        ):
+            fail("Private Guardian configuration has unsafe ownership or permissions")
+        raw = os.read(descriptor, 8193)
+        if len(raw) > 8192:
+            fail("Private Guardian configuration is too large")
+    finally:
+        os.close(descriptor)
+    try:
+        content = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        fail("Private Guardian configuration is malformed")
+    if not content.endswith("\n") or "\r" in content or "\x00" in content:
+        fail("Private Guardian configuration is malformed")
+    allowed = {
+        "WEBANK_GUARDIAN_HERMES_URL",
+        "WEBANK_GUARDIAN_HERMES_KEY",
+        "WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED",
+        "WEBANK_GUARDIAN_HERMES_MODEL",
+    }
+    required = allowed - {"WEBANK_GUARDIAN_HERMES_MODEL"}
+    values: dict[str, str] = {}
+    for line in content.splitlines():
+        name, separator, value = line.partition("=")
+        if not separator or name not in allowed or name in values or not value:
+            fail("Private Guardian configuration is malformed")
+        values[name] = value
+    if not required.issubset(values):
+        fail("Private Guardian configuration is incomplete")
+    try:
+        url = urllib.parse.urlsplit(values["WEBANK_GUARDIAN_HERMES_URL"])
+        port = url.port
+    except ValueError:
+        fail("Private Guardian configuration has an invalid endpoint")
+    if (
+        url.scheme != "http"
+        or url.hostname != "127.0.0.1"
+        or port is None
+        or port < 1
+        or url.netloc != f"127.0.0.1:{port}"
+        or (url.path not in ("", "/") and not re.fullmatch(r"/p/[A-Za-z0-9_-]+/?", url.path))
+        or url.query
+        or url.fragment
+    ):
+        fail("Private Guardian configuration has an invalid endpoint")
+    if not re.fullmatch(r"[0-9a-f]{64}", values["WEBANK_GUARDIAN_HERMES_KEY"]):
+        fail("Private Guardian configuration has an invalid key")
+    if values["WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED"] != "1":
+        fail("Private Guardian profile audit is not confirmed")
+    if "WEBANK_GUARDIAN_HERMES_MODEL" in values and not re.fullmatch(
+        r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", values["WEBANK_GUARDIAN_HERMES_MODEL"]
+    ):
+        fail("Private Guardian configuration has an invalid model")
     return values
 
 
@@ -845,6 +938,7 @@ def up(fresh: bool) -> None:
         gateway_env = {
             **environment,
             **read_gateway_env(),
+            **read_guardian_env(),
             "WEBANK_LOCAL_DEMO": "1",
             "WEBANK_DEMO_APPROVALS": "1",
             "WEBANK_DEMO_APP_ORIGIN": "http://127.0.0.1:8081",

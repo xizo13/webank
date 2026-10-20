@@ -65,8 +65,10 @@ export async function GET(request: NextRequest) {
             query.get("query") || "",
             maxPrice,
             shop as ShopId | undefined,
-          ).map(({ sku, name, price, rating, summary, match }) => ({
+          ).map(({ sku, shop, name, price, rating, summary, match }) => ({
             sku,
+            shop,
+            shop_name: shops[shop].name,
             name,
             price: { amount: price, currency: "CNY" },
             rating,
@@ -90,6 +92,8 @@ export async function GET(request: NextRequest) {
         if (!order) throw new Error("Order not found");
         return agentResponse({
           order_id: order.order_id,
+          shop: order.shop,
+          shop_name: shops[order.shop].name,
           status: order.status,
           items: order.items,
           total: order.total,
@@ -101,7 +105,9 @@ export async function GET(request: NextRequest) {
       case "clock":
         return NextResponse.json({ now: demoClock() });
       case "scenarios":
-        return NextResponse.json({ scenarios: demoScenarios() });
+        return NextResponse.json({
+          scenarios: { attack: demoScenarios().attack },
+        });
       default:
         throw new Error("Unknown operation");
     }
@@ -129,12 +135,21 @@ export async function POST(request: NextRequest) {
       case "checkout":
         return agentResponse(checkout(body.shipping_address));
       case "set_scenario": {
-        if (body.scenario !== "attack" && body.scenario !== "drill")
+        if (body.scenario === "drill")
+          return NextResponse.json(
+            {
+              error: {
+                message: "Start or stop fire drills in the WeBank owner app",
+              },
+            },
+            { status: 403 },
+          );
+        if (body.scenario !== "attack")
           throw new Error("Unknown demo scenario");
         if (typeof body.enabled !== "boolean")
           throw new Error("Demo scenario enabled must be boolean");
         return NextResponse.json({
-          scenarios: setDemoScenario(body.scenario, body.enabled),
+          scenarios: { attack: setDemoScenario("attack", body.enabled).attack },
         });
       }
       case "set_price":

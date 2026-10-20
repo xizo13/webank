@@ -7,7 +7,11 @@ import { createGateway } from "../../../services/gateway/src/app.js";
 import { WeBankConnector } from "../src/client.js";
 import { createConnectorServer } from "../src/index.js";
 import { newAgentKey, signAgentRequest } from "../src/signing.js";
-import type { CredentialStore, Credentials } from "../src/storage.js";
+import {
+  type CredentialStore,
+  type Credentials,
+  clientAppIdentity,
+} from "../src/storage.js";
 
 class MemoryStore implements CredentialStore {
   value: Credentials | null = null;
@@ -150,6 +154,8 @@ describe("WeBank MCP connector", () => {
         return reply(200, {
           state: "connected",
           agent_id: "agt_test",
+          client_app_id: clientAppIdentity("connector-test").id,
+          client_app_name: "connector-test",
           access_token_valid: false,
           licence: {
             level: "L",
@@ -170,6 +176,7 @@ describe("WeBank MCP connector", () => {
             agent_key_binding: publicKey,
             description: "Buy headphones",
             intent_level: "open",
+            approval_timing: "upfront",
             user_text: "Buy headphones",
             user_text_source: "agent_reported",
             constraints,
@@ -275,6 +282,32 @@ describe("WeBank MCP connector", () => {
       "get_payment_status",
       "list_my_payments",
     ]);
+    expect(client.getInstructions()).toContain(
+      "A shop checkout payment_request is only merchant-signed",
+    );
+    expect(client.getInstructions()).toContain(
+      "only after WeBank request_payment returns status awaiting_user with both payment_id and approval_id",
+    );
+    expect(client.getInstructions()).toContain(
+      "mandate_id and no payment_id means only the upfront mandate awaits approval",
+    );
+    expect(client.getInstructions()).toContain(
+      "The licence light is AMBER, GREEN, or RED",
+    );
+    expect(client.getInstructions()).toContain(
+      "RED cannot spend until the owner reviews its history and uses Return to Amber",
+    );
+    expect(client.getInstructions()).toContain(
+      "A paid response means WeBank settled it and includes a receipt",
+    );
+    expect(
+      tools.tools.find((tool) => tool.name === "request_payment")?.description,
+    ).toContain(
+      "Tell the user a payment approval is pending only if this tool returns status awaiting_user with both payment_id and approval_id",
+    );
+    expect(
+      tools.tools.find((tool) => tool.name === "request_payment")?.description,
+    ).toContain("GREEN may return paid with a receipt automatically");
     const call = async (name: string, args: Record<string, unknown>) => {
       const result = await client.callTool({ name, arguments: args });
       expect(result.isError).not.toBe(true);
@@ -294,6 +327,7 @@ describe("WeBank MCP connector", () => {
       description: "Buy headphones",
       user_text: "Buy headphones",
       intent_level: "open",
+      approval_timing: "upfront",
       constraints,
     });
     expect(mandate.status).toBe("pending_user");
@@ -301,8 +335,8 @@ describe("WeBank MCP connector", () => {
     expect(mandate.request_number).toBe("345678");
     expect(notifications).toContain("Request number 345678");
     expect(
-      (await call("get_mandate_status", { mandate_id: "mdt_test" })).status,
-    ).toBe("pending_user");
+      await call("get_mandate_status", { mandate_id: "mdt_test" }),
+    ).toMatchObject({ status: "pending_user", approval_timing: "upfront" });
     const pathsBeforeBadInput = paths.length;
     const loose = await client.callTool({
       name: "create_mandate",
@@ -397,6 +431,7 @@ describe("WeBank MCP connector", () => {
           throw new Error("unreachable");
         },
         anchorAudit: async () => `0x${"1".repeat(64)}`,
+        setTrustLight: async () => `0x${"2".repeat(64)}`,
         signReceipt: async () => "unused",
       },
       { agents: [prior], policies: [] },

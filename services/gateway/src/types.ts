@@ -6,6 +6,7 @@ import type {
   GuardianVerdict,
   Mandate,
   PaymentRequest,
+  PaymentReview,
   Policy,
   Receipt,
   RuleDeniedError,
@@ -18,6 +19,18 @@ export interface WalletSnapshot {
   walletFrozen: boolean;
   blockNumber: bigint;
   observedAt: string;
+}
+
+export interface PolicyCapsSnapshot {
+  perPaymentCap: bigint;
+  dailyCap: bigint;
+  monthlyCap: bigint;
+  spentToday: bigint;
+  spentMonth: bigint;
+  blockNumber: bigint;
+  observedAt: string;
+  nextDailyResetAt: string;
+  nextMonthlyResetAt: string;
 }
 
 export interface TransferEvidence {
@@ -84,6 +97,23 @@ export interface RiskAssessment {
 }
 
 export interface GatewayDependencies {
+  /** Read-only contract caps and bank-only audited cap writer. */
+  policyCaps?: {
+    read(): Promise<PolicyCapsSnapshot>;
+    write(changeId: string): Promise<`0x${string}`>;
+  };
+  /** Bank-owned registry writer. Must verify the latest level and key hash before returning. */
+  setTrustLight?(
+    agent: Agent,
+    level: "AMBER" | "GREEN" | "RED",
+    intentId: string,
+  ): Promise<`0x${string}`>;
+  /** Local demo callback; the bank remains authoritative for drill state. */
+  setDrillVisibility?(enabled: boolean): Promise<void>;
+  /** Authenticated bank-only evidence sources. Missing callbacks deny access. */
+  authenticateDrillService?(request: FastifyRequest): Promise<boolean>;
+  authenticateBankOperator?(request: FastifyRequest): Promise<boolean>;
+  demoTrustControlsEnabled?: true;
   walletFunding?: WalletFundingRail;
   /** Production must provide a bank-backed proof verifier; local demo uses an explicit simulated proof. */
   verifyFundingProof?(
@@ -125,8 +155,19 @@ export interface GatewayDependencies {
     merchant: Merchant;
     paymentRequest: PaymentRequest;
     priceEvidence: unknown[];
+    historyKnown: boolean;
+    earlierPaidOrdersHour: number;
+    earlierPaymentAttemptsHour: number;
+    ownerAutoApproveBelow: number;
   }): Promise<RiskAssessment>;
   evaluateGuardian(input: GuardianInput): Promise<GuardianVerdict>;
+  /** Read-only simulation of the exact wallet payment before creating a composite card. */
+  preflightPayment?(input: {
+    paymentId: string;
+    mandate: Mandate;
+    request: PaymentRequest;
+    merchant: Merchant;
+  }): Promise<void>;
   /** Must be idempotent by paymentId at the rail, including retries after process failure. */
   executePayment(input: {
     paymentId: string;
@@ -179,10 +220,15 @@ export interface GatewaySeed {
 }
 
 export interface StoredPayment {
+  approvalSource?: "owner" | "auto";
   paymentId: string;
   /** Original deployment identity survives an explicit funding cutover. */
   deployment?: string;
   mandateId: string;
+  /** Immutable pre-consent intent and owner review for checkout-bound payments. */
+  review?: PaymentReview;
+  /** Byte-exact merchant URI for a composite review; absent on historical payments. */
+  paymentUri?: string;
   agentId: string;
   userId: string;
   merchant: Merchant;
@@ -199,5 +245,6 @@ export interface StoredPayment {
   /** Preserved even if audit or merchant confirmation fails after a verified Paid event. */
   settlementTx?: `0x${string}`;
   approvalId?: string;
+  paidAt?: string;
   createdAt: string;
 }

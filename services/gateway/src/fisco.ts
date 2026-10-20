@@ -35,7 +35,7 @@ export function createFiscoGatewayAdapters(input: {
   classifyMerchant(merchantId: string): Promise<MerchantClassification | null>;
 }): Pick<
   GatewayDependencies,
-  "lookupMerchant" | "executePayment" | "anchorAudit"
+  "lookupMerchant" | "preflightPayment" | "executePayment" | "anchorAudit"
 > {
   const { chain, addresses } = input;
   return {
@@ -83,6 +83,14 @@ export function createFiscoGatewayAdapters(input: {
       )
         throw new Error("FISCO payment event did not match request");
       return hash;
+    },
+    async preflightPayment({ paymentId, request, merchant }) {
+      await chain.simulatePay(
+        addresses.agentWallet,
+        keccak256(stringToHex(paymentId)),
+        keccak256(stringToHex(merchant.merchant_id)),
+        BigInt(request.amount.amount),
+      );
     },
     async anchorAudit(recordHash, subjectId, kind) {
       const hashBytes = recordHash.slice("sha256:".length);

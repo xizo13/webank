@@ -29,6 +29,7 @@ export type CartItem = {
 };
 export type Cart = {
   shop: ShopId | null;
+  shop_name: string | null;
   items: Array<
     CartItem & {
       product: NonNullable<ReturnType<typeof getProduct>>;
@@ -64,7 +65,7 @@ const defaultScenarios: Scenarios = { attack: false, drill: false };
 export function visibleShop(shop: ShopId, scenarios: Scenarios): boolean {
   return (
     (shop !== "malicious" || scenarios.attack) &&
-    (shop !== "decoy" || scenarios.attack || scenarios.drill)
+    (shop !== "decoy" || scenarios.drill)
   );
 }
 
@@ -174,17 +175,22 @@ export function listProducts(
     .sort((a, b) => (a.match === b.match ? 0 : a.match === "exact" ? -1 : 1));
 }
 
-export function productBySku(
-  sku: string,
-):
-  | (NonNullable<ReturnType<typeof getProduct>> & { price: number })
+export function productBySku(sku: string):
+  | (NonNullable<ReturnType<typeof getProduct>> & {
+      price: number;
+      shop_name: string;
+    })
   | undefined {
   const product = getProduct(sku);
   if (!product) return undefined;
   const state = readState();
   const scenarios = state.scenarios ?? defaultScenarios;
   if (!visibleShop(product.shop, scenarios)) return undefined;
-  return { ...product, price: state.prices[sku] ?? product.price };
+  return {
+    ...product,
+    price: state.prices[sku] ?? product.price,
+    shop_name: shops[product.shop].name,
+  };
 }
 
 export function getCart(): Cart {
@@ -201,6 +207,7 @@ export function getCart(): Cart {
   });
   return {
     shop: items[0]?.product.shop ?? null,
+    shop_name: items[0]?.product.shop_name ?? null,
     items,
     total: money(items.reduce((sum, item) => sum + item.line_total.amount, 0)),
   };
@@ -261,6 +268,10 @@ export function clearCart(): Cart {
 
 export function checkout(shippingAddress: unknown): {
   order_id: string;
+  shop: ShopId;
+  shop_name: string;
+  wallet_submission: "not_performed_by_shop";
+  wallet_submission_message: string;
   total: ReturnType<typeof money>;
   payment_request: string;
   expires_at: string;
@@ -324,7 +335,17 @@ export function checkout(shippingAddress: unknown): {
   state.orders[order_id] = order;
   state.cart = [];
   saveState(state);
-  return { order_id, total, payment_request, expires_at };
+  return {
+    order_id,
+    shop,
+    shop_name: shops[shop].name,
+    wallet_submission: "not_performed_by_shop",
+    wallet_submission_message:
+      "Checkout signed a merchant request; it did not create a WeBank approval or payment.",
+    total,
+    payment_request,
+    expires_at,
+  };
 }
 
 export function getOrder(orderId: string): Order | undefined {
@@ -367,6 +388,11 @@ export function advanceDemoClock(minutes: number): string {
   return now(state).toISOString();
 }
 
-export function resetDemo(): void {
-  saveState(emptyState());
+export function resetDemo(options: { clearDrill?: boolean } = {}): void {
+  const next = emptyState();
+  next.scenarios = {
+    attack: false,
+    drill: options.clearDrill ? false : demoScenarios().drill,
+  };
+  saveState(next);
 }

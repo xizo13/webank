@@ -78,6 +78,7 @@ export default function CartPage() {
         </div>
       ) : (
         <>
+          <p className="cart-seller">Sold by {cart.shop_name}</p>
           <div className="cart-lines">
             {cart.items.map((item) => (
               <div

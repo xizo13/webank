@@ -23,10 +23,13 @@ Every local approval is visibly simulated, and no Face ID or Secure Enclave sign
 Gateway mode without the explicit local flag and exact `127.0.0.1` HTTP origin keeps approval locked.
 The app polls Gateway every three seconds for agents, pending approvals, and payment history, and polls an open payment for its decision and receipt.
 It looks up connector pairing consent by code, then shows claimed pending and expired pairings with a countdown.
-Each approved pairing creates a new independent agent identity with its own wallet limits.
-The consent card shows the app, provider, requested scopes, pairing-code deadline, and shorter request-number deadline before approval.
-The Agents screen exposes Freeze, Unfreeze, Re-license, and Delete agent controls.
-Unfreeze and Re-license use the explicit local simulated verifier only; Delete confirms the named agent and retains history.
+Each approved pairing creates a new independent Amber agent identity for the MCP host's self-reported app name.
+The consent card explains that the grant covers every chat in that app and shows the provider, scopes, pairing-code deadline, and shorter request-number deadline.
+The Agents screen shows Amber, Green, or Red trust with a reason, plus a separate owner freeze state.
+It offers Freeze, Unfreeze, Re-approve connection after seven days idle, Return to Amber after reviewing trust evidence, and Delete agent controls.
+The owner can use a clearly labelled local demo control to simulate Green without fabricating a clean purchase history.
+These owner actions use explicit local simulated verification; they are not bank-verifiable biometric actions.
+Delete confirms the named agent and retains history.
 In Gateway mode, Home and Wallet read the simulated main-account and separate Agent Wallet balances from `GET /v1/app/home` with a chain block and observation time.
 Stale or unavailable readings disable funding and sweep actions; policy values remain unavailable in this view.
 In explicit loopback demo mode, the owner can enter an exact CNY amount, review the fixed source and destination, and perform a visibly simulated biometric confirmation before submitting the action-bound funding challenge.
@@ -36,6 +39,16 @@ Return history shows pending reconciliation and verified chain transaction evide
 The app does not submit live approvals until it can register and use a biometric-only Secure Enclave key for an action-bound signature.
 Do not interpret a successful local Face ID prompt as a bank-verifiable approval signature.
 The `src/deviceSigner.ts` interface is fail closed and has no native implementation yet.
+
+## Current approval behavior
+
+An attended one-time mandate is locked as `pending_checkout` before shopping and has no spending authority or approval card.
+After the shop signs the exact order, the Gateway checks it against that mandate and can present one composite payment card with the locked intent and signed order facts.
+Amber agents need owner approval for every purchase, with a request number on the first payment.
+Eligible Green purchases within the owner's threshold can proceed after all checks without a card; larger or uncertain purchases require the owner.
+Red agents cannot spend until the owner reviews their trust events and returns them to Amber.
+An upfront mandate for an unattended task can require its own approval when created.
+The local demo uses simulated approval proof for all owner actions.
 
 ## Demo path
 

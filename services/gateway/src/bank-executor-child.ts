@@ -2,7 +2,12 @@ import { createHash } from "node:crypto";
 import { readFileSync, realpathSync, statSync } from "node:fs";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { AgentWalletAbi, connectFisco, ECnySimAbi } from "@webank/chain";
+import {
+  AgentWalletAbi,
+  AuditAnchorAbi,
+  connectFisco,
+  ECnySimAbi,
+} from "@webank/chain";
 import {
   createPublicClient,
   defineChain,
@@ -13,6 +18,11 @@ import {
   stringToHex,
 } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
+import {
+  applyAuditedPolicyCaps,
+  assertAuditedPolicyIntent,
+} from "./bank-policy-intent.js";
+import { trustOrdinal } from "./trust-light.js";
 
 const expectedState = fileURLToPath(
   new URL(
@@ -35,8 +45,12 @@ const [kind, id, rawAmount, statePath] = args as [
   string,
 ];
 if (
-  (kind !== "fund" && kind !== "sweep" && kind !== "human") ||
-  !/^(fnd|swp|hpm)_[A-Za-z0-9_-]+$/.test(id ?? "") ||
+  (kind !== "fund" &&
+    kind !== "sweep" &&
+    kind !== "human" &&
+    kind !== "trust" &&
+    kind !== "policy") ||
+  !/^(fnd|swp|hpm|tev|pch)_[A-Za-z0-9_-]+$/.test(id ?? "") ||
   !/^[1-9][0-9]*$/.test(rawAmount ?? "") ||
   resolve(statePath ?? "") !== expectedState ||
   realpathSync(statePath) !== expectedState
@@ -59,6 +73,8 @@ const addresses = JSON.parse(readFileSync(addressesPath, "utf8")) as {
   ecnySim: `0x${string}`;
   agentWallet: `0x${string}`;
   merchantRegistry: `0x${string}`;
+  licenceRegistry: `0x${string}`;
+  auditAnchor: `0x${string}`;
   migration?: { state: string };
 };
 if (
@@ -96,6 +112,36 @@ const envelope = JSON.parse(readFileSync(statePath, "utf8")) as {
       status: string;
       deployment: string;
     }>;
+    trustPending?: Array<{
+      intentId: string;
+      agentId: string;
+      level: "AMBER" | "GREEN" | "RED";
+      from: "AMBER" | "GREEN" | "RED";
+      forceChain?: boolean;
+      status: string;
+      auditHash?: string;
+    }>;
+    policyChanges?: Array<{
+      changeId: string;
+      userId: string;
+      status: string;
+      auditHash?: string;
+      baseCaps: { perPayment: number; daily: number; monthly: number };
+      proposed: {
+        per_payment_max: { amount: number; currency: string };
+        daily_max: { amount: number; currency: string };
+        monthly_max: { amount: number; currency: string };
+      };
+      deployment: string;
+    }>;
+    agents?: Array<{ agent_id: string; public_key: string }>;
+    audits?: Array<{
+      record_hash: string;
+      subject_id: string;
+      actor?: string;
+      kind: string;
+    }>;
+    pairings?: Array<{ status: string; agentId?: string }>;
   };
   sha256: string;
 };
@@ -110,20 +156,51 @@ if (
   throw new Error(
     "Gateway funding intent is not bound to the active deployment",
   );
-const intent =
+const transferIntent =
   kind === "fund"
     ? envelope.payload.fundingRecords?.find((item) => item.fundingId === id)
     : kind === "sweep"
       ? envelope.payload.sweepRecords?.find((item) => item.sweepId === id)
-      : envelope.payload.humanPaymentRecords?.find(
-          (item) => item.confirmationId === id,
-        );
+      : kind === "human"
+        ? envelope.payload.humanPaymentRecords?.find(
+            (item) => item.confirmationId === id,
+          )
+        : undefined;
+const trustIntent =
+  kind === "trust"
+    ? envelope.payload.trustPending?.find((item) => item.intentId === id)
+    : undefined;
+const policyIntent =
+  kind === "policy"
+    ? envelope.payload.policyChanges?.find((item) => item.changeId === id)
+    : undefined;
 if (
-  intent?.status !== "settling" ||
-  intent.amount !== Number(amount) ||
-  intent.deployment !== expectedDeployment
+  kind !== "trust" &&
+  kind !== "policy" &&
+  (transferIntent?.status !== "settling" ||
+    transferIntent.amount !== Number(amount) ||
+    transferIntent.deployment !== expectedDeployment)
 )
   throw new Error("No exact settling owner intent exists");
+if (
+  kind === "trust" &&
+  (trustIntent?.status !== "anchored" ||
+    trustOrdinal(trustIntent.level) !== Number(amount) ||
+    ![1, 2, 4].includes(Number(amount)) ||
+    typeof trustIntent.auditHash !== "string" ||
+    !envelope.payload.agents?.some(
+      (agent) => agent.agent_id === trustIntent.agentId,
+    ))
+)
+  throw new Error("No exact audited trust intent exists");
+if (kind === "policy") {
+  assertAuditedPolicyIntent(
+    policyIntent,
+    envelope.payload.audits,
+    expectedDeployment,
+    amount,
+  );
+}
 const keyText = readFileSync(bankKeyPath, "utf8");
 const match = /^FISCO_BANK_PRIVATE_KEY=(0x[0-9a-fA-F]{64})\n?$/.exec(keyText);
 if (!match) throw new Error("Bank key file is invalid");
@@ -166,18 +243,95 @@ if (
 )
   throw new Error("Token and wallet are not configured together");
 const chain = await connectFisco({ rpcUrl: addresses.rpcUrl, privateKey });
+if (kind === "policy") {
+  if (!policyIntent?.auditHash) throw new Error("Policy audit missing");
+  const anchored = await client.readContract({
+    address: addresses.auditAnchor,
+    abi: AuditAnchorAbi,
+    functionName: "anchored",
+    args: [`0x${policyIntent.auditHash.slice(7)}` as Hex],
+  });
+  if (!anchored) throw new Error("Policy audit not anchored");
+  const tx = await applyAuditedPolicyCaps(
+    chain,
+    addresses.agentWallet,
+    policyIntent,
+  );
+  process.stdout.write(`${JSON.stringify({ tx_hash: tx })}\n`);
+  process.exit(0);
+}
+if (kind === "trust") {
+  if (!trustIntent) throw new Error("Trust intent missing");
+  const agent = envelope.payload.agents?.find(
+    (item) => item.agent_id === trustIntent.agentId,
+  );
+  if (!agent) throw new Error("Trust intent agent is missing");
+  if (
+    !envelope.payload.audits?.some(
+      (audit) =>
+        audit.record_hash === trustIntent.auditHash &&
+        audit.subject_id === agent.agent_id &&
+        (audit.kind === "licence_change" || audit.kind === "drill"),
+    )
+  )
+    throw new Error("Trust intent has no matching audit record");
+  const anchored = await client.readContract({
+    address: addresses.auditAnchor,
+    abi: AuditAnchorAbi,
+    functionName: "anchored",
+    args: [`0x${trustIntent.auditHash?.slice(7)}` as Hex],
+  });
+  if (!anchored) throw new Error("Trust intent audit hash is not anchored");
+  const agentHash = keccak256(stringToHex(agent.agent_id));
+  const keyHash = keccak256(stringToHex(agent.public_key));
+  const ordinal = trustOrdinal(trustIntent.level);
+  if (
+    trustIntent.forceChain &&
+    (trustIntent.level !== "AMBER" ||
+      trustIntent.from !== "AMBER" ||
+      !envelope.payload.pairings?.some(
+        (pairing) =>
+          pairing.status === "processing" && pairing.agentId === agent.agent_id,
+      ))
+  )
+    throw new Error("Initial Amber registry intent is not paired");
+  const prior = await chain.getLicence(addresses.licenceRegistry, agentHash);
+  const expectedPrior = trustOrdinal(trustIntent.from);
+  const allowedPrior =
+    (trustIntent.forceChain && prior.level === 0) ||
+    prior.level === expectedPrior ||
+    prior.level === ordinal ||
+    (expectedPrior === 2 && prior.level === 3);
+  if (!allowedPrior || (prior.level !== 0 && prior.keyHash !== keyHash))
+    throw new Error("Trust registry prior light or key changed");
+  const tx = await chain.setLicence(
+    addresses.licenceRegistry,
+    agentHash,
+    keyHash,
+    ordinal,
+  );
+  const verified = await chain.getLicence(addresses.licenceRegistry, agentHash);
+  if (verified.level !== ordinal || verified.keyHash !== keyHash)
+    throw new Error("Trust registry confirmation mismatch");
+  process.stdout.write(`${JSON.stringify({ tx_hash: tx })}\n`);
+  process.exit(0);
+}
 if (kind === "human") {
-  if (!intent || !("merchantId" in intent) || !("payout" in intent))
+  if (
+    !transferIntent ||
+    !("merchantId" in transferIntent) ||
+    !("payout" in transferIntent)
+  )
     throw new Error("Human payment intent is invalid");
   const merchant = await chain.getMerchant(
     addresses.merchantRegistry,
-    keccak256(stringToHex(intent.merchantId)),
+    keccak256(stringToHex(transferIntent.merchantId)),
   );
   if (
     !merchant.active ||
-    getAddress(merchant.payout) !== getAddress(intent.payout) ||
-    getAddress(intent.payout) === getAddress(addresses.agentWallet) ||
-    getAddress(intent.payout) === getAddress(addresses.bank)
+    getAddress(merchant.payout) !== getAddress(transferIntent.payout) ||
+    getAddress(transferIntent.payout) === getAddress(addresses.agentWallet) ||
+    getAddress(transferIntent.payout) === getAddress(addresses.bank)
   )
     throw new Error("Human payment merchant payout changed");
 }
@@ -189,7 +343,7 @@ const tx =
       ? await chain.sweepToMain(addresses.agentWallet, hashId, amount)
       : await chain.transferMain(
           addresses.ecnySim,
-          (intent as { payout: `0x${string}` }).payout,
+          (transferIntent as { payout: `0x${string}` }).payout,
           amount,
         );
 process.stdout.write(`${JSON.stringify({ tx_hash: tx })}\n`);

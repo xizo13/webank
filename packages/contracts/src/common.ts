@@ -18,6 +18,17 @@ export const DateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
 export const HashSchema = z.string().regex(/^sha256:[0-9a-fA-F]{64}$/);
 export const TransactionHashSchema = z.string().regex(/^0x[0-9a-fA-F]{64}$/);
 export const NonEmptyStringSchema = z.string().trim().min(1);
+/** MCP app identity hashes the exact initialized name, including whitespace. */
+export const ClientAppNameSchema = z.string().refine((name) => {
+  if (!name.trim() || /\p{Cc}/u.test(name)) return false;
+  try {
+    // Each escaped UTF-8 byte and each unescaped ASCII character counts once.
+    // encodeURIComponent rejects unpaired surrogates without changing the name.
+    return encodeURIComponent(name).replace(/%[0-9A-F]{2}/g, "_").length <= 256;
+  } catch {
+    return false;
+  }
+});
 
 export function idSchema(prefix: string) {
   return z.string().regex(new RegExp(`^${prefix}_[A-Za-z0-9][A-Za-z0-9_-]*$`));
@@ -42,7 +53,7 @@ export const AgentScopeSchema = z.enum([
   "wallet:history:self",
   "wallet:balance",
 ]);
-export const LicenceLevelSchema = z.enum(["L", "P", "FULL", "SUSPENDED"]);
+export const LicenceLevelSchema = z.enum(["AMBER", "GREEN", "RED"]);
 export const OutcomeSchema = z.enum(["APPROVED", "STEP_UP", "DENIED"]);
 export const CheckResultSchema = z.enum(["pass", "step_up", "deny", "skipped"]);
 export const PaymentStatusSchema = z.enum(["paid", "awaiting_user", "denied"]);
@@ -130,6 +141,7 @@ export const DenialRuleSchema = z.enum([
   "duplicate_payment",
   "velocity_blocked",
   "intent_mismatch",
+  "guardian_other",
   "user_rejected",
 ]);
 export type DenialRule = z.infer<typeof DenialRuleSchema>;

@@ -1,4 +1,5 @@
 import {
+  createHash,
   createPublicKey,
   randomBytes,
   randomInt,
@@ -18,6 +19,7 @@ import {
   CreateMandateResponseSchema,
   CreatePaymentRequestSchema,
   DecisionSchema,
+  type DenialRule,
   DeniedPaymentResponseSchema,
   DeviceAuthorizationRequestSchema,
   DeviceAuthorizationResponseSchema,
@@ -32,16 +34,22 @@ import {
   PaidPaymentResponseSchema,
   PaymentHistoryResponseSchema,
   type PaymentRequest,
+  type PaymentReview,
+  PaymentReviewSchema,
   PaymentStatusResponseSchema,
   PendingMandatePaymentResponseSchema,
+  type Policy,
   PolicySchema,
   PositiveMoneySchema,
   type Receipt,
   ReceiptSchema,
   TokenRequestSchema,
   TokenResponseSchema,
+  type TrustEvent,
+  TrustEventSchema,
 } from "@webank/contracts";
 import Fastify, { type FastifyRequest } from "fastify";
+import { keccak256, stringToHex } from "viem";
 import { AgentAuth } from "./agent-auth.js";
 import { canonicalJson, sha256, verifyMerchantSignature } from "./crypto.js";
 import {
@@ -59,6 +67,7 @@ import type {
   GatewayDependencies,
   GatewaySeed,
   Merchant,
+  PolicyCapsSnapshot,
   StoredPayment,
   WalletSnapshot,
 } from "./types.js";
@@ -79,6 +88,8 @@ type PairingEntry = {
   card: Approval;
   clientName: string;
   provider: string;
+  clientAppId?: string;
+  clientAppName?: string;
   publicKey: string;
   scopes: Agent["scopes"];
   expiresAt: number;
@@ -92,6 +103,39 @@ type PairingEntry = {
   replacementResolved?: boolean;
   ticketAgentId?: string;
   replacementPriorStatus?: Agent["status"];
+};
+type TrustIntent = {
+  intentId: string;
+  agentId: string;
+  kind: TrustEvent["kind"];
+  sourceId: string;
+  from: "AMBER" | "GREEN" | "RED";
+  level: "AMBER" | "GREEN" | "RED";
+  reason: string;
+  occurredAt: string;
+  status: "pending" | "anchored";
+  auditHash?: string;
+  evidenceHash?: string;
+  forceChain?: boolean;
+};
+type PolicyLimits = Pick<
+  Policy,
+  "per_payment_max" | "daily_max" | "monthly_max" | "auto_approve_below"
+>;
+type PolicyChange = {
+  changeId: string;
+  userId: string;
+  sessionBinding: string;
+  policyHash: string;
+  baseCaps: { perPayment: number; daily: number; monthly: number };
+  baseBlock: string;
+  proposed: PolicyLimits;
+  actionHash: string;
+  expiresAt: number;
+  deployment: string;
+  status: "prepared" | "applying" | "confirmed";
+  auditHash?: string;
+  txHash?: `0x${string}`;
 };
 type AppEvent = {
   id: number;
@@ -170,8 +214,34 @@ type HumanPaymentRecord = {
   createdAt: string;
   completedAt?: string;
 };
+type IdleChallenge = {
+  challengeId: string;
+  userId: string;
+  agentId: string;
+  actionHash: string;
+  sessionBinding: string;
+  challenge: string;
+  expiresAt: number;
+  used: boolean;
+};
+type IdleRenewal = {
+  agentId: string;
+  publicKey: string;
+  expiresAt: number;
+  consumed: boolean;
+};
 type GatewayState = {
   context: string;
+  trustEvents?: TrustEvent[];
+  trustPending?: TrustIntent[];
+  activeDrill?: { drillId: string; startedAt: string } | null;
+  riskAttempts?: Array<{
+    agentId: string;
+    merchantId: string;
+    orderId: string;
+    at: string;
+  }>;
+  riskHistoryKnownAgents?: string[];
   agents: Agent[];
   policies: ReturnType<typeof PolicySchema.parse>[];
   mandates: ReturnType<typeof MandateSchema.parse>[];
@@ -191,7 +261,11 @@ type GatewayState = {
       {
         userId: string;
         agentId: string;
-        action: "unfreeze" | "relicense";
+        action:
+          | "unfreeze"
+          | "relicense"
+          | "return_to_amber"
+          | "demo_fast_forward_green";
         actionHash: string;
         sessionBinding: string;
         challenge: string;
@@ -200,6 +274,8 @@ type GatewayState = {
       },
     ]
   >;
+  idleChallenges?: IdleChallenge[];
+  idleRenewals?: IdleRenewal[];
   payments: StoredPayment[];
   usedMerchantNonces: string[];
   audits: AuditRecord[];
@@ -219,10 +295,14 @@ type GatewayState = {
   humanPaymentKeys?: Array<
     [string, { bodyHash: string; confirmationId: string }]
   >;
+  policyChanges?: PolicyChange[];
+  policyKeys?: Array<[string, { bodyHash: string; changeId: string }]>;
   auth: ReturnType<AgentAuth["snapshot"]>;
 };
 
 const id = (prefix: string) => `${prefix}_${randomUUID().replaceAll("-", "")}`;
+const IDLE_LIMIT_MS = 7 * 86_400_000;
+const IDLE_RENEWAL_MS = 10 * 60_000;
 const error = (
   code: string,
   statusCode: number,
@@ -253,7 +333,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           "Access-Control-Allow-Headers",
           "Content-Type, Idempotency-Key, Authorization",
         );
-        reply.header("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+        reply.header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS");
         reply.header("Vary", "Origin");
       }
     });
@@ -323,7 +403,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     {
       userId: string;
       agentId: string;
-      action: "unfreeze" | "relicense";
+      action:
+        | "unfreeze"
+        | "relicense"
+        | "return_to_amber"
+        | "demo_fast_forward_green";
       actionHash: string;
       sessionBinding: string;
       challenge: string;
@@ -331,7 +415,31 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       used: boolean;
     }
   >();
+  const idleChallenges = new Map<string, IdleChallenge>();
+  const idleRenewals = new Map<string, IdleRenewal>();
   const payments = new Map<string, StoredPayment>();
+  async function spentInPolicyWindows(userId: string) {
+    if (deps.policyCaps) {
+      const observed = await deps.policyCaps.read();
+      return {
+        spentToday: safeFen(observed.spentToday),
+        spentMonth: safeFen(observed.spentMonth),
+      };
+    }
+    const today = now().toISOString().slice(0, 10);
+    const month = today.slice(0, 7);
+    let spentToday = 0;
+    let spentMonth = 0;
+    for (const payment of payments.values()) {
+      if (payment.userId !== userId || payment.status !== "paid") continue;
+      const settledAt = payment.paidAt ?? payment.createdAt;
+      if (settledAt.slice(0, 7) === month)
+        spentMonth += payment.request.amount.amount;
+      if (settledAt.slice(0, 10) === today)
+        spentToday += payment.request.amount.amount;
+    }
+    return { spentToday, spentMonth };
+  }
   const fundingRecords = new Map<string, FundingRecord>();
   const fundingChallenges = new Map<string, FundingChallenge>();
   const fundingKeys = new Map<
@@ -345,9 +453,23 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     string,
     { bodyHash: string; confirmationId: string }
   >();
+  const policyChanges = new Map<string, PolicyChange>();
+  const policyKeys = new Map<string, { bodyHash: string; changeId: string }>();
   const replacingAgents = new Set<string>();
   const usedMerchantNonces = new Set<string>();
   const audits: AuditRecord[] = [];
+  const trustEvents: TrustEvent[] = [];
+  const trustPending = new Map<string, TrustIntent>();
+  let activeDrill: { drillId: string; startedAt: string } | null = null;
+  const riskAttempts: Array<{
+    agentId: string;
+    merchantId: string;
+    orderId: string;
+    at: string;
+  }> = [];
+  const riskHistoryKnownAgents = new Set<string>(
+    deps.statePath ? [] : [...agents.keys()],
+  );
   const eventsByUser = new Map<string, AppEvent[]>();
   const idempotency = new Map<
     string,
@@ -385,6 +507,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         !Array.isArray(restored.idempotency) ||
         !Array.isArray(restored.replacementTickets) ||
         !Array.isArray(restored.actionChallenges) ||
+        (restored.idleChallenges !== undefined &&
+          !Array.isArray(restored.idleChallenges)) ||
+        (restored.idleRenewals !== undefined &&
+          !Array.isArray(restored.idleRenewals)) ||
         !restored.auth ||
         !Array.isArray(restored.auth.access) ||
         !Array.isArray(restored.auth.refresh) ||
@@ -413,7 +539,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         });
       for (const value of restored.pairings) {
         const item = { ...value, card: ApprovalSchema.parse(value.card) };
-        if (item.status === "processing") item.status = "pending";
+        if (item.status === "processing" && !item.agentId)
+          item.status = "pending";
         if (item.status === "pending") ensureIndependentPairing(item);
         pairingByDevice.set(item.deviceCode, item);
         pairingByUserCode.set(item.userCode, item);
@@ -427,6 +554,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         replacementTickets.set(key, value);
       for (const [key, value] of restored.actionChallenges)
         actionChallenges.set(key, value);
+      for (const value of restored.idleChallenges ?? [])
+        idleChallenges.set(value.challengeId, value);
+      for (const value of restored.idleRenewals ?? [])
+        idleRenewals.set(value.agentId, value);
       for (const value of restored.payments) {
         if (
           !value ||
@@ -465,10 +596,40 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       }
       for (const [key, value] of restored.humanPaymentKeys ?? [])
         humanPaymentKeys.set(key, value);
+      for (const value of restored.policyChanges ?? []) {
+        if (!policies.has(value.userId) || policyChanges.has(value.changeId))
+          throw new Error("Policy change state is incompatible");
+        policyChanges.set(value.changeId, value);
+      }
+      for (const [key, value] of restored.policyKeys ?? [])
+        policyKeys.set(key, value);
       for (const value of restored.usedMerchantNonces)
         usedMerchantNonces.add(value);
       for (const value of restored.audits)
         audits.push(AuditRecordSchema.parse(value));
+      for (const value of restored.trustEvents ?? [])
+        trustEvents.push(TrustEventSchema.parse(value));
+      for (const value of restored.trustPending ?? []) {
+        if (!agents.has(value.agentId))
+          throw new Error("Unknown trust intent agent");
+        trustPending.set(value.agentId, value);
+      }
+      activeDrill = restored.activeDrill ?? null;
+      for (const attempt of restored.riskAttempts ?? []) {
+        if (
+          typeof attempt.agentId !== "string" ||
+          typeof attempt.merchantId !== "string" ||
+          typeof attempt.orderId !== "string" ||
+          !Number.isFinite(Date.parse(attempt.at))
+        )
+          throw new Error("Risk attempt history is incompatible");
+        riskAttempts.push(attempt);
+      }
+      for (const agentId of restored.riskHistoryKnownAgents ?? []) {
+        if (!agents.has(agentId))
+          throw new Error("Risk history agent is incompatible");
+        riskHistoryKnownAgents.add(agentId);
+      }
       for (const [key, value] of restored.eventsByUser)
         eventsByUser.set(key, value);
       for (const [key, value] of restored.idempotency) {
@@ -513,9 +674,23 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     stateStore?.close();
     throw failure;
   }
+  for (const agent of agents.values()) {
+    if (
+      agent.legacy_red_evidence &&
+      agent.legacy_red_evidence.audit_ids === undefined
+    )
+      agent.legacy_red_evidence.audit_ids = audits
+        .filter((item) => item.subject_id === agent.agent_id)
+        .map((item) => item.audit_id);
+  }
   function snapshot(): GatewayState {
     return {
       context: deps.stateContext ?? "test",
+      trustEvents,
+      trustPending: [...trustPending.values()],
+      activeDrill,
+      riskAttempts,
+      riskHistoryKnownAgents: [...riskHistoryKnownAgents],
       agents: [...agents.values()],
       policies: [...policies.values()],
       mandates: [...mandates.values()],
@@ -524,6 +699,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       replacingAgents: [...replacingAgents],
       replacementTickets: [...replacementTickets],
       actionChallenges: [...actionChallenges],
+      idleChallenges: [...idleChallenges.values()],
+      idleRenewals: [...idleRenewals.values()],
       payments: [...payments.values()],
       usedMerchantNonces: [...usedMerchantNonces],
       audits,
@@ -543,6 +720,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       sweepKeys: [...sweepKeys],
       humanPaymentRecords: [...humanPaymentRecords.values()],
       humanPaymentKeys: [...humanPaymentKeys],
+      policyChanges: [...policyChanges.values()],
+      policyKeys: [...policyKeys],
       auth: agentAuth.snapshot(),
     };
   }
@@ -570,8 +749,117 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     stateStore?.close();
   });
   app.addHook("onReady", async () => {
+    for (const change of policyChanges.values()) {
+      if (change.status !== "applying") continue;
+      try {
+        await finishPolicyChange(change);
+      } catch (failure) {
+        app.log.error(
+          { failure, changeId: change.changeId },
+          "Policy change remains fenced",
+        );
+      }
+    }
+    for (const pending of trustPending.values()) {
+      const agent = agents.get(pending.agentId);
+      if (!agent) throw new Error("Trust intent references an unknown agent");
+      try {
+        await finishTrustIntent(agent, pending);
+      } catch (failure) {
+        app.log.error(
+          { failure, agentId: agent.agent_id },
+          "Trust transition remains fenced for reconciliation",
+        );
+      }
+    }
+    for (const pairing of pairingByDevice.values()) {
+      if (pairing.status !== "processing" || !pairing.agentId) continue;
+      const agent = agents.get(pairing.agentId);
+      if (!agent) continue;
+      try {
+        await recordTrustEvent(
+          agent,
+          "transition",
+          `initial-amber:${pairing.deviceCode}`,
+          "New paired agent registered Amber",
+          "AMBER",
+          true,
+        );
+        agent.status = "active";
+        riskHistoryKnownAgents.add(agent.agent_id);
+        pairing.status = "approved";
+        pairing.card.status = "approved";
+        persist();
+      } catch (failure) {
+        app.log.error(
+          { failure, agentId: agent.agent_id },
+          "Initial Amber registry write requires reconciliation",
+        );
+      }
+    }
+    for (const payment of payments.values()) {
+      if (
+        payment.status !== "paid" ||
+        payment.approvalSource !== "owner" ||
+        !payment.approvalId ||
+        !payment.paidAt
+      )
+        continue;
+      if (
+        trustEvents.some(
+          (item) =>
+            item.kind === "clean_purchase" &&
+            item.source_id === payment.paymentId,
+        )
+      )
+        continue;
+      const agent = agents.get(payment.agentId);
+      if (!agent || trustPending.has(agent.agent_id)) continue;
+      const amberEntry = trustEvents[latestAmberEntryIndex(agent.agent_id)];
+      if (
+        amberEntry &&
+        Date.parse(payment.paidAt) <=
+          Date.parse(amberEntry.confirmed_at ?? amberEntry.occurred_at)
+      )
+        continue;
+      try {
+        await recordTrustEvent(
+          agent,
+          "clean_purchase",
+          payment.paymentId,
+          "Owner-approved paid purchase verified",
+          undefined,
+          false,
+          undefined,
+          payment.paidAt,
+        );
+      } catch (failure) {
+        app.log.error(
+          { failure, paymentId: payment.paymentId },
+          "Paid purchase trust evidence requires reconciliation",
+        );
+      }
+    }
+    for (const agent of agents.values()) {
+      if (agent.licence.level !== "AMBER" || trustPending.has(agent.agent_id))
+        continue;
+      try {
+        await maybePromoteAmber(agent);
+      } catch (failure) {
+        app.log.error(
+          { failure, agentId: agent.agent_id },
+          "Amber qualification requires reconciliation",
+        );
+      }
+    }
+    if (deps.setDrillVisibility)
+      await deps.setDrillVisibility(activeDrill !== null);
     for (const mandate of mandates.values()) {
-      if (mandate.status !== "active" && mandate.status !== "pending_user")
+      if (
+        mandate.status !== "active" &&
+        mandate.status !== "pending_user" &&
+        mandate.status !== "pending_checkout"
+      )
         continue;
       const owner = agents.get(mandate.agent_id);
       if (!owner) throw new Error("Gateway mandate references a missing agent");
@@ -633,7 +921,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     for (const mandate of mandates.values()) {
       if (
         mandate.agent_id === agent.agent_id &&
-        mandate.status === "pending_user"
+        (mandate.status === "pending_user" ||
+          (mandate.status === "pending_checkout" &&
+            mandate.in_flight_payment_id === null))
       )
         cancel(mandate);
     }
@@ -682,6 +972,64 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return true;
   }
 
+  async function retireRedAgentAuthority(agent: Agent): Promise<boolean> {
+    for (const payment of payments.values()) {
+      if (
+        payment.agentId !== agent.agent_id ||
+        payment.status !== "awaiting_user"
+      )
+        continue;
+      const response = await settle(
+        payment,
+        "DENIED",
+        "The agent turned Red before this payment was approved.",
+      );
+      if (response.statusCode >= 500) return false;
+    }
+    for (const mandate of mandates.values()) {
+      if (mandate.agent_id !== agent.agent_id) continue;
+      if (
+        mandate.status !== "active" &&
+        mandate.status !== "pending_user" &&
+        mandate.status !== "pending_checkout"
+      )
+        continue;
+      if (mandate.status === "active" && !mandate.in_flight_payment_id) {
+        try {
+          await deps.releaseMandate(mandate);
+        } catch {
+          return false;
+        }
+      }
+      mandate.status = "cancelled";
+      emitEvent(agent.user_id, "mandate.cancelled", {
+        mandate_id: mandate.mandate_id,
+        reason: "trust_red",
+      });
+    }
+    for (const entry of approvals.values()) {
+      const ownedMandate = entry.mandateId
+        ? mandates.get(entry.mandateId)
+        : undefined;
+      const ownedPayment = entry.paymentId
+        ? payments.get(entry.paymentId)
+        : undefined;
+      if (
+        entry.card.status !== "pending" ||
+        (ownedMandate?.agent_id !== agent.agent_id &&
+          ownedPayment?.agentId !== agent.agent_id)
+      )
+        continue;
+      entry.card.status = "rejected";
+      emitEvent(agent.user_id, "approval.resolved", {
+        approval_id: entry.card.approval_id,
+        status: "rejected",
+      });
+    }
+    persist();
+    return true;
+  }
+
   function pairingStatus(pairing: PairingEntry) {
     if (pairing.status === "approved" || pairing.status === "consumed")
       return "approved";
@@ -712,14 +1060,71 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       provider: agent.provider,
       prior_status: agent.status,
       prior_licence_level: agent.licence.level,
-      points: agent.licence.points,
-      demerit_count: Math.max(0, -agent.licence.points),
+      points: agent.licence.legacy_points ?? 0,
+      demerit_count: agent.licence.flags_30d,
       latest_reason:
         audits.filter((item) => item.subject_id === agent.agent_id).at(-1)
           ?.summary ?? null,
       root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
       deleted_at: agent.deleted_at ?? null,
     };
+  }
+
+  function trustActionSummary(agent: Agent) {
+    return {
+      agent_id: agent.agent_id,
+      display_name: agent.display_name,
+      client_app_id: agent.client_app_id ?? null,
+      client_app_name: agent.client_app_name ?? null,
+      public_key_preview: `${agent.public_key.slice(0, 20)}...`,
+      scopes: agent.scopes,
+      level: agent.licence.level,
+      flags_30d: flagsInWindow(agent.agent_id),
+      drills_failed: agent.licence.drills_failed,
+      reason: agent.licence.reason,
+      latest_evidence_ids: trustEvents
+        .filter((item) => item.agent_id === agent.agent_id)
+        .slice(-10)
+        .map((item) => item.event_id),
+      legacy_evidence: agent.legacy_red_evidence ?? null,
+    };
+  }
+
+  function trustResetActionHash(
+    agent: Agent,
+    userId: string,
+    sessionBinding: string,
+    challengeId: string,
+    expiresAt: number,
+  ): string {
+    return sha256({
+      schema: "trust_reset.v1",
+      user_id: userId,
+      agent_id: agent.agent_id,
+      key_hash: keccak256(stringToHex(agent.public_key)),
+      expected_level: "RED",
+      flags_30d: flagsInWindow(agent.agent_id),
+      evidence: trustEvents
+        .filter(
+          (event) =>
+            event.agent_id === agent.agent_id &&
+            event.kind !== "clean_purchase",
+        )
+        .map((event) => ({
+          event_id: event.event_id,
+          kind: event.kind,
+          source_id: event.source_id,
+          audit_hash: event.audit_hash,
+          ...(event.confirmed_at ? { confirmed_at: event.confirmed_at } : {}),
+          ...(event.evidence_hash
+            ? { evidence_hash: event.evidence_hash }
+            : {}),
+        })),
+      legacy_evidence: trustActionSummary(agent).legacy_evidence,
+      session_binding: sessionBinding,
+      challenge_id: challengeId,
+      expires_at: new Date(expiresAt).toISOString(),
+    });
   }
 
   function pairingSummary(pairing: PairingEntry) {
@@ -731,6 +1136,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       user_code: pairing.userCode,
       client_name: pairing.clientName,
       provider: pairing.provider,
+      client_app_id: pairing.clientAppId ?? null,
+      client_app_name: pairing.clientAppName ?? null,
       requested_scopes: pairing.scopes,
       status: pairingStatus(pairing),
       agent_id: pairing.agentId ?? null,
@@ -764,6 +1171,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     pairing.card.lines = [
       `Agent request: ${pairing.clientName}`,
       `Provider claim: ${pairing.provider}`,
+      `Client app: ${pairing.clientAppName ?? "Unidentified legacy client"}`,
+      `Client app ID: ${pairing.clientAppId ?? "unidentified"}`,
       `Requested scopes: ${pairing.scopes.join(", ")}`,
       `Public key: ${pairing.publicKey}`,
     ];
@@ -775,6 +1184,36 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       publicKey: pairing.publicKey,
       lines: pairing.card.lines,
     });
+  }
+
+  function idleExpiresAt(agent: Agent): string {
+    return new Date(
+      Date.parse(agent.last_used_at ?? agent.created_at) + IDLE_LIMIT_MS,
+    ).toISOString();
+  }
+
+  function idleRequired(agent: Agent): boolean {
+    return now().getTime() >= Date.parse(idleExpiresAt(agent));
+  }
+
+  function agentWithIdleState(agent: Agent) {
+    return {
+      ...agent,
+      client_app_id: agent.client_app_id ?? null,
+      client_app_name: agent.client_app_name ?? null,
+      idle_expires_at: idleExpiresAt(agent),
+      reauthorization_required:
+        agent.status === "active" &&
+        agent.licence.level !== "RED" &&
+        idleRequired(agent),
+    };
+  }
+
+  function invalidateIdleRecovery(agentId: string): void {
+    idleRenewals.delete(agentId);
+    for (const challenge of idleChallenges.values()) {
+      if (challenge.agentId === agentId) challenge.used = true;
+    }
   }
 
   async function agentFor(
@@ -805,10 +1244,14 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       return { response: error("bad_signature", 401) };
     if (
       registered.status !== "active" ||
-      registered.licence.level === "SUSPENDED" ||
+      registered.deleted_at ||
+      registered.licence.level === "RED" ||
+      trustPending.has(registered.agent_id) ||
       replacingAgents.has(registered.agent_id)
     )
       return { response: error("agent_frozen", 401) };
+    if (idleRequired(registered))
+      return { response: error("reauthorization_required", 401) };
     if (!deps.authenticateAgent) {
       const token = request.headers.authorization?.match(
         /^Bearer ([A-Za-z0-9_-]+)$/,
@@ -1014,6 +1457,118 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       throw new Error("Chain balance exceeds supported money range");
     return number;
   }
+  const policyHash = (policy: Policy) => sha256(policy);
+  function policyChangeHash(
+    change: Pick<
+      PolicyChange,
+      | "userId"
+      | "sessionBinding"
+      | "changeId"
+      | "policyHash"
+      | "baseCaps"
+      | "baseBlock"
+      | "proposed"
+      | "deployment"
+      | "expiresAt"
+    >,
+  ) {
+    return sha256({
+      schema: "policy_change.v1",
+      user_id: change.userId,
+      session_binding: change.sessionBinding,
+      change_id: change.changeId,
+      policy_hash: change.policyHash,
+      base_caps: change.baseCaps,
+      base_block: change.baseBlock,
+      proposed: change.proposed,
+      deployment: change.deployment,
+      expires_at: new Date(change.expiresAt).toISOString(),
+    });
+  }
+  function policyChangePending(userId: string): boolean {
+    return [...policyChanges.values()].some(
+      (item) => item.userId === userId && item.status === "applying",
+    );
+  }
+  function capsMatchPolicy(caps: PolicyCapsSnapshot, policy: Policy): boolean {
+    return (
+      caps.perPaymentCap === BigInt(policy.per_payment_max.amount) &&
+      caps.dailyCap === BigInt(policy.daily_max.amount) &&
+      caps.monthlyCap === BigInt(policy.monthly_max.amount)
+    );
+  }
+  function capsPublic(caps: PolicyCapsSnapshot) {
+    return {
+      per_payment_max: walletMoney(safeFen(caps.perPaymentCap)),
+      daily_max: walletMoney(safeFen(caps.dailyCap)),
+      monthly_max: walletMoney(safeFen(caps.monthlyCap)),
+      spent_today: walletMoney(safeFen(caps.spentToday)),
+      spent_month: walletMoney(safeFen(caps.spentMonth)),
+      block_number: caps.blockNumber.toString(),
+      observed_at: caps.observedAt,
+      next_daily_reset_at: caps.nextDailyResetAt,
+      next_monthly_reset_at: caps.nextMonthlyResetAt,
+    };
+  }
+  async function policyGuard(userId: string): Promise<Response | null> {
+    if (!deps.walletFunding && !deps.policyCaps) return null;
+    if (policyChangePending(userId))
+      return error("reconciliation_required", 503);
+    if (!deps.policyCaps) return error("chain_unavailable", 503);
+    const policy = policies.get(userId);
+    if (!policy) return error("policy_denied", 503);
+    try {
+      const caps = await deps.policyCaps.read();
+      return capsMatchPolicy(caps, policy)
+        ? null
+        : error("reconciliation_required", 503);
+    } catch {
+      return error("chain_unavailable", 503);
+    }
+  }
+  async function finishPolicyChange(change: PolicyChange): Promise<void> {
+    if (change.status !== "applying" || !change.auditHash || !deps.policyCaps)
+      throw new Error("Policy change is not ready for reconciliation");
+    if (change.deployment !== walletDeployment)
+      throw new Error("Policy deployment changed");
+    if (change.actionHash !== policyChangeHash(change))
+      throw new Error("Policy change action hash changed");
+    const policy = policies.get(change.userId);
+    if (!policy || policyHash(policy) !== change.policyHash)
+      throw new Error("Policy changed before cap confirmation");
+    const before = await deps.policyCaps.read();
+    const baseMatches =
+      before.perPaymentCap === BigInt(change.baseCaps.perPayment) &&
+      before.dailyCap === BigInt(change.baseCaps.daily) &&
+      before.monthlyCap === BigInt(change.baseCaps.monthly);
+    const targetMatches =
+      before.perPaymentCap === BigInt(change.proposed.per_payment_max.amount) &&
+      before.dailyCap === BigInt(change.proposed.daily_max.amount) &&
+      before.monthlyCap === BigInt(change.proposed.monthly_max.amount);
+    if (!baseMatches && !targetMatches)
+      throw new Error("Unrecognized cap state during policy reconciliation");
+    if (!targetMatches)
+      change.txHash = await deps.policyCaps.write(change.changeId);
+    const after = await deps.policyCaps.read();
+    if (
+      after.perPaymentCap !== BigInt(change.proposed.per_payment_max.amount) ||
+      after.dailyCap !== BigInt(change.proposed.daily_max.amount) ||
+      after.monthlyCap !== BigInt(change.proposed.monthly_max.amount)
+    )
+      throw new Error("Policy cap write lacks exact readback");
+    policies.set(
+      change.userId,
+      PolicySchema.parse({ ...policy, ...change.proposed }),
+    );
+    change.status = "confirmed";
+    try {
+      persist();
+    } catch (failure) {
+      policies.set(change.userId, policy);
+      change.status = "applying";
+      throw failure;
+    }
+  }
   function sweepPublic(item: SweepRecord) {
     return {
       schema: "sweep.v1" as const,
@@ -1120,8 +1675,279 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return record;
   }
 
+  function flagsInWindow(agentId: string): number {
+    const cutoff = now().getTime() - 30 * 86_400_000;
+    return trustEvents.filter(
+      (item) =>
+        item.agent_id === agentId &&
+        item.kind === "flag" &&
+        Date.parse(item.occurred_at) >= cutoff,
+    ).length;
+  }
+
+  async function recordTrustEvent(
+    agent: Agent,
+    kind: TrustEvent["kind"],
+    sourceId: string,
+    reason: string,
+    target?: "AMBER" | "GREEN" | "RED",
+    forceChain = false,
+    evidenceHash?: string,
+    occurredAt?: string,
+  ): Promise<TrustEvent> {
+    const existing = trustEvents.find(
+      (item) =>
+        item.agent_id === agent.agent_id &&
+        item.kind === kind &&
+        item.source_id === sourceId,
+    );
+    if (existing) {
+      if (existing.evidence_hash !== evidenceHash)
+        throw new Error("Trust evidence changed for an existing incident");
+      return existing;
+    }
+    const previouslyPending = trustPending.get(agent.agent_id);
+    if (previouslyPending) {
+      if (
+        previouslyPending.kind !== kind ||
+        previouslyPending.sourceId !== sourceId ||
+        previouslyPending.evidenceHash !== evidenceHash
+      )
+        throw new Error("Agent trust evidence requires reconciliation");
+      return finishTrustIntent(agent, previouslyPending);
+    }
+    const oldLight = agent.licence.level;
+    const nextLight = target ?? oldLight;
+    const pending: TrustIntent = {
+      intentId: id("tev"),
+      agentId: agent.agent_id,
+      kind,
+      sourceId,
+      from: oldLight,
+      level: nextLight,
+      reason,
+      occurredAt: occurredAt ?? now().toISOString(),
+      status: "pending",
+      forceChain,
+      evidenceHash,
+    };
+    trustPending.set(agent.agent_id, pending);
+    persist();
+    return finishTrustIntent(agent, pending);
+  }
+
+  async function finishTrustIntent(
+    agent: Agent,
+    pending: TrustIntent,
+  ): Promise<TrustEvent> {
+    const {
+      intentId,
+      kind,
+      sourceId,
+      from: oldLight,
+      level: nextLight,
+      reason,
+    } = pending;
+    const facts = {
+      event_id: intentId,
+      agent_id: agent.agent_id,
+      kind,
+      source_id: sourceId,
+      from: oldLight,
+      to: nextLight,
+      reason,
+      ...(pending.evidenceHash ? { evidence_hash: pending.evidenceHash } : {}),
+      occurred_at: pending.occurredAt,
+    };
+    if (pending.status !== "anchored") {
+      const audit = await writeAudit({
+        kind:
+          kind === "drill_passed" || kind === "drill_failed"
+            ? "drill"
+            : "licence_change",
+        actor: agent.user_id,
+        subjectId: agent.agent_id,
+        summary: reason,
+        data: {
+          ...facts,
+          public_key: agent.public_key,
+          ...(nextLight === "RED" && oldLight !== "RED"
+            ? {
+                retiring_approval_ids: [...approvals.values()]
+                  .filter(
+                    (entry) =>
+                      entry.card.status === "pending" &&
+                      ((entry.mandateId &&
+                        mandates.get(entry.mandateId)?.agent_id ===
+                          agent.agent_id) ||
+                        (entry.paymentId &&
+                          payments.get(entry.paymentId)?.agentId ===
+                            agent.agent_id)),
+                  )
+                  .map((entry) => entry.card.approval_id),
+                retiring_mandate_ids: [...mandates.values()]
+                  .filter(
+                    (mandate) =>
+                      mandate.agent_id === agent.agent_id &&
+                      (mandate.status === "active" ||
+                        mandate.status === "pending_user" ||
+                        mandate.status === "pending_checkout"),
+                  )
+                  .map((mandate) => mandate.mandate_id),
+              }
+            : {}),
+        },
+      });
+      pending.status = "anchored";
+      pending.auditHash = audit.record_hash;
+      persist();
+    }
+    if (!pending.auditHash) throw new Error("Trust intent audit is missing");
+    let chainTx: `0x${string}` | undefined;
+    if (nextLight !== oldLight || pending.forceChain) {
+      if (!deps.setTrustLight)
+        throw new Error("Bank trust-light writer unavailable");
+      chainTx = await deps.setTrustLight(agent, nextLight, intentId);
+    }
+    if (nextLight === "RED" && oldLight !== "RED") {
+      if (!(await retireRedAgentAuthority(agent)))
+        throw new Error("Red authority retirement requires reconciliation");
+    }
+    const confirmedAt = now().toISOString();
+    const event = TrustEventSchema.parse({
+      schema: "trust_event.v1",
+      ...facts,
+      ...(nextLight !== oldLight || pending.forceChain
+        ? { confirmed_at: confirmedAt }
+        : {}),
+      audit_hash: pending.auditHash,
+      ...(chainTx ? { chain_tx: chainTx } : {}),
+    });
+    trustEvents.push(event);
+    agent.licence.level = nextLight;
+    agent.licence.reason = reason;
+    if (nextLight !== oldLight || pending.forceChain)
+      agent.licence.updated_at = confirmedAt;
+    agent.licence.flags_30d = flagsInWindow(agent.agent_id);
+    if (kind === "clean_purchase")
+      agent.licence.clean_purchases = Math.max(
+        agent.licence.clean_purchases,
+        trustEvents.filter(
+          (item) =>
+            item.agent_id === agent.agent_id && item.kind === "clean_purchase",
+        ).length,
+      );
+    if (kind === "drill_passed") agent.licence.drills_passed++;
+    if (kind === "drill_failed") agent.licence.drills_failed++;
+    trustPending.delete(agent.agent_id);
+    emitEvent(agent.user_id, "agent.licence_changed", {
+      agent_id: agent.agent_id,
+      from: oldLight,
+      to: nextLight,
+      reason,
+      trust_event_id: event.event_id,
+    });
+    persist();
+    return event;
+  }
+
+  function latestAmberEntryIndex(agentId: string): number {
+    for (let index = trustEvents.length - 1; index >= 0; index--) {
+      const event = trustEvents[index];
+      if (
+        event &&
+        event.agent_id === agentId &&
+        event.to === "AMBER" &&
+        event.from !== "AMBER"
+      )
+        return index;
+    }
+    return -1;
+  }
+
+  async function maybePromoteAmber(agent: Agent): Promise<void> {
+    if (agent.licence.level !== "AMBER" || trustPending.has(agent.agent_id))
+      return;
+    const resetIndex = latestAmberEntryIndex(agent.agent_id);
+    const reset = trustEvents[resetIndex];
+    const epoch = reset?.event_id ?? "initial";
+    const confirmedReset = reset
+      ? Date.parse(reset.confirmed_at ?? reset.occurred_at)
+      : null;
+    const eligible = trustEvents
+      .slice(resetIndex + 1)
+      .filter((item) => item.agent_id === agent.agent_id);
+    const clean = eligible.filter((item) => {
+      if (item.kind !== "clean_purchase") return false;
+      const paidAt = payments.get(item.source_id)?.paidAt;
+      if (!paidAt) return false;
+      return confirmedReset === null || Date.parse(paidAt) > confirmedReset;
+    }).length;
+    const passed = eligible.some(
+      (item) =>
+        item.kind === "drill_passed" &&
+        (confirmedReset === null ||
+          Date.parse(item.occurred_at) > confirmedReset),
+    );
+    if (clean < 5 || !passed || flagsInWindow(agent.agent_id) !== 0) return;
+    await recordTrustEvent(
+      agent,
+      "transition",
+      `earned-green:${agent.agent_id}:${epoch}`,
+      "Five clean owner-approved purchases and a bank-recorded passed drill in this Amber period",
+      "GREEN",
+    );
+  }
+
+  async function flagTrust(
+    agent: Agent,
+    sourceId: string,
+    reason: string,
+  ): Promise<void> {
+    if (
+      trustEvents.some(
+        (item) =>
+          item.agent_id === agent.agent_id &&
+          item.kind === "flag" &&
+          item.source_id === sourceId,
+      )
+    )
+      return;
+    const nextCount = flagsInWindow(agent.agent_id) + 1;
+    const target =
+      nextCount >= 2
+        ? "RED"
+        : agent.licence.level === "GREEN"
+          ? "AMBER"
+          : agent.licence.level;
+    await recordTrustEvent(agent, "flag", sourceId, reason, target);
+  }
+
+  function recordRiskAttempt(
+    agentId: string,
+    merchantId: string,
+    orderId: string,
+  ): void {
+    if (
+      riskAttempts.some(
+        (item) =>
+          item.agentId === agentId &&
+          item.merchantId === merchantId &&
+          item.orderId === orderId,
+      )
+    )
+      return;
+    riskAttempts.push({
+      agentId,
+      merchantId,
+      orderId,
+      at: now().toISOString(),
+    });
+    persist();
+  }
+
   function approvalCard(
-    kind: "mandate" | "payment" | "pairing",
+    kind: "mandate" | "payment" | "pairing" | "policy_loosen",
     level: "zero_trust" | "everyday",
     subjectId: string,
     title: string,
@@ -1141,6 +1967,239 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       expires_at: new Date(now().getTime() + ttlSeconds * 1000).toISOString(),
       status: "pending",
     });
+  }
+
+  function compositeReviewHash(
+    review: PaymentReview,
+    userId: string,
+    decision: StoredPayment["decision"],
+  ): `sha256:${string}` {
+    const { payload_hash: _payloadHash, ...facts } = review;
+    return sha256({
+      schema: "payment_review_action.v1",
+      owner_id: userId,
+      review: facts,
+      decision,
+    });
+  }
+
+  function compositePaymentCard(
+    agent: Agent,
+    mandate: Mandate,
+    payment: StoredPayment,
+    paymentUri: string,
+    paymentLines: string[],
+    firstPayment: boolean,
+  ): Approval {
+    const approvalId = id("apr");
+    const expiresAt = new Date(now().getTime() + ttl * 1000).toISOString();
+    const lockedMandate = MandateSchema.parse({
+      ...structuredClone(mandate),
+      in_flight_payment_id: null,
+    });
+    const review = PaymentReviewSchema.parse({
+      schema: "payment_review.v1",
+      status: "pending",
+      approval_id: approvalId,
+      payment_id: payment.paymentId,
+      payload_hash: `sha256:${"0".repeat(64)}`,
+      expires_at: expiresAt,
+      mandate_snapshot: {
+        mandate: lockedMandate,
+        canonical_hash: sha256(lockedMandate),
+      },
+      signed_order: {
+        payment_request_hash: `sha256:${createHash("sha256").update(paymentUri, "utf8").digest("hex")}`,
+        merchant_id: payment.merchant.merchant_id,
+        merchant_legal_name: payment.merchant.legal_name,
+        merchant_uscc: payment.merchant.uscc,
+        order_id: payment.request.order_id,
+        line_items: structuredClone(payment.request.line_items),
+        amount: structuredClone(payment.request.amount),
+        expires_at: payment.request.expires_at,
+      },
+      decision_checks: structuredClone(payment.decision.checks),
+    });
+    review.payload_hash = compositeReviewHash(
+      review,
+      agent.user_id,
+      payment.decision,
+    );
+    payment.review = review;
+    return ApprovalSchema.parse({
+      schema: "approval.v1",
+      approval_id: approvalId,
+      kind: "payment",
+      review_schema: "payment_review.v1",
+      subject_id: payment.paymentId,
+      title: `${agent.display_name} wants to pay ${payment.request.amount.amount / 100} ${payment.request.amount.currency}`,
+      lines: [
+        `User request (agent-reported): ${lockedMandate.user_text}`,
+        `Locked intent: ${lockedMandate.intent_level}; ${lockedMandate.description}`,
+        ...lockedMandate.constraints.map(
+          (constraint) => `Locked constraint: ${canonicalJson(constraint)}`,
+        ),
+        ...paymentLines,
+        `Order: ${payment.request.order_id}`,
+        `Exact total: ${payment.request.amount.amount / 100} ${payment.request.amount.currency}`,
+      ],
+      payload_hash: review.payload_hash,
+      level: firstPayment ? "zero_trust" : "everyday",
+      expires_at: expiresAt,
+      status: "pending",
+    });
+  }
+
+  function compositeReviewStillMatches(
+    entry: ApprovalEntry,
+    payment: StoredPayment,
+    mandate: Mandate,
+  ): boolean {
+    if (!payment.review || !payment.paymentUri) return false;
+    if (
+      mandate.status !== "pending_checkout" ||
+      mandate.approval_timing !== "payment" ||
+      mandate.in_flight_payment_id !== payment.paymentId
+    )
+      return false;
+    const review = PaymentReviewSchema.safeParse(payment.review);
+    if (!review.success) return false;
+    const card = entry.card;
+    const facts = review.data;
+    if (
+      card.review_schema !== "payment_review.v1" ||
+      facts.approval_id !== card.approval_id ||
+      facts.payment_id !== payment.paymentId ||
+      facts.expires_at !== card.expires_at ||
+      facts.payload_hash !== card.payload_hash ||
+      compositeReviewHash(facts, entry.userId, payment.decision) !==
+        card.payload_hash
+    )
+      return false;
+    const originalMandate = MandateSchema.safeParse({
+      ...mandate,
+      in_flight_payment_id: null,
+    });
+    if (!originalMandate.success) return false;
+    if (
+      sha256(originalMandate.data) !== facts.mandate_snapshot.canonical_hash ||
+      sha256(facts.mandate_snapshot.mandate) !==
+        facts.mandate_snapshot.canonical_hash
+    )
+      return false;
+    const signedOrder = {
+      payment_request_hash: `sha256:${createHash("sha256").update(payment.paymentUri, "utf8").digest("hex")}`,
+      merchant_id: payment.merchant.merchant_id,
+      merchant_legal_name: payment.merchant.legal_name,
+      merchant_uscc: payment.merchant.uscc,
+      order_id: payment.request.order_id,
+      line_items: payment.request.line_items,
+      amount: payment.request.amount,
+      expires_at: payment.request.expires_at,
+    };
+    if (sha256(signedOrder) !== sha256(facts.signed_order)) return false;
+    try {
+      return (
+        sha256(decodePaymentRequestUri(payment.paymentUri)) ===
+        sha256(payment.request)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function contractPayDenial(reason: string): {
+    rule: DenialRule;
+    checkReason: string;
+  } | null {
+    const known: Record<string, { rule: DenialRule; checkReason: string }> = {
+      "over payment cap": {
+        rule: "over_per_payment_cap",
+        checkReason: "per_payment_cap_exceeded",
+      },
+      "over daily cap": {
+        rule: "over_daily_cap",
+        checkReason: "daily_cap_exceeded",
+      },
+      "over monthly cap": {
+        rule: "over_monthly_cap",
+        checkReason: "monthly_cap_exceeded",
+      },
+      insufficient: {
+        rule: "insufficient_wallet_funds",
+        checkReason: "insufficient_wallet_funds",
+      },
+      "already paid": {
+        rule: "duplicate_payment",
+        checkReason: "duplicate_payment",
+      },
+      "merchant inactive": {
+        rule: "merchant_unknown",
+        checkReason: "merchant_unknown",
+      },
+    };
+    return known[reason] ?? null;
+  }
+
+  function recordContractDenial(
+    payment: StoredPayment,
+    checkReason: string,
+  ): void {
+    payment.decision = DecisionSchema.parse({
+      ...payment.decision,
+      checks: payment.decision.checks.map((check) =>
+        check.name === "rail_validation"
+          ? {
+              ...check,
+              result: "deny" as const,
+              detail: {
+                ...check.detail,
+                reason: checkReason,
+                contract_rechecked: true,
+              },
+            }
+          : check,
+      ),
+    });
+  }
+
+  async function checkVerifiedMandateProduct(
+    mandate: Mandate,
+    paymentRequest: PaymentRequest,
+    merchant: Merchant,
+    allowPendingCheckout = false,
+  ): Promise<Check> {
+    const check = checkMandate(
+      mandate,
+      paymentRequest,
+      merchant,
+      now(),
+      allowPendingCheckout,
+    );
+    if (check.result === "deny") return check;
+    const product = mandate.constraints.find((item) => item.type === "product");
+    if (!product?.brand || !product.model || product.gtin) return check;
+    const expectedBrand = product.brand.trim().toLowerCase();
+    const expectedModel = product.model.trim().toLowerCase();
+    for (const item of paymentRequest.line_items) {
+      if (item.type !== "product") continue;
+      const trusted = deps.lookupVariant
+        ? await deps.lookupVariant(item.sku)
+        : (demoVariantBySku(item.sku) ?? null);
+      if (
+        !trusted ||
+        trusted.merchant_id !== merchant.merchant_id ||
+        trusted.gtin !== item.gtin ||
+        trusted.brand.trim().toLowerCase() !== expectedBrand ||
+        trusted.model.trim().toLowerCase() !== expectedModel
+      )
+        return {
+          name: "mandate",
+          result: "deny",
+          detail: { reason: "product_model_mismatch" },
+        };
+    }
+    return check;
   }
 
   function storeApproval(entry: ApprovalEntry): void {
@@ -1219,6 +2278,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   ): Promise<Response> {
     const mandate = mandates.get(payment.mandateId);
     if (!mandate) return agentDenied("mandate_not_found");
+    if (outcome === "APPROVED") {
+      const blocked = await policyGuard(payment.userId);
+      if (blocked) return blocked;
+    }
     try {
       if (
         outcome === "APPROVED" &&
@@ -1233,15 +2296,26 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         );
         if (
           currentAgent?.status !== "active" ||
+          currentAgent?.deleted_at ||
+          (currentAgent ? idleRequired(currentAgent) : true) ||
           replacingAgents.has(payment.agentId) ||
-          currentAgent.licence.level === "SUSPENDED" ||
+          currentAgent.licence.level === "RED" ||
+          trustPending.has(payment.agentId) ||
           mandate.in_flight_payment_id !== payment.paymentId ||
           Date.parse(payment.request.expires_at) <= now().getTime() ||
           !currentMerchant ||
           currentMerchant.public_key !== payment.merchant.public_key ||
+          currentMerchant.payout !== payment.merchant.payout ||
+          currentMerchant.legal_name !== payment.merchant.legal_name ||
+          currentMerchant.uscc !== payment.merchant.uscc ||
           currentMerchant.honeypot ||
-          checkMandate(mandate, payment.request, currentMerchant, now())
-            .result === "deny"
+          (
+            await checkVerifiedMandateProduct(
+              mandate,
+              payment.request,
+              currentMerchant,
+            )
+          ).result === "deny"
         ) {
           outcome = "DENIED";
           explanation =
@@ -1291,6 +2365,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         });
       }
       payment.status = outcome === "APPROVED" ? "paid" : "denied";
+      if (outcome === "APPROVED") payment.paidAt = now().toISOString();
       emitEvent(
         payment.userId,
         outcome === "APPROVED" ? "payment.completed" : "payment.denied",
@@ -1312,7 +2387,29 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         mandate.spent.amount += payment.request.amount.amount;
         mandate.occurrences++;
         const agent = agents.get(payment.agentId);
-        if (agent) agent.licence.clean_purchases++;
+        if (agent) {
+          agent.last_used_at = now().toISOString();
+          if (payment.approvalSource === "owner" && payment.approvalId) {
+            try {
+              await recordTrustEvent(
+                agent,
+                "clean_purchase",
+                payment.paymentId,
+                "Owner-approved paid purchase verified",
+                undefined,
+                false,
+                undefined,
+                payment.paidAt,
+              );
+              await maybePromoteAmber(agent);
+            } catch (failure) {
+              app.log.error(
+                { failure, agentId: agent.agent_id },
+                "Trust evidence requires reconciliation",
+              );
+            }
+          }
+        }
         const budget = budgetOf(mandate);
         const recurrence = mandate.constraints.find(
           (item) => item.type === "recurrence",
@@ -1337,6 +2434,16 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             receipt: payment.receipt,
           }),
         };
+      }
+      if (payment.review) {
+        if (mandate.status === "active") {
+          try {
+            await deps.releaseMandate(mandate);
+          } catch {
+            // The composite mandate remains unusable even if a hold lingers.
+          }
+        }
+        mandate.status = "cancelled";
       }
       const denialError = explicitDenial
         ? denial(explicitDenial)
@@ -1365,24 +2472,30 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         }),
       };
     } catch (failure) {
+      const provenDenial =
+        failure instanceof ChainRevertError
+          ? contractPayDenial(failure.reason)
+          : null;
       if (
-        failure instanceof ChainRevertError &&
-        failure.reason === "insufficient" &&
+        provenDenial &&
         payment.status === "settling" &&
         !payment.settlementTx
       ) {
         try {
-          const explanation =
-            "The Agent Wallet does not hold enough confirmed funds.";
+          const explanation = denial(provenDenial.rule).user_explanation;
+          recordContractDenial(payment, provenDenial.checkReason);
           payment.decision = DecisionSchema.parse({
             ...payment.decision,
             outcome: "DENIED",
             user_explanation: explanation,
           });
           payment.receipt = await makeReceipt(payment, "DENIED");
-          payment.denialError = denial("insufficient_wallet_funds");
+          if (payment.review && mandate.status === "active")
+            await deps.releaseMandate(mandate);
+          payment.denialError = denial(provenDenial.rule);
           payment.status = "denied";
           mandate.in_flight_payment_id = null;
+          if (payment.review) mandate.status = "cancelled";
           persist();
           return {
             statusCode: 403,
@@ -1438,12 +2551,17 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     }
     if (entry.paymentId) {
       const payment = payments.get(entry.paymentId);
-      if (payment?.status === "awaiting_user")
+      if (payment?.status === "awaiting_user") {
         await settle(
           payment,
           "DENIED",
           `Approval timed out after ${ttl} seconds.`,
         );
+        if (payment.review) {
+          const mandate = mandates.get(payment.mandateId);
+          if (mandate?.status === "cancelled") mandate.status = "expired";
+        }
+      }
     }
   }
 
@@ -1465,6 +2583,25 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       summary: `DENIED before a verified payment request: ${code}`,
       data,
     });
+    if (
+      typeof data.merchant_id === "string" &&
+      typeof data.order_id === "string"
+    )
+      recordRiskAttempt(agent.agent_id, data.merchant_id, data.order_id);
+    if (
+      [
+        "mandate_not_found",
+        "mandate_budget_exceeded",
+        "merchant_outside_mandate",
+        "category_outside_mandate",
+        "variant_sku_mismatch",
+      ].includes(code)
+    )
+      await flagTrust(
+        agent,
+        `attempt:${String(data.merchant_id ?? "unknown")}:${String(data.order_id ?? sha256(data))}`,
+        `Verified payment attempt outside mandate or hard policy: ${code}`,
+      );
     if (statusCode === 403 && code === "merchant_unknown")
       return agentDenied("merchant_unknown");
     if (statusCode === 403 && code === "variant_sku_mismatch")
@@ -1479,6 +2616,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     raw: unknown,
     request?: FastifyRequest,
   ): Promise<Response> {
+    const blocked = await policyGuard(agent.user_id);
+    if (blocked) return blocked;
     if (deps.walletFunding && balanceChangePending(agent.user_id))
       return error("reconciliation_required", 503);
     const parsed = CreatePaymentRequestSchema.safeParse(raw);
@@ -1517,9 +2656,16 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         }),
       };
     }
+    const composite =
+      mandate.status === "pending_checkout" &&
+      mandate.approval_timing === "payment";
+    if (mandate.status === "pending_checkout" && !composite)
+      return agentDenied("mandate_not_found");
     if (mandate.status === "cancelled") return agentDenied("mandate_cancelled");
     if (mandate.status === "exhausted") return agentDenied("mandate_exhausted");
     if (mandate.status === "expired") return agentDenied("mandate_expired");
+    if (mandate.approval_timing === "payment" && !composite)
+      return error("mandate_in_flight", 409);
     const window = mandate.constraints.find(
       (constraint) => constraint.type === "execution_window",
     );
@@ -1628,6 +2774,29 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         reason: "merchant_nonce_reused",
       });
     usedMerchantNonces.add(nonceKey);
+    const priorHour = now().getTime() - 3_600_000;
+    const earlierPaymentAttemptsHour = riskAttempts.filter(
+      (item) =>
+        item.agentId === agent.agent_id && Date.parse(item.at) >= priorHour,
+    ).length;
+    const paidWithoutTime = [...payments.values()].some(
+      (item) =>
+        item.agentId === agent.agent_id &&
+        item.status === "paid" &&
+        !item.paidAt,
+    );
+    const earlierPaidOrdersHour = [...payments.values()].filter(
+      (item) =>
+        item.agentId === agent.agent_id &&
+        item.status === "paid" &&
+        item.paidAt &&
+        Date.parse(item.paidAt) >= priorHour,
+    ).length;
+    recordRiskAttempt(
+      agent.agent_id,
+      paymentRequest.merchant_id,
+      paymentRequest.order_id,
+    );
 
     const paymentId = id("pay");
     if (request) {
@@ -1637,43 +2806,37 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     }
     mandate.in_flight_payment_id = paymentId;
     try {
+      const railCheck: Check = {
+        name: "rail_validation",
+        result: merchant.honeypot ? "deny" : "pass",
+        detail: {
+          merchant_verified: merchant.name,
+          category: merchant.category,
+          honeypot: merchant.honeypot,
+          ...(merchant.honeypot ? { reason: "fire_drill_decoy" } : {}),
+        },
+      };
       const checks: Check[] = [
         { name: "agent_auth", result: "pass" },
-        {
-          name: "rail_validation",
-          result: merchant.honeypot ? "deny" : "pass",
-          detail: {
-            merchant_verified: merchant.name,
-            category: merchant.category,
-            honeypot: merchant.honeypot,
-            ...(merchant.honeypot ? { reason: "fire_drill_decoy" } : {}),
-          },
-        },
+        railCheck,
       ];
       const mandateCheck: Check = checks.some(
         (check) => check.result === "deny",
       )
         ? { name: "mandate", result: "skipped" }
-        : checkMandate(mandate, paymentRequest, merchant, now());
+        : await checkVerifiedMandateProduct(
+            mandate,
+            paymentRequest,
+            merchant,
+            composite,
+          );
       checks.push(mandateCheck);
       let policyCheck: Check = checks.some((check) => check.result === "deny")
         ? { name: "policy_licence", result: "skipped" }
         : { name: "policy_licence", result: "pass" };
       if (policyCheck.result !== "skipped") {
-        const paid = [...payments.values()].filter(
-          (item) => item.userId === agent.user_id && item.status === "paid",
-        );
-        const paidToday = paid
-          .filter(
-            (item) => now().getTime() - Date.parse(item.createdAt) < 86_400_000,
-          )
-          .reduce((sum, item) => sum + item.request.amount.amount, 0);
-        const paidMonth = paid
-          .filter(
-            (item) =>
-              now().getTime() - Date.parse(item.createdAt) < 31 * 86_400_000,
-          )
-          .reduce((sum, item) => sum + item.request.amount.amount, 0);
+        const { spentToday: paidToday, spentMonth: paidMonth } =
+          await spentInPolicyWindows(agent.user_id);
         policyCheck = checkPolicy(
           agent,
           policy,
@@ -1720,6 +2883,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
               merchant,
               paymentRequest,
               priceEvidence: body.price_evidence,
+              historyKnown:
+                riskHistoryKnownAgents.has(agent.agent_id) && !paidWithoutTime,
+              earlierPaidOrdersHour,
+              earlierPaymentAttemptsHour,
+              ownerAutoApproveBelow: policy.auto_approve_below.amount,
             });
             if (!["pass", "step_up", "deny"].includes(assessment.result))
               throw new Error("Invalid risk result");
@@ -1750,6 +2918,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       let guardianExplanation = "All verified checks passed.";
       if (!checks.some((check) => check.result === "deny")) {
         const shouldRun =
+          composite ||
+          agent.licence.level === "GREEN" ||
           mandate.intent_level !== "listing" ||
           riskCheck.result === "step_up" ||
           riskSignals.length > 0;
@@ -1789,13 +2959,37 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
               }),
             ]);
             const verdict = GuardianVerdictSchema.parse(result);
-            guardianCheck = { name: "guardian", result: verdict.verdict };
+            if (
+              (verdict.verdict === "deny" &&
+                verdict.reason_code !== "intent_mismatch" &&
+                verdict.reason_code !== "other") ||
+              (verdict.verdict !== "deny" && verdict.reason_code !== "none")
+            )
+              throw new Error("Unclassified Guardian verdict");
+            guardianCheck = {
+              name: "guardian",
+              result: verdict.verdict,
+              detail: {
+                explanation: verdict.user_explanation,
+                ...(verdict.verdict === "deny"
+                  ? { reason: verdict.reason_code }
+                  : {}),
+                ...(verdict.verdict === "step_up" &&
+                verdict.reasons.includes("guardian_unavailable")
+                  ? { reason: "guardian_unavailable" }
+                  : {}),
+              },
+            };
             guardianExplanation = verdict.user_explanation;
           } catch {
             guardianCheck = {
               name: "guardian",
               result: "step_up",
-              detail: { reason: "guardian_unavailable" },
+              detail: {
+                reason: "guardian_unavailable",
+                explanation:
+                  "We could not confirm the purchase intent. Please review it.",
+              },
             };
             guardianExplanation =
               "We could not confirm the purchase intent. Please review it.";
@@ -1805,6 +2999,38 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         }
       }
       checks.push(guardianCheck);
+      if (composite && !checks.some((check) => check.result === "deny")) {
+        if (!deps.preflightPayment) {
+          usedMerchantNonces.delete(nonceKey);
+          mandate.in_flight_payment_id = null;
+          return error("chain_unavailable", 503);
+        }
+        try {
+          await deps.preflightPayment({
+            paymentId,
+            mandate,
+            request: paymentRequest,
+            merchant,
+          });
+          railCheck.detail = { ...railCheck.detail, contract_simulated: true };
+        } catch (failure) {
+          const provenDenial =
+            failure instanceof ChainRevertError
+              ? contractPayDenial(failure.reason)
+              : null;
+          if (!provenDenial) {
+            usedMerchantNonces.delete(nonceKey);
+            mandate.in_flight_payment_id = null;
+            return error("chain_unavailable", 503);
+          }
+          railCheck.result = "deny";
+          railCheck.detail = {
+            ...railCheck.detail,
+            reason: provenDenial.checkReason,
+            contract_simulated: true,
+          };
+        }
+      }
       const result = strictest(
         checks
           .filter((check) => check.result !== "skipped")
@@ -1813,14 +3039,36 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       const outcome =
         result === "deny"
           ? "DENIED"
-          : result === "step_up"
+          : result === "step_up" ||
+              agent.licence.level !== "GREEN" ||
+              guardianCheck.result !== "pass"
             ? "STEP_UP"
             : "APPROVED";
       const deniedReason = checks.find((check) => check.result === "deny")
         ?.detail?.reason;
+      if (merchant.honeypot && activeDrill) {
+        await recordTrustEvent(
+          agent,
+          "drill_failed",
+          `${activeDrill.drillId}:${paymentRequest.merchant_id}:${paymentRequest.order_id}`,
+          "Verified active fire-drill decoy payment attempt",
+          "RED",
+        );
+      } else if (
+        result === "deny" &&
+        (mandateCheck.result === "deny" || policyCheck.result === "deny")
+      ) {
+        await flagTrust(
+          agent,
+          `payment:${paymentRequest.merchant_id}:${paymentRequest.order_id}`,
+          `Verified payment outside mandate or hard policy: ${String(deniedReason ?? "denied")}`,
+        );
+      }
       const explanation =
         outcome === "DENIED"
-          ? `Blocked by ${String(deniedReason ?? "verified policy")}.`
+          ? guardianCheck.result === "deny"
+            ? denialFromChecks(checks).user_explanation
+            : `Blocked by ${String(deniedReason ?? "verified policy")}.`
           : outcome === "STEP_UP"
             ? "Please review this payment in the WeBank app."
             : guardianExplanation;
@@ -1829,12 +3077,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         decision_id: id("dec"),
         payment_id: paymentId,
         outcome,
-        autonomy_level:
-          agent.licence.level === "FULL"
-            ? "L3"
-            : agent.licence.level === "P"
-              ? "L1"
-              : "L0",
+        autonomy_level: agent.licence.level === "GREEN" ? "L1" : "L0",
         checks,
         risk_signals: riskSignals,
         user_explanation: explanation,
@@ -1842,6 +3085,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       });
       const payment: StoredPayment = {
         paymentId,
+        ...(composite ? { paymentUri: body.payment_request } : {}),
         deployment: deps.stateContext,
         mandateId: mandate.mandate_id,
         agentId: agent.agent_id,
@@ -1853,31 +3097,84 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         createdAt: now().toISOString(),
       };
       payments.set(paymentId, payment);
-      if (outcome === "DENIED") return settle(payment, "DENIED", explanation);
-      if (outcome === "APPROVED")
+      if (outcome === "DENIED") {
+        const denied = await settle(payment, "DENIED", explanation);
+        if (composite && denied.statusCode < 500) mandate.status = "cancelled";
+        return denied;
+      }
+      if (outcome === "APPROVED") {
+        if (composite) {
+          mandate.status = "active";
+          mandate.approved_by = "auto_threshold";
+          let reserved = false;
+          try {
+            reserved = await deps.reserveMandate(mandate);
+          } catch {
+            /* fail closed */
+          }
+          if (!reserved) {
+            mandate.status = "pending_checkout";
+            mandate.approved_by = null;
+            payment.status = "denied";
+            mandate.in_flight_payment_id = null;
+            return agentDenied("insufficient_reserved_funds");
+          }
+          try {
+            await writeAudit({
+              kind: "mandate",
+              actor: agent.agent_id,
+              subjectId: mandate.mandate_id,
+              summary: "Green owner-threshold checkout activation",
+              data: { mandate, payment_id: paymentId, decision },
+            });
+          } catch {
+            await deps.releaseMandate(mandate);
+            mandate.status = "pending_checkout";
+            mandate.approved_by = null;
+            payment.status = "reconciliation_required";
+            return error("policy_denied", 503);
+          }
+        }
+        payment.approvalSource = "auto";
         return settle(payment, "APPROVED", explanation);
+      }
       const requestNumber = firstPayment
         ? randomInt(0, 1_000_000).toString().padStart(6, "0")
         : undefined;
-      const card = approvalCard(
-        "payment",
-        firstPayment ? "zero_trust" : "everyday",
-        paymentId,
-        `${agent.display_name} wants to pay ${paymentRequest.amount.amount / 100} ${paymentRequest.amount.currency}`,
-        [
-          `To: ${merchant.legal_name} (${merchant.uscc})`,
-          `For: ${paymentRequest.line_items
-            .filter((item) => item.type === "product")
-            .map((item) => `${item.qty} x ${item.name} (${item.variant})`)
-            .join(", ")}`,
-          `Delivery: ${(paymentRequest.line_items.find((item) => item.type === "shipping")?.unit_price.amount ?? 0) / 100} ${paymentRequest.amount.currency}`,
-          `Why asking: ${checks
-            .filter((check) => check.result === "step_up")
-            .map((check) => check.name)
-            .join(", ")}`,
-        ],
-        { paymentId, mandateId: mandate.mandate_id, paymentRequest, decision },
-      );
+      const cardLines = [
+        `To: ${merchant.legal_name} (${merchant.uscc})`,
+        `For: ${paymentRequest.line_items
+          .filter((item) => item.type === "product")
+          .map((item) => `${item.qty} x ${item.name} (${item.variant})`)
+          .join(", ")}`,
+        `Delivery: ${(paymentRequest.line_items.find((item) => item.type === "shipping")?.unit_price.amount ?? 0) / 100} ${paymentRequest.amount.currency}`,
+        `Why asking: ${checks
+          .filter((check) => check.result === "step_up")
+          .map((check) => check.name)
+          .join(", ")}`,
+      ];
+      const card = composite
+        ? compositePaymentCard(
+            agent,
+            mandate,
+            payment,
+            body.payment_request,
+            cardLines,
+            firstPayment,
+          )
+        : approvalCard(
+            "payment",
+            firstPayment ? "zero_trust" : "everyday",
+            paymentId,
+            `${agent.display_name} wants to pay ${paymentRequest.amount.amount / 100} ${paymentRequest.amount.currency}`,
+            cardLines,
+            {
+              paymentId,
+              mandateId: mandate.mandate_id,
+              paymentRequest,
+              decision,
+            },
+          );
       payment.approvalId = card.approval_id;
       storeApproval({
         card,
@@ -1921,6 +3218,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   }
 
   async function createMandate(agent: Agent, raw: unknown): Promise<Response> {
+    const blocked = await policyGuard(agent.user_id);
+    if (blocked) return blocked;
     if (deps.walletFunding && balanceChangePending(agent.user_id))
       return error("reconciliation_required", 503);
     const parsed = CreateMandateRequestSchema.safeParse(raw);
@@ -1960,13 +3259,31 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     );
     if (blockedCategory)
       return agentDenied("category_blocked", { category: blockedCategory });
+    if (deps.walletFunding) {
+      let walletBalance: number;
+      try {
+        const snapshot = await deps.walletFunding.snapshot();
+        if (snapshot.walletFrozen) return error("policy_denied", 403);
+        walletBalance = safeFen(snapshot.walletBalance);
+      } catch {
+        return error("chain_unavailable", 503);
+      }
+      if (
+        walletBalance - reservedWalletFunds(agent.user_id) <
+        budget.max.amount
+      )
+        return agentDenied("insufficient_reserved_funds");
+    }
     const autoCap =
-      agent.licence.level === "L"
-        ? 0
-        : agent.licence.level === "P"
-          ? Math.min(10_000, policy.auto_approve_below.amount)
-          : policy.auto_approve_below.amount;
+      agent.licence.level === "GREEN" ? policy.auto_approve_below.amount : 0;
+    const oneTime =
+      recurrence.frequency === "NONE" && recurrence.max_occurrences === 1;
+    const approvalTiming =
+      parsed.data.approval_timing ?? (oneTime ? "payment" : "upfront");
+    if (approvalTiming === "payment" && !oneTime)
+      return error("invalid_mandate", 400);
     const auto =
+      approvalTiming === "upfront" &&
       autoCap > 0 &&
       budget.max.amount <= autoCap &&
       amountRange.max.amount <= autoCap &&
@@ -1979,10 +3296,16 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       agent_key_binding: agent.public_key,
       description: parsed.data.description,
       intent_level: parsed.data.intent_level,
+      approval_timing: approvalTiming,
       user_text: parsed.data.user_text,
       user_text_source: "agent_reported",
       constraints,
-      status: auto ? "active" : "pending_user",
+      status:
+        approvalTiming === "payment"
+          ? "pending_checkout"
+          : auto
+            ? "active"
+            : "pending_user",
       spent: { amount: 0, currency: budget.max.currency },
       occurrences: 0,
       in_flight_payment_id: null,
@@ -1991,6 +3314,13 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     });
     if (!mandateResult.success) return error("invalid_mandate", 400);
     const mandate = mandateResult.data;
+    if (approvalTiming === "payment") {
+      mandates.set(mandateId, mandate);
+      return {
+        statusCode: 201,
+        body: CreateMandateResponseSchema.parse({ mandate }),
+      };
+    }
     if (auto) {
       let reserved: boolean;
       try {
@@ -2018,7 +3348,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       };
     }
     const firstMandate =
-      agent.licence.level === "L" &&
+      agent.licence.level === "AMBER" &&
       ![...mandates.values()].some(
         (item) => item.agent_id === agent.agent_id && item.approved_by !== null,
       );
@@ -2110,6 +3440,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       }
       return { statusCode: 200, body: { approval: entry.card } };
     }
+    const blocked = await policyGuard(userId);
+    if (blocked) return blocked;
     if (!demoProofAvailable) return error("policy_denied", 503);
     if (parsed.data.verification?.action_hash !== entry.card.payload_hash)
       return error("bad_signature", 401);
@@ -2161,6 +3493,150 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     if (!verifiedBy) return error("bad_signature", 401);
     await expireApproval(entry);
     if (entry.card.status !== "pending") return error("policy_denied", 403);
+    if (entry.paymentId) {
+      const payment = payments.get(entry.paymentId);
+      if (payment?.review) {
+        if (deps.walletFunding && balanceChangePending(userId))
+          return error("reconciliation_required", 503);
+        const mandate = mandates.get(payment.mandateId);
+        if (
+          !mandate ||
+          payment.status !== "awaiting_user" ||
+          !compositeReviewStillMatches(entry, payment, mandate)
+        )
+          return error("action_changed", 409);
+        const agent = agents.get(payment.agentId);
+        const policy = policies.get(userId);
+        const merchant = await deps.lookupMerchant(
+          payment.merchant.merchant_id,
+        );
+        const { spentToday, spentMonth } = await spentInPolicyWindows(userId);
+        if (
+          agent?.status !== "active" ||
+          replacingAgents.has(payment.agentId) ||
+          agent.licence.level === "RED" ||
+          trustPending.has(payment.agentId) ||
+          !policy ||
+          !merchant ||
+          merchant.public_key !== payment.merchant.public_key ||
+          merchant.payout !== payment.merchant.payout ||
+          merchant.legal_name !== payment.merchant.legal_name ||
+          merchant.uscc !== payment.merchant.uscc ||
+          merchant.honeypot ||
+          Date.parse(payment.request.expires_at) <= now().getTime() ||
+          orderCommitted(
+            payment.request.merchant_id,
+            payment.request.order_id,
+            payment.paymentId,
+          ) ||
+          (
+            await checkVerifiedMandateProduct(
+              mandate,
+              payment.request,
+              merchant,
+              true,
+            )
+          ).result === "deny" ||
+          checkPolicy(
+            agent,
+            policy,
+            payment.request,
+            merchant,
+            spentToday,
+            spentMonth,
+          ).result === "deny"
+        ) {
+          entry.card.status = "rejected";
+          await settle(
+            payment,
+            "DENIED",
+            "The checkout or wallet rules changed before approval.",
+          );
+          return error("policy_denied", 403, payment.decision.decision_id);
+        }
+        if (!deps.preflightPayment) return error("chain_unavailable", 503);
+        try {
+          await deps.preflightPayment({
+            paymentId: payment.paymentId,
+            mandate,
+            request: payment.request,
+            merchant: payment.merchant,
+          });
+        } catch (failure) {
+          const provenDenial =
+            failure instanceof ChainRevertError
+              ? contractPayDenial(failure.reason)
+              : null;
+          if (!provenDenial) return error("chain_unavailable", 503);
+          recordContractDenial(payment, provenDenial.checkReason);
+          entry.card.status = "rejected";
+          emitEvent(userId, "approval.resolved", {
+            approval_id: entry.card.approval_id,
+            status: "rejected",
+          });
+          const denied = await settle(
+            payment,
+            "DENIED",
+            denial(provenDenial.rule).user_explanation,
+            provenDenial.rule,
+          );
+          if (denied.statusCode >= 500) return denied;
+          return agentDenied(provenDenial.rule);
+        }
+        mandate.status = "active";
+        mandate.approved_by = verifiedBy;
+        mandate.user_text_source = "webank_screen";
+        let reserved: boolean;
+        try {
+          reserved = await deps.reserveMandate(mandate);
+        } catch {
+          mandate.status = "pending_checkout";
+          mandate.approved_by = null;
+          mandate.user_text_source = "agent_reported";
+          return error("chain_unavailable", 503);
+        }
+        if (!reserved) {
+          mandate.status = "pending_checkout";
+          mandate.approved_by = null;
+          mandate.user_text_source = "agent_reported";
+          const denied = await settle(
+            payment,
+            "DENIED",
+            "The Agent Wallet does not have enough unreserved funds.",
+            "insufficient_reserved_funds",
+          );
+          if (denied.statusCode >= 500) return denied;
+          entry.card.status = "rejected";
+          emitEvent(userId, "approval.resolved", {
+            approval_id: entry.card.approval_id,
+            status: "rejected",
+          });
+          return agentDenied("insufficient_reserved_funds");
+        }
+        try {
+          await writeAudit({
+            kind: "mandate",
+            actor: userId,
+            subjectId: mandate.mandate_id,
+            summary: "Owner-approved checkout-bound mandate activated",
+            data: {
+              mandate,
+              original_intent_hash:
+                payment.review.mandate_snapshot.canonical_hash,
+              approval_id: entry.card.approval_id,
+              approval_payload_hash: entry.card.payload_hash,
+              payment_id: payment.paymentId,
+            },
+          });
+        } catch {
+          await deps.releaseMandate(mandate);
+          mandate.status = "pending_checkout";
+          mandate.approved_by = null;
+          mandate.user_text_source = "agent_reported";
+          return error("policy_denied", 503);
+        }
+      }
+    }
     if (entry.mandateId) {
       if (deps.walletFunding && balanceChangePending(userId))
         return error("reconciliation_required", 503);
@@ -2255,7 +3731,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       const merchant = await deps.lookupMerchant(payment.merchant.merchant_id);
       if (
         agent?.status !== "active" ||
-        agent.licence.level === "SUSPENDED" ||
+        agent.licence.level === "RED" ||
+        trustPending.has(payment.agentId) ||
         !mandate ||
         mandate.status !== "active" ||
         !policy ||
@@ -2273,20 +3750,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         );
         return error("policy_denied", 403, payment.decision.decision_id);
       }
-      const paid = [...payments.values()].filter(
-        (item) => item.userId === userId && item.status === "paid",
-      );
-      const spentToday = paid
-        .filter(
-          (item) => now().getTime() - Date.parse(item.createdAt) < 86_400_000,
-        )
-        .reduce((sum, item) => sum + item.request.amount.amount, 0);
-      const spentMonth = paid
-        .filter(
-          (item) =>
-            now().getTime() - Date.parse(item.createdAt) < 31 * 86_400_000,
-        )
-        .reduce((sum, item) => sum + item.request.amount.amount, 0);
+      const { spentToday, spentMonth } = await spentInPolicyWindows(userId);
       if (
         checkPolicy(
           agent,
@@ -2306,6 +3770,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         return error("policy_denied", 403, payment.decision.decision_id);
       }
       entry.card.status = "approved";
+      payment.approvalSource = "owner";
       const response = await settle(
         payment,
         "APPROVED",
@@ -2336,6 +3801,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   app.post("/v1/oauth/device_authorization", async (request, reply) => {
     const parsed = DeviceAuthorizationRequestSchema.safeParse(request.body);
     if (!parsed.success)
+      return reply.code(400).send({ error: "invalid_request" });
+    if (
+      parsed.data.client_app_id !==
+      `app_${createHash("sha256").update(parsed.data.client_app_name, "utf8").digest("hex")}`
+    )
       return reply.code(400).send({ error: "invalid_request" });
     let keyValid = false;
     try {
@@ -2372,6 +3842,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       [
         `Agent request: ${parsed.data.client_name}`,
         `Provider claim: ${parsed.data.provider}`,
+        `Client app: ${parsed.data.client_app_name}`,
+        `Client app ID: ${parsed.data.client_app_id}`,
         `Requested scopes: ${parsed.data.requested_scopes.join(", ")}`,
         `Public key: ${parsed.data.agent_public_key}`,
       ],
@@ -2379,6 +3851,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         userCode,
         client_name: parsed.data.client_name,
         provider: parsed.data.provider,
+        client_app_id: parsed.data.client_app_id,
+        client_app_name: parsed.data.client_app_name,
         agent_public_key: parsed.data.agent_public_key,
         requested_scopes: parsed.data.requested_scopes,
       },
@@ -2391,6 +3865,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       card,
       clientName: parsed.data.client_name,
       provider: parsed.data.provider,
+      clientAppId: parsed.data.client_app_id,
+      clientAppName: parsed.data.client_app_name,
       publicKey: parsed.data.agent_public_key,
       scopes: parsed.data.requested_scopes,
       expiresAt: now().getTime() + 600_000,
@@ -2428,8 +3904,14 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         now().getTime(),
       );
       const agent = agentId ? agents.get(agentId) : null;
-      if (agent?.status !== "active" || agent.licence.level === "SUSPENDED")
+      if (
+        agent?.status !== "active" ||
+        agent.deleted_at ||
+        agent.licence.level === "RED"
+      )
         return reply.code(400).send({ error: "invalid_grant" });
+      if (idleRequired(agent))
+        return send(reply, error("reauthorization_required", 401));
       const rotated = agentAuth.rotate(
         parsed.data.refresh_token,
         now().getTime(),
@@ -2496,13 +3978,15 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     if ("error" in auth) return send(reply, error(auth.error, 401));
     const agent = auth.agent;
     const state =
-      agent.status === "revoked"
+      agent.status === "revoked" || agent.deleted_at
         ? "revoked"
         : agent.status === "frozen"
           ? "frozen"
-          : agent.licence.level === "SUSPENDED"
-            ? "suspended"
-            : "connected";
+          : agent.licence.level === "RED"
+            ? "red"
+            : idleRequired(agent)
+              ? "reauthorization_required"
+              : "connected";
     let accessTokenValid = agentAuth.hasAccess(
       request.headers.authorization?.match(/^Bearer ([A-Za-z0-9_-]+)$/)?.[1],
       agent.agent_id,
@@ -2519,6 +4003,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return reply.send({
       state,
       agent_id: agent.agent_id,
+      client_app_id: agent.client_app_id ?? null,
+      client_app_name: agent.client_app_name ?? null,
+      last_used_at: agent.last_used_at,
+      idle_expires_at: idleExpiresAt(agent),
       access_token_valid: accessTokenValid,
       licence: agent.licence,
       active_mandates: [...mandates.values()]
@@ -2528,6 +4016,67 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         )
         .map((item) => item.mandate_id),
     });
+  });
+
+  app.post("/v1/agent/session/renew", async (request, reply) => {
+    if (request.headers.authorization)
+      return send(reply, error("bad_signature", 401));
+    if (
+      !request.body ||
+      typeof request.body !== "object" ||
+      Array.isArray(request.body) ||
+      Object.keys(request.body).length !== 0
+    )
+      return send(reply, error("invalid_request", 400));
+    const auth = agentAuth.verify(
+      request,
+      rawBodies.get(request) ?? Buffer.alloc(0),
+      agents,
+      now().getTime(),
+      true,
+    );
+    if ("error" in auth) return send(reply, error(auth.error, 401));
+    const agent = auth.agent;
+    if (
+      agent.status !== "active" ||
+      agent.deleted_at ||
+      agent.licence.level === "RED" ||
+      replacingAgents.has(agent.agent_id)
+    )
+      return send(reply, error("agent_frozen", 401));
+    const renewal = idleRenewals.get(agent.agent_id);
+    if (
+      !renewal ||
+      renewal.consumed ||
+      renewal.expiresAt <= now().getTime() ||
+      renewal.publicKey !== agent.public_key ||
+      !idleRequired(agent)
+    )
+      return send(reply, error("action_changed", 409));
+    const oldAuth = agentAuth.snapshot();
+    const oldLastUsedAt = agent.last_used_at;
+    renewal.consumed = true;
+    agentAuth.revokeAgent(agent.agent_id);
+    agent.last_used_at = now().toISOString();
+    const tokens = TokenResponseSchema.parse(
+      agentAuth.issue(agent.agent_id, now().getTime()),
+    );
+    try {
+      persist();
+    } catch (failure) {
+      renewal.consumed = false;
+      agent.last_used_at = oldLastUsedAt;
+      agentAuth.restore(oldAuth);
+      app.log.error(
+        { err: failure, agentId: agent.agent_id },
+        "Idle renewal persistence failed",
+      );
+      return send(reply, error("service_unavailable", 503));
+    }
+    emitEvent(agent.user_id, "agent.idle_reauthorized", {
+      agent_id: agent.agent_id,
+    });
+    return reply.send(tokens);
   });
 
   app.post("/v1/agent/session/revoke", async (request, reply) => {
@@ -2547,6 +4096,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           const rePair =
             (request.body as { re_pair?: unknown } | null)?.re_pair === true;
           agent.status = "revoked";
+          invalidateIdleRecovery(agent.agent_id);
           agentAuth.revokeAgent(agent.agent_id);
           if (!(await cancelRevokedAgentMandates(agent, "agent_disconnected")))
             return error("service_unavailable", 503);
@@ -2669,12 +4219,40 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         await idem(userId, request, async () => {
           const pairing = pairingByUserCode.get(request.params.userCode);
           if (
+            pairing?.status === "processing" &&
+            pairing.userId === userId &&
+            pairing.agentId
+          ) {
+            const recovering = agents.get(pairing.agentId);
+            if (!recovering) return error("reconciliation_required", 503);
+            try {
+              await recordTrustEvent(
+                recovering,
+                "transition",
+                `initial-amber:${pairing.deviceCode}`,
+                "New paired agent registered Amber",
+                "AMBER",
+                true,
+              );
+              recovering.status = "active";
+              riskHistoryKnownAgents.add(recovering.agent_id);
+              pairing.status = "approved";
+              pairing.card.status = "approved";
+              persist();
+              return { statusCode: 200, body: { agent: recovering } };
+            } catch {
+              return error("reconciliation_required", 503);
+            }
+          }
+          if (
             !pairing ||
             pairing.expiresAt <= now().getTime() ||
             pairing.status !== "pending"
           )
             return error("policy_denied", 403);
           if (pairing.userId !== userId) return error("policy_denied", 403);
+          if (!pairing.clientAppId || !pairing.clientAppName)
+            return error("action_changed", 409);
           ensureIndependentPairing(pairing);
           if (!demoProofAvailable) return error("policy_denied", 503);
           const parsed = ApprovalDecisionRequestSchema.safeParse({
@@ -2726,15 +4304,20 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             user_id: userId,
             display_name: pairing.clientName,
             provider: pairing.provider,
+            client_app_id: pairing.clientAppId,
+            client_app_name: pairing.clientAppName,
             public_key: pairing.publicKey,
             scopes: pairing.scopes,
             licence: {
-              level: "L",
-              points: 0,
+              level: "AMBER",
               clean_purchases: 0,
               drills_passed: 0,
+              drills_failed: 0,
+              flags_30d: 0,
+              reason: "New agent, no history yet",
+              updated_at: now().toISOString(),
             },
-            status: "active",
+            status: "frozen",
             lineage: {
               root_agent_id: agentId,
               replaces_agent_id: null,
@@ -2742,7 +4325,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             },
             deleted_at: null,
             created_at: now().toISOString(),
-            last_used_at: null,
+            last_used_at: now().toISOString(),
           });
           try {
             await writeAudit({
@@ -2757,6 +4340,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
                 agent_id: agentId,
                 key: pairing.publicKey,
                 scopes: pairing.scopes,
+                client_app_id: pairing.clientAppId,
+                client_app_name: pairing.clientAppName,
                 replaces_agent_id: null,
                 prior_key_revoked: false,
               },
@@ -2771,6 +4356,25 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           }
           agents.set(agentId, record);
           pairing.agentId = agentId;
+          persist();
+          try {
+            await recordTrustEvent(
+              record,
+              "transition",
+              `initial-amber:${pairing.deviceCode}`,
+              "New paired agent registered Amber",
+              "AMBER",
+              true,
+            );
+          } catch (failure) {
+            app.log.error(
+              { failure, userCode: pairing.userCode },
+              "Initial Amber registry write requires reconciliation",
+            );
+            return error("service_unavailable", 503);
+          }
+          record.status = "active";
+          riskHistoryKnownAgents.add(record.agent_id);
           pairing.status = "approved";
           pairing.card.status = "approved";
           emitEvent(userId, "approval.resolved", {
@@ -2832,7 +4436,17 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       const mandate = mandates.get(request.params.id);
       if (!mandate || mandate.agent_id !== auth.agent.agent_id)
         return send(reply, agentDenied("mandate_not_found"));
-      return reply.send(MandateResponseSchema.parse({ mandate }));
+      const window = mandate.constraints.find(
+        (constraint) => constraint.type === "execution_window",
+      );
+      const reported =
+        (mandate.status === "active" ||
+          mandate.status === "pending_checkout") &&
+        window &&
+        Date.parse(window.not_after) <= now().getTime()
+          ? { ...mandate, status: "expired" as const }
+          : mandate;
+      return reply.send(MandateResponseSchema.parse({ mandate: reported }));
     },
   );
 
@@ -2932,6 +4546,308 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     },
   );
 
+  app.get("/v1/app/policy", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const policy = policies.get(userId);
+    if (!policy) return send(reply, error("not_found", 404));
+    if (!deps.policyCaps)
+      return reply.send({
+        policy,
+        policy_hash: policyHash(policy),
+        contract: null,
+        sync_status: "chain_unavailable",
+      });
+    try {
+      const caps = await deps.policyCaps.read();
+      return reply.send({
+        policy,
+        policy_hash: policyHash(policy),
+        contract: capsPublic(caps),
+        sync_status: policyChangePending(userId)
+          ? "change_pending"
+          : capsMatchPolicy(caps, policy)
+            ? "consistent"
+            : "mismatch",
+      });
+    } catch {
+      return reply.send({
+        policy,
+        policy_hash: policyHash(policy),
+        contract: null,
+        sync_status: "chain_unavailable",
+      });
+    }
+  });
+
+  app.post("/v1/app/policy/prepare", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        const policy = policies.get(userId);
+        if (!policy || !deps.policyCaps || !walletDeployment)
+          return error("chain_unavailable", 503);
+        if (policyChangePending(userId))
+          return error("reconciliation_required", 503);
+        const body = request.body as Record<string, unknown> | null;
+        const proposed = body?.proposed as Record<string, unknown> | null;
+        if (
+          !proposed ||
+          typeof proposed !== "object" ||
+          Array.isArray(proposed) ||
+          Object.keys(proposed).sort().join(",") !==
+            "auto_approve_below,daily_max,monthly_max,per_payment_max"
+        )
+          return error("invalid_request", 400);
+        const next = PolicySchema.safeParse({ ...policy, ...proposed });
+        if (!next.success) return error("invalid_request", 400);
+        const limits: PolicyLimits = {
+          per_payment_max: next.data.per_payment_max,
+          daily_max: next.data.daily_max,
+          monthly_max: next.data.monthly_max,
+          auto_approve_below: next.data.auto_approve_below,
+        };
+        const {
+          per_payment_max: per,
+          daily_max: day,
+          monthly_max: month,
+          auto_approve_below: auto,
+        } = limits;
+        if (
+          per.amount <= 0 ||
+          per.amount > day.amount ||
+          day.amount > month.amount ||
+          auto.amount < 0 ||
+          auto.amount > per.amount
+        )
+          return error("invalid_request", 400);
+        let caps: PolicyCapsSnapshot;
+        try {
+          caps = await deps.policyCaps.read();
+        } catch {
+          return error("chain_unavailable", 503);
+        }
+        const baseCaps = {
+          perPayment: safeFen(caps.perPaymentCap),
+          daily: safeFen(caps.dailyCap),
+          monthly: safeFen(caps.monthlyCap),
+        };
+        const expectedCaps = {
+          per_payment_max: walletMoney(baseCaps.perPayment),
+          daily_max: walletMoney(baseCaps.daily),
+          monthly_max: walletMoney(baseCaps.monthly),
+        };
+        if (body?.expected_contract_caps === undefined)
+          return error("invalid_request", 400);
+        if (
+          !capsMatchPolicy(caps, policy) ||
+          body?.expected_policy_hash !== policyHash(policy) ||
+          body?.expected_contract_block !== caps.blockNumber.toString() ||
+          sha256(body?.expected_contract_caps) !== sha256(expectedCaps)
+        )
+          return error("action_changed", 409);
+        const changeId = id("pch");
+        const expiresAt = now().getTime() + 60_000;
+        const sessionBinding = appSessionBinding(request);
+        const actionHash = policyChangeHash({
+          userId,
+          sessionBinding,
+          changeId,
+          policyHash: policyHash(policy),
+          baseCaps,
+          baseBlock: caps.blockNumber.toString(),
+          proposed: limits,
+          deployment: walletDeployment,
+          expiresAt,
+        });
+        policyChanges.set(changeId, {
+          changeId,
+          userId,
+          sessionBinding,
+          policyHash: policyHash(policy),
+          baseCaps,
+          baseBlock: caps.blockNumber.toString(),
+          proposed: limits,
+          actionHash,
+          expiresAt,
+          deployment: walletDeployment,
+          status: "prepared",
+        });
+        persist();
+        return {
+          statusCode: 200,
+          body: {
+            change_id: changeId,
+            action_hash: actionHash,
+            expires_at: new Date(expiresAt).toISOString(),
+            current: policy,
+            proposed: limits,
+            requires_verification:
+              per.amount > policy.per_payment_max.amount ||
+              day.amount > policy.daily_max.amount ||
+              month.amount > policy.monthly_max.amount ||
+              auto.amount > policy.auto_approve_below.amount,
+            simulated: true,
+          },
+        };
+      }),
+    );
+  });
+
+  app.put("/v1/app/policy", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const key = request.headers["idempotency-key"];
+    if (typeof key !== "string" || !key || key.length > 255)
+      return send(reply, error("idempotency_conflict", 409));
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        const body = request.body as {
+          change_id?: unknown;
+          verification?: { action_hash?: unknown; device_signature?: unknown };
+        } | null;
+        const change =
+          typeof body?.change_id === "string"
+            ? policyChanges.get(body.change_id)
+            : undefined;
+        if (!change || change.userId !== userId)
+          return error("action_changed", 409);
+        const keyId = `${userId}:policy:${key}`;
+        const bodyHash = sha256(body);
+        const oldKey = policyKeys.get(keyId);
+        if (
+          oldKey &&
+          (oldKey.changeId !== change.changeId || oldKey.bodyHash !== bodyHash)
+        )
+          return error("idempotency_conflict", 409);
+        if (change.status === "confirmed") {
+          if (!oldKey) return error("action_changed", 409);
+          const policy = policies.get(userId);
+          if (!policy || !deps.policyCaps)
+            return error("chain_unavailable", 503);
+          try {
+            const caps = await deps.policyCaps.read();
+            if (!capsMatchPolicy(caps, policy))
+              return error("reconciliation_required", 503);
+            return {
+              statusCode: 200,
+              body: {
+                policy,
+                policy_hash: policyHash(policy),
+                contract: capsPublic(caps),
+                sync_status: "consistent",
+              },
+            };
+          } catch {
+            return error("chain_unavailable", 503);
+          }
+        }
+        if (change.status === "prepared") {
+          const policy = policies.get(userId);
+          if (
+            !policy ||
+            !deps.policyCaps ||
+            !walletDeployment ||
+            change.expiresAt <= now().getTime() ||
+            change.sessionBinding !== appSessionBinding(request) ||
+            change.deployment !== walletDeployment ||
+            change.actionHash !== policyChangeHash(change) ||
+            change.policyHash !== policyHash(policy) ||
+            policyChangePending(userId)
+          )
+            return error("action_changed", 409);
+          let caps: PolicyCapsSnapshot;
+          try {
+            caps = await deps.policyCaps.read();
+          } catch {
+            return error("chain_unavailable", 503);
+          }
+          if (
+            !capsMatchPolicy(caps, policy) ||
+            caps.blockNumber.toString() !== change.baseBlock ||
+            caps.perPaymentCap !== BigInt(change.baseCaps.perPayment) ||
+            caps.dailyCap !== BigInt(change.baseCaps.daily) ||
+            caps.monthlyCap !== BigInt(change.baseCaps.monthly)
+          )
+            return error("action_changed", 409);
+          const loosened =
+            change.proposed.per_payment_max.amount >
+              policy.per_payment_max.amount ||
+            change.proposed.daily_max.amount > policy.daily_max.amount ||
+            change.proposed.monthly_max.amount > policy.monthly_max.amount ||
+            change.proposed.auto_approve_below.amount >
+              policy.auto_approve_below.amount;
+          if (loosened) {
+            if (body?.verification?.action_hash !== change.actionHash)
+              return error("bad_signature", 401);
+            const card = approvalCard(
+              "policy_loosen",
+              "everyday",
+              change.changeId,
+              "Change Agent Wallet limits",
+              ["Confirm the exact new wallet limits"],
+              { actionHash: change.actionHash },
+            );
+            card.payload_hash = change.actionHash;
+            if (!(await verifyDemoProof(card, body.verification, userId)))
+              return error("bad_signature", 401);
+          }
+          let audit: AuditRecord;
+          try {
+            audit = await writeAudit({
+              kind: "policy_change",
+              actor: userId,
+              subjectId: change.changeId,
+              summary: "Owner changed Agent Wallet limits",
+              data: {
+                action_hash: change.actionHash,
+                session_binding: change.sessionBinding,
+                policy_hash: change.policyHash,
+                base_caps: change.baseCaps,
+                base_block: change.baseBlock,
+                proposed: change.proposed,
+                deployment: change.deployment,
+                expires_at: new Date(change.expiresAt).toISOString(),
+              },
+            });
+          } catch {
+            return error("chain_unavailable", 503);
+          }
+          change.auditHash = audit.record_hash;
+          change.status = "applying";
+          policyKeys.set(keyId, { bodyHash, changeId: change.changeId });
+          persist();
+        } else if (!oldKey) return error("action_changed", 409);
+        try {
+          await finishPolicyChange(change);
+        } catch {
+          return error("reconciliation_required", 503);
+        }
+        const policy = policies.get(userId);
+        const capReader = deps.policyCaps;
+        if (!policy || !capReader) return error("reconciliation_required", 503);
+        let caps: PolicyCapsSnapshot;
+        try {
+          caps = await capReader.read();
+        } catch {
+          return error("chain_unavailable", 503);
+        }
+        return {
+          statusCode: 200,
+          body: {
+            policy,
+            policy_hash: policyHash(policy),
+            contract: capsPublic(caps),
+            sync_status: "consistent",
+          },
+        };
+      }),
+    );
+  });
+
   app.get("/v1/app/approvals", async (request, reply) => {
     const userId = await appUser(request);
     if (!userId) return send(reply, error("bad_signature", 401));
@@ -2947,10 +4863,52 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       return send(reply, error("policy_denied", 400));
     const items = [...approvals.values()]
       .filter((entry) => entry.userId === userId)
-      .map((entry) => entry.card)
+      .map((entry) => {
+        const payment = entry.paymentId
+          ? payments.get(entry.paymentId)
+          : undefined;
+        const mandate = entry.mandateId
+          ? mandates.get(entry.mandateId)
+          : payment
+            ? mandates.get(payment.mandateId)
+            : undefined;
+        const agent = mandate ? agents.get(mandate.agent_id) : undefined;
+        return agent
+          ? {
+              ...entry.card,
+              trust_light: agent.licence.level,
+              trust_reason: agent.licence.reason,
+            }
+          : entry.card;
+      })
       .filter((card) => status === undefined || card.status === status);
     return reply.send({ items, next_cursor: null });
   });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/app/approvals/:id/review",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const entry = approvals.get(request.params.id);
+      if (!entry || entry.userId !== userId || !entry.paymentId)
+        return send(reply, error("not_found", 404));
+      const payment = payments.get(entry.paymentId);
+      if (entry.card.review_schema !== "payment_review.v1" || !payment?.review)
+        return send(reply, error("not_found", 404));
+      if (
+        entry.card.status !== "pending" ||
+        payment.status !== "awaiting_user" ||
+        Date.parse(entry.card.expires_at) <= now().getTime()
+      )
+        return send(reply, error("action_changed", 409));
+      const review = PaymentReviewSchema.parse(payment.review);
+      const mandate = mandates.get(payment.mandateId);
+      if (!mandate || !compositeReviewStillMatches(entry, payment, mandate))
+        return send(reply, error("action_changed", 409));
+      return reply.send(review);
+    },
+  );
 
   app.get("/v1/app/events", async (request, reply) => {
     const userId = await appUser(request);
@@ -2972,11 +4930,107 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   app.get("/v1/app/agents", async (request, reply) => {
     const userId = await appUser(request);
     if (!userId) return send(reply, error("bad_signature", 401));
-    const items = [...agents.values()].filter(
-      (agent) => agent.user_id === userId && !agent.deleted_at,
-    );
+    const items = [...agents.values()]
+      .filter((agent) => agent.user_id === userId && !agent.deleted_at)
+      .map(agentWithIdleState);
     return reply.send({ items, next_cursor: null });
   });
+
+  app.get<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/trust-events",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      const agent = agents.get(request.params.id);
+      if (!agent || agent.user_id !== userId)
+        return send(reply, error("not_found", 404));
+      const items = trustEvents.filter(
+        (item) => item.agent_id === agent.agent_id,
+      );
+      const legacyEvidence = agent.legacy_red_evidence
+        ? [agent.legacy_red_evidence]
+        : [];
+      return reply.send({
+        items,
+        legacy_evidence: legacyEvidence,
+        next_cursor: null,
+      });
+    },
+  );
+
+  app.get("/v1/app/demo/drills", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    if (!deps.demoTrustControlsEnabled)
+      return send(reply, error("not_found", 404));
+    return reply.send({
+      active: activeDrill !== null,
+      drill_id: activeDrill?.drillId ?? null,
+    });
+  });
+
+  for (const action of ["start", "stop"] as const) {
+    app.post(`/v1/app/demo/drills/${action}`, async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      if (!deps.demoTrustControlsEnabled || !deps.setDrillVisibility)
+        return send(reply, error("not_found", 404));
+      const synchronizeVisibility = deps.setDrillVisibility;
+      return send(
+        reply,
+        await idem(userId, request, () =>
+          serializePaymentSubmission(userId, async () => {
+            if (action === "start" && activeDrill)
+              return {
+                statusCode: 200,
+                body: { active: true, drill_id: activeDrill.drillId },
+              };
+            if (action === "stop" && !activeDrill)
+              return {
+                statusCode: 200,
+                body: { active: false, drill_id: null },
+              };
+            const next =
+              action === "start"
+                ? { drillId: id("drill"), startedAt: now().toISOString() }
+                : null;
+            const drillSubjectId = next?.drillId ?? activeDrill?.drillId;
+            if (!drillSubjectId) return error("action_changed", 409);
+            try {
+              await synchronizeVisibility(next !== null);
+            } catch {
+              return error("service_unavailable", 503);
+            }
+            try {
+              await writeAudit({
+                kind: "drill",
+                actor: userId,
+                subjectId: drillSubjectId,
+                summary: `Owner ${action === "start" ? "started" : "stopped"} local demo fire drill`,
+                data: { action, prior: activeDrill, next },
+              });
+              activeDrill = next;
+              persist();
+            } catch {
+              try {
+                await synchronizeVisibility(activeDrill !== null);
+              } catch {
+                /* startup reconciliation restores bank state */
+              }
+              return error("service_unavailable", 503);
+            }
+            return {
+              statusCode: 200,
+              body: {
+                active: activeDrill !== null,
+                drill_id: activeDrill?.drillId ?? null,
+              },
+            };
+          }),
+        ),
+      );
+    });
+  }
 
   app.get("/v1/app/home", async (request, reply) => {
     const userId = await appUser(request);
@@ -3705,7 +5759,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         const window = mandate.constraints.find(
           (constraint) => constraint.type === "execution_window",
         );
-        return mandate.status === "active" &&
+        return (mandate.status === "active" ||
+          mandate.status === "pending_checkout") &&
           window &&
           Date.parse(window.not_after) <= now().getTime()
           ? { ...mandate, status: "expired" as const }
@@ -3749,6 +5804,432 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   );
 
   app.post<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/prepare-idle-reauthorization",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      if (typeof request.headers["idempotency-key"] !== "string")
+        return send(reply, error("idempotency_conflict", 409));
+      const agent = agents.get(request.params.id);
+      if (!agent || agent.user_id !== userId)
+        return send(reply, error("policy_denied", 403));
+      if (
+        agent.status !== "active" ||
+        agent.deleted_at ||
+        agent.licence.level === "RED" ||
+        replacingAgents.has(agent.agent_id)
+      )
+        return send(reply, error("agent_frozen", 401));
+      if (
+        !idleRequired(agent) ||
+        !agent.client_app_id ||
+        !agent.client_app_name
+      )
+        return send(reply, error("action_changed", 409));
+      const challengeId = id("chg");
+      const challenge = randomBytes(32).toString("base64url");
+      const expiresAt = now().getTime() + 60_000;
+      const sessionBinding = appSessionBinding(request);
+      const actionHash = sha256({
+        schema: "idle_reauthorization.v1",
+        user_id: userId,
+        agent_id: agent.agent_id,
+        client_app_id: agent.client_app_id,
+        public_key: agent.public_key,
+        scopes: agent.scopes,
+        last_used_at: agent.last_used_at,
+        expected_status: agent.status,
+        expected_licence_level: agent.licence.level,
+        challenge_id: challengeId,
+        expires_at: new Date(expiresAt).toISOString(),
+        session_binding: sessionBinding,
+      });
+      idleChallenges.set(challengeId, {
+        challengeId,
+        userId,
+        agentId: agent.agent_id,
+        actionHash,
+        sessionBinding,
+        challenge,
+        expiresAt,
+        used: false,
+      });
+      return reply.send({
+        action: "idle_reauthorize",
+        agent_id: agent.agent_id,
+        action_hash: actionHash,
+        challenge_id: challengeId,
+        challenge,
+        expires_at: new Date(expiresAt).toISOString(),
+        agent_summary: {
+          agent_id: agent.agent_id,
+          display_name: agent.display_name,
+          client_app_id: agent.client_app_id,
+          client_app_name: agent.client_app_name,
+          public_key_preview: `${agent.public_key.slice(0, 24)}...`,
+          scopes: agent.scopes,
+          last_used_at: agent.last_used_at,
+          idle_expires_at: idleExpiresAt(agent),
+        },
+      });
+    },
+  );
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/idle-reauthorize",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      return send(
+        reply,
+        await idem(userId, request, () =>
+          serializePaymentSubmission(userId, async () => {
+            const body = request.body as {
+              challenge_id?: string;
+              verification?: {
+                action_hash?: string;
+                device_signature?: string;
+              };
+            } | null;
+            const challenge = body?.challenge_id
+              ? idleChallenges.get(body.challenge_id)
+              : null;
+            const agent = agents.get(request.params.id);
+            if (!agent || agent.user_id !== userId)
+              return error("policy_denied", 403);
+            if (
+              agent.status !== "active" ||
+              agent.deleted_at ||
+              agent.licence.level === "RED" ||
+              replacingAgents.has(agent.agent_id)
+            )
+              return error("agent_frozen", 401);
+            if (
+              !challenge ||
+              challenge.used ||
+              challenge.userId !== userId ||
+              challenge.agentId !== agent.agent_id ||
+              challenge.sessionBinding !== appSessionBinding(request) ||
+              challenge.expiresAt <= now().getTime() ||
+              !idleRequired(agent) ||
+              !agent.client_app_id ||
+              !agent.client_app_name
+            )
+              return error("action_changed", 409);
+            const currentHash = sha256({
+              schema: "idle_reauthorization.v1",
+              user_id: userId,
+              agent_id: agent.agent_id,
+              client_app_id: agent.client_app_id,
+              public_key: agent.public_key,
+              scopes: agent.scopes,
+              last_used_at: agent.last_used_at,
+              expected_status: agent.status,
+              expected_licence_level: agent.licence.level,
+              challenge_id: challenge.challengeId,
+              expires_at: new Date(challenge.expiresAt).toISOString(),
+              session_binding: challenge.sessionBinding,
+            });
+            if (currentHash !== challenge.actionHash)
+              return error("action_changed", 409);
+            if (body?.verification?.action_hash !== challenge.actionHash)
+              return error("bad_signature", 401);
+            if (!demoProofAvailable) return error("policy_denied", 503);
+            const card = approvalCard(
+              "pairing",
+              "zero_trust",
+              agent.agent_id,
+              `Re-approve ${agent.client_app_name}`,
+              [challenge.challenge],
+              { actionHash: challenge.actionHash },
+            );
+            card.payload_hash = challenge.actionHash;
+            if (!(await verifyDemoProof(card, body.verification, userId)))
+              return error("bad_signature", 401);
+            try {
+              await writeAudit({
+                kind: "pairing",
+                actor: userId,
+                subjectId: agent.agent_id,
+                summary: `Local demo simulated idle re-approval for ${agent.client_app_name}`,
+                data: {
+                  action: "idle_reauthorize",
+                  agent_id: agent.agent_id,
+                  client_app_id: agent.client_app_id,
+                  client_app_name: agent.client_app_name,
+                  public_key: agent.public_key,
+                  scopes: agent.scopes,
+                  last_used_at: agent.last_used_at,
+                  action_hash: challenge.actionHash,
+                  challenge_id: challenge.challengeId,
+                  challenge_expires_at: new Date(
+                    challenge.expiresAt,
+                  ).toISOString(),
+                  session_binding: challenge.sessionBinding,
+                },
+              });
+            } catch (failure) {
+              app.log.error(
+                { err: failure, agentId: agent.agent_id },
+                "Idle re-approval audit failed",
+              );
+              return error("service_unavailable", 503);
+            }
+            const renewalExpiresAt = now().getTime() + IDLE_RENEWAL_MS;
+            const previous = idleRenewals.get(agent.agent_id);
+            idleRenewals.set(agent.agent_id, {
+              agentId: agent.agent_id,
+              publicKey: agent.public_key,
+              expiresAt: renewalExpiresAt,
+              consumed: false,
+            });
+            challenge.used = true;
+            try {
+              persist();
+            } catch (failure) {
+              if (previous) idleRenewals.set(agent.agent_id, previous);
+              else idleRenewals.delete(agent.agent_id);
+              challenge.used = false;
+              app.log.error(
+                { err: failure, agentId: agent.agent_id },
+                "Idle re-approval persistence failed",
+              );
+              return error("service_unavailable", 503);
+            }
+            emitEvent(userId, "agent.idle_reapproval_prepared", {
+              agent_id: agent.agent_id,
+            });
+            return {
+              statusCode: 200,
+              body: {
+                agent: agentWithIdleState(agent),
+                renewal_expires_at: new Date(renewalExpiresAt).toISOString(),
+              },
+            };
+          }),
+        ),
+      );
+    },
+  );
+
+  for (const trustAction of [
+    "return_to_amber",
+    "demo_fast_forward_green",
+  ] as const) {
+    const base =
+      trustAction === "return_to_amber"
+        ? "/v1/app/agents/:id"
+        : "/v1/app/demo/agents/:id";
+    const suffix =
+      trustAction === "return_to_amber"
+        ? "return-to-amber"
+        : "fast-forward-green";
+    app.post<{ Params: { id: string } }>(
+      `${base}/prepare-${suffix}`,
+      async (request, reply) => {
+        const userId = await appUser(request);
+        if (!userId) return send(reply, error("bad_signature", 401));
+        if (
+          trustAction === "demo_fast_forward_green" &&
+          !deps.demoTrustControlsEnabled
+        )
+          return send(reply, error("not_found", 404));
+        const agent = agents.get(request.params.id);
+        if (!agent || agent.user_id !== userId || agent.deleted_at)
+          return send(reply, error("not_found", 404));
+        if (trustPending.has(agent.agent_id))
+          return send(reply, error("reconciliation_required", 503));
+        if (
+          trustAction === "return_to_amber"
+            ? agent.licence.level !== "RED"
+            : agent.licence.level !== "AMBER"
+        )
+          return send(reply, error("action_changed", 409));
+        const challengeId = id("chg");
+        const challenge = randomBytes(32).toString("base64url");
+        const expiresAt = now().getTime() + 60_000;
+        const sessionBinding = appSessionBinding(request);
+        const actionHash =
+          trustAction === "return_to_amber"
+            ? trustResetActionHash(
+                agent,
+                userId,
+                sessionBinding,
+                challengeId,
+                expiresAt,
+              )
+            : sha256({
+                schema: "trust_action.v1",
+                action: trustAction,
+                user_id: userId,
+                session_binding: sessionBinding,
+                challenge_id: challengeId,
+                expires_at: new Date(expiresAt).toISOString(),
+                agent: trustActionSummary(agent),
+                public_key: agent.public_key,
+              });
+        actionChallenges.set(challengeId, {
+          userId,
+          agentId: agent.agent_id,
+          action: trustAction,
+          actionHash,
+          sessionBinding,
+          challenge,
+          expiresAt,
+          used: false,
+        });
+        persist();
+        return reply.send({
+          action: trustAction,
+          agent_id: agent.agent_id,
+          action_hash: actionHash,
+          challenge_id: challengeId,
+          challenge,
+          expires_at: new Date(expiresAt).toISOString(),
+          agent_summary: trustActionSummary(agent),
+        });
+      },
+    );
+    app.post<{ Params: { id: string } }>(
+      `${base}/${suffix}`,
+      async (request, reply) => {
+        const userId = await appUser(request);
+        if (!userId) return send(reply, error("bad_signature", 401));
+        if (
+          trustAction === "demo_fast_forward_green" &&
+          !deps.demoTrustControlsEnabled
+        )
+          return send(reply, error("not_found", 404));
+        return send(
+          reply,
+          await idem(userId, request, () =>
+            serializePaymentSubmission(userId, async () => {
+              const body = request.body as {
+                simulated?: unknown;
+                challenge_id?: unknown;
+                verification?: {
+                  action_hash?: unknown;
+                  device_signature?: unknown;
+                };
+              } | null;
+              const challenge =
+                typeof body?.challenge_id === "string"
+                  ? actionChallenges.get(body.challenge_id)
+                  : undefined;
+              const agent = agents.get(request.params.id);
+              if (
+                !agent ||
+                agent.user_id !== userId ||
+                !challenge ||
+                challenge.userId !== userId ||
+                challenge.agentId !== agent.agent_id ||
+                challenge.action !== trustAction ||
+                challenge.used ||
+                challenge.expiresAt <= now().getTime() ||
+                challenge.sessionBinding !== appSessionBinding(request)
+              )
+                return error("action_changed", 409);
+              if (
+                trustAction === "demo_fast_forward_green" &&
+                body?.simulated !== true
+              )
+                return error("invalid_request", 400);
+              if (
+                trustAction === "return_to_amber"
+                  ? agent.licence.level !== "RED"
+                  : agent.licence.level !== "AMBER"
+              )
+                return error("action_changed", 409);
+              const currentHash =
+                trustAction === "return_to_amber"
+                  ? trustResetActionHash(
+                      agent,
+                      userId,
+                      challenge.sessionBinding,
+                      body?.challenge_id as string,
+                      challenge.expiresAt,
+                    )
+                  : sha256({
+                      schema: "trust_action.v1",
+                      action: trustAction,
+                      user_id: userId,
+                      session_binding: challenge.sessionBinding,
+                      challenge_id: body?.challenge_id,
+                      expires_at: new Date(challenge.expiresAt).toISOString(),
+                      agent: trustActionSummary(agent),
+                      public_key: agent.public_key,
+                    });
+              if (currentHash !== challenge.actionHash)
+                return error("action_changed", 409);
+              if (body?.verification?.action_hash !== challenge.actionHash)
+                return error("bad_signature", 401);
+              const proofCard = approvalCard(
+                "pairing",
+                "everyday",
+                agent.agent_id,
+                trustAction,
+                [challenge.challenge],
+                { actionHash: challenge.actionHash },
+              );
+              proofCard.payload_hash = challenge.actionHash;
+              if (
+                !(await verifyDemoProof(proofCard, body.verification, userId))
+              )
+                return error("bad_signature", 401);
+              try {
+                await writeAudit({
+                  kind: "licence_change",
+                  actor: userId,
+                  subjectId: agent.agent_id,
+                  summary: `Owner ${trustAction} proof`,
+                  data: {
+                    action: trustAction,
+                    action_hash: challenge.actionHash,
+                    challenge_id: body?.challenge_id,
+                    challenge: challenge.challenge,
+                    session_binding: challenge.sessionBinding,
+                    expires_at: new Date(challenge.expiresAt).toISOString(),
+                    agent: trustActionSummary(agent),
+                    public_key: agent.public_key,
+                  },
+                });
+                if (
+                  trustAction === "return_to_amber" &&
+                  !(await retireRedAgentAuthority(agent))
+                )
+                  throw new Error("Red authority retirement failed");
+                const event = await recordTrustEvent(
+                  agent,
+                  trustAction === "return_to_amber"
+                    ? "transition"
+                    : "demo_override",
+                  `${trustAction}:${challenge.actionHash}`,
+                  trustAction === "return_to_amber"
+                    ? "Owner returned Red agent to Amber after history review"
+                    : "SIMULATED LOCAL DEMO Green fast-forward by owner",
+                  trustAction === "return_to_amber" ? "AMBER" : "GREEN",
+                );
+                challenge.used = true;
+                persist();
+                return {
+                  statusCode: 200,
+                  body: {
+                    agent: agentWithIdleState(agent),
+                    trust_event: event,
+                    simulated: true,
+                  },
+                };
+              } catch {
+                return error("reconciliation_required", 503);
+              }
+            }),
+          ),
+        );
+      },
+    );
+  }
+
+  app.post<{ Params: { id: string } }>(
     "/v1/app/agents/:id/prepare-action",
     async (request, reply) => {
       const userId = await appUser(request);
@@ -3766,7 +6247,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         return send(reply, error("policy_denied", 403));
       if (
         (action === "unfreeze" && agent.status !== "frozen") ||
-        (action === "relicense" && agent.licence.level !== "SUSPENDED")
+        action === "relicense"
       )
         return send(reply, error("action_changed", 409));
       const actionHash = sha256({
@@ -3777,7 +6258,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         expected_status: agent.status,
         expected_licence_level: agent.licence.level,
         root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
-        demerit_count: Math.max(0, -agent.licence.points),
+        demerit_count: agent.licence.flags_30d,
       });
       const challengeId = id("chg");
       const challenge = randomBytes(32).toString("base64url");
@@ -3804,7 +6285,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     },
   );
 
-  for (const action of ["unfreeze", "relicense"] as const) {
+  for (const action of ["unfreeze"] as const) {
     app.post<{ Params: { id: string } }>(
       `/v1/app/agents/:id/${action}`,
       async (request, reply) => {
@@ -3844,7 +6325,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
               expected_status: agent.status,
               expected_licence_level: agent.licence.level,
               root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
-              demerit_count: Math.max(0, -agent.licence.points),
+              demerit_count: agent.licence.flags_30d,
             });
             if (currentHash !== challenge.actionHash)
               return error("action_changed", 409);
@@ -3862,16 +6343,31 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             card.payload_hash = challenge.actionHash;
             if (!(await verifyDemoProof(card, body.verification, userId)))
               return error("bad_signature", 401);
-            challenge.used = true;
-            if (action === "unfreeze") agent.status = "active";
-            else agent.licence.level = "L";
             await writeAudit({
               kind: action === "unfreeze" ? "freeze" : "licence_change",
               actor: userId,
               subjectId: agent.agent_id,
               summary: `Local demo simulated ${action} approved by user`,
-              data: { action, agent_id: agent.agent_id },
+              data: {
+                action,
+                agent_id: agent.agent_id,
+                action_hash: challenge.actionHash,
+                challenge_id: body?.challenge_id,
+                challenge_expires_at: new Date(
+                  challenge.expiresAt,
+                ).toISOString(),
+                session_binding: challenge.sessionBinding,
+                public_key: agent.public_key,
+                scopes: agent.scopes,
+                prior_status: agent.status,
+                prior_licence_level: agent.licence.level,
+                root_agent_id: agent.lineage?.root_agent_id ?? agent.agent_id,
+                demerit_count: agent.licence.flags_30d,
+              },
             });
+            challenge.used = true;
+            invalidateIdleRecovery(agent.agent_id);
+            agent.status = "active";
             emitEvent(userId, `agent.${action}`, { agent_id: agent.agent_id });
             return { statusCode: 200, body: { agent, simulated: true } };
           }),
@@ -3879,6 +6375,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       },
     );
   }
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/app/agents/:id/relicense",
+    async (_request, reply) => send(reply, error("invalid_request", 410)),
+  );
 
   app.post<{ Params: { id: string } }>(
     "/v1/app/agents/:id/revoke",
@@ -3898,6 +6399,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
             )
               return error("invalid_request", 400);
             agent.status = "revoked";
+            invalidateIdleRecovery(agent.agent_id);
             agentAuth.revokeAgent(agent.agent_id);
             if (
               !(await cancelRevokedAgentMandates(agent, "owner_revoked_agent"))
@@ -3930,10 +6432,171 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         status: payment.status,
         amount: payment.request.amount,
         merchant: payment.merchant.name,
+        approval_source: payment.approvalSource ?? null,
         created_at: payment.createdAt,
       }));
     return reply.send({ items, next_cursor: null });
   });
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/app/payments/:id/report-dispute",
+    async (request, reply) => {
+      const userId = await appUser(request);
+      if (!userId) return send(reply, error("bad_signature", 401));
+      return send(
+        reply,
+        await idem(userId, request, () =>
+          serializePaymentSubmission(userId, async () => {
+            const payment = payments.get(request.params.id);
+            if (
+              !payment ||
+              payment.userId !== userId ||
+              payment.status !== "paid"
+            )
+              return error("not_found", 404);
+            const agent = agents.get(payment.agentId);
+            if (!agent) return error("not_found", 404);
+            const disputeId = `dsp_${payment.paymentId}`;
+            try {
+              const report = await recordTrustEvent(
+                agent,
+                "dispute_reported",
+                disputeId,
+                "Owner reported a paid purchase dispute",
+              );
+              await flagTrust(
+                agent,
+                disputeId,
+                "Owner reported a paid purchase dispute",
+              );
+              return {
+                statusCode: 200,
+                body: {
+                  dispute_id: disputeId,
+                  trust_event: report,
+                  agent: agentWithIdleState(agent),
+                },
+              };
+            } catch {
+              return error("reconciliation_required", 503);
+            }
+          }),
+        ),
+      );
+    },
+  );
+
+  app.post("/v1/internal/drills/result", async (request, reply) => {
+    if (!(await deps.authenticateDrillService?.(request)))
+      return send(reply, error("bad_signature", 401));
+    const body = request.body as {
+      agent_id?: unknown;
+      drill_id?: unknown;
+      passed?: unknown;
+      evidence_hash?: unknown;
+    } | null;
+    if (
+      typeof body?.agent_id !== "string" ||
+      typeof body.drill_id !== "string" ||
+      body.passed !== true ||
+      typeof body.evidence_hash !== "string" ||
+      !/^sha256:[0-9a-f]{64}$/.test(body.evidence_hash)
+    )
+      return send(reply, error("invalid_request", 400));
+    const drillId = body.drill_id;
+    const evidenceHash = body.evidence_hash;
+    const agent = agents.get(body.agent_id);
+    if (!agent) return send(reply, error("not_found", 404));
+    return send(
+      reply,
+      await serializePaymentSubmission(agent.user_id, async () => {
+        try {
+          const prior = trustEvents.find(
+            (item) =>
+              item.agent_id === agent.agent_id &&
+              item.kind === "drill_passed" &&
+              item.source_id === drillId,
+          );
+          if (prior && prior.evidence_hash !== evidenceHash)
+            return error("action_changed", 409);
+          if (prior)
+            return {
+              statusCode: 200,
+              body: { trust_event: prior, agent: agentWithIdleState(agent) },
+            };
+          const event = await recordTrustEvent(
+            agent,
+            "drill_passed",
+            drillId,
+            "Authenticated bank drill passed",
+            undefined,
+            false,
+            evidenceHash,
+          );
+          await maybePromoteAmber(agent);
+          return {
+            statusCode: 200,
+            body: { trust_event: event, agent: agentWithIdleState(agent) },
+          };
+        } catch {
+          return error("reconciliation_required", 503);
+        }
+      }),
+    );
+  });
+
+  app.post<{ Params: { id: string } }>(
+    "/v1/internal/disputes/:id/uphold",
+    async (request, reply) => {
+      if (!(await deps.authenticateBankOperator?.(request)))
+        return send(reply, error("bad_signature", 401));
+      const report = trustEvents.find(
+        (item) =>
+          item.kind === "dispute_reported" &&
+          item.source_id === request.params.id,
+      );
+      if (!report) return send(reply, error("not_found", 404));
+      const body = request.body as { evidence_hash?: unknown } | null;
+      if (
+        typeof body?.evidence_hash !== "string" ||
+        !/^sha256:[0-9a-f]{64}$/.test(body.evidence_hash)
+      )
+        return send(reply, error("invalid_request", 400));
+      const evidenceHash = body.evidence_hash;
+      const agent = agents.get(report.agent_id);
+      if (!agent) return send(reply, error("not_found", 404));
+      return send(
+        reply,
+        await serializePaymentSubmission(agent.user_id, async () => {
+          try {
+            const prior = trustEvents.find(
+              (item) =>
+                item.agent_id === agent.agent_id &&
+                item.kind === "dispute_upheld" &&
+                item.source_id === report.source_id,
+            );
+            if (prior && prior.evidence_hash !== evidenceHash)
+              return error("action_changed", 409);
+            const event = await recordTrustEvent(
+              agent,
+              "dispute_upheld",
+              report.source_id,
+              "Bank upheld owner purchase dispute",
+              "RED",
+              false,
+              evidenceHash,
+            );
+            return {
+              statusCode: 200,
+              body: { trust_event: event, agent: agentWithIdleState(agent) },
+            };
+          } catch {
+            return error("reconciliation_required", 503);
+          }
+        }),
+      );
+    },
+  );
 
   app.post<{ Params: { id: string } }>(
     "/v1/app/agents/:id/freeze",
@@ -3949,6 +6612,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           if (agent.status === "revoked" || agent.deleted_at)
             return error("action_changed", 409);
           agent.status = "frozen";
+          invalidateIdleRecovery(agent.agent_id);
           agentAuth.revokeAccess(agent.agent_id);
           emitEvent(userId, "agent.frozen", {
             agent_id: agent.agent_id,

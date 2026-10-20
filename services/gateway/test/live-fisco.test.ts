@@ -1,4 +1,10 @@
-import { generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomUUID,
+  sign,
+  verify,
+} from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { type ChainAddresses, connectFisco } from "@webank/chain";
 import {
@@ -194,6 +200,8 @@ describe.runIf(live)("live signed checkout through Gateway and FISCO", () => {
       const pairing = await post("/v1/oauth/device_authorization", {
         client_name: "Live connector",
         provider: "anthropic",
+        client_app_name: "Claude Code",
+        client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
         agent_public_key: credentials.publicKey,
         requested_scopes: [
           "wallet:pay",

@@ -62,6 +62,8 @@ export const AgentLicenceChangedEventSchema = z
         from: LicenceLevelSchema,
         to: LicenceLevelSchema,
         reason: NonEmptyStringSchema,
+        trust_event_id: NonEmptyStringSchema.optional(),
+        simulated: z.boolean().optional(),
       })
       .strict(),
   })
@@ -103,8 +105,10 @@ export const DrillResultEventSchema = z
     data: z
       .object({
         agent_id: AgentIdSchema,
+        drill_id: NonEmptyStringSchema.optional(),
         passed: z.boolean(),
-        points: z.number().int().safe(),
+        reason: NonEmptyStringSchema.optional(),
+        trust_event_id: NonEmptyStringSchema.optional(),
       })
       .strict(),
   })

@@ -18,6 +18,14 @@ The token and signer values are not written to launcher logs.
 The app's local Gateway mode asks for that token before showing account-specific demo data.
 The login token is reusable during the current Gateway identity, survives an ordinary restart even though shutdown removes its temporary file, and rotates after a fresh reset archives that identity.
 
+## Optional Guardian review
+
+The Gateway can call a dedicated local Nous Research Hermes Agent profile for one fixed intent review per payment.
+Set the Hermes URL, key, and operator verification flag only in local uncommitted configuration after checking that the profile has no callable tools, MCP servers, plugins, memory, or skills.
+The [Guardian guide](../services/guardian/README.md) lists the exact environment names and isolation checks.
+Without verified configuration, Guardian fails closed to owner review.
+The deterministic tests cover this transport, but a live isolated Hermes decision is still pending acceptance.
+
 Before a fresh reset, stop the launcher and inspect free disk space from the repository root:
 
 ```sh

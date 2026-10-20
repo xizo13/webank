@@ -28,4 +28,26 @@ describe("denial rule mapping", () => {
       denialFromChecks([{ name: "policy_licence", result: "step_up" }]),
     ).toThrow();
   });
+
+  it("keeps an uncorroborated Guardian other denial neutral", () => {
+    expect(
+      denialFromChecks([
+        { name: "guardian", result: "deny", detail: { reason: "other" } },
+      ]),
+    ).toMatchObject({
+      code: "guardian_denied",
+      rule: "guardian_other",
+      user_explanation:
+        "WeBank's Guardian could not safely approve this purchase.",
+    });
+    expect(
+      denialFromChecks([
+        {
+          name: "guardian",
+          result: "deny",
+          detail: { reason: "intent_mismatch" },
+        },
+      ]),
+    ).toMatchObject({ code: "guardian_denied", rule: "intent_mismatch" });
+  });
 });

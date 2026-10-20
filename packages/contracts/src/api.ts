@@ -4,6 +4,8 @@ import {
   AgentScopeSchema,
   ApprovalIdSchema,
   ApprovalLevelSchema,
+  ClientAppNameSchema,
+  HashSchema,
   MandateIdSchema,
   MoneySchema,
   NonEmptyStringSchema,
@@ -40,6 +42,8 @@ export const DeviceAuthorizationRequestSchema = z
   .object({
     client_name: NonEmptyStringSchema,
     provider: NonEmptyStringSchema,
+    client_app_id: z.string().regex(/^app_[0-9a-f]{64}$/),
+    client_app_name: ClientAppNameSchema,
     agent_public_key: z.string().startsWith("p256:").min(6),
     requested_scopes: z.array(AgentScopeSchema).min(1),
     replacement_ticket: NonEmptyStringSchema.optional(),
@@ -94,6 +98,7 @@ export const CreateMandateRequestSchema = z
     user_text: NonEmptyStringSchema,
     intent_level: z.enum(["open", "product", "listing"]),
     constraints: MandateConstraintsSchema,
+    approval_timing: z.enum(["payment", "upfront"]).optional(),
   })
   .strict();
 export const MandateResponseSchema = z
@@ -136,6 +141,34 @@ export const CreateMandateResponseSchema = z
         message: "Request number is zero-trust only",
       });
   });
+export const MandateReviewSnapshotSchema = z
+  .object({ mandate: MandateSchema, canonical_hash: HashSchema })
+  .strict();
+export const PaymentReviewSchema = z
+  .object({
+    schema: z.literal("payment_review.v1"),
+    status: z.literal("pending"),
+    approval_id: ApprovalIdSchema,
+    payment_id: PaymentIdSchema,
+    payload_hash: HashSchema,
+    expires_at: TimestampSchema,
+    mandate_snapshot: MandateReviewSnapshotSchema,
+    signed_order: z
+      .object({
+        payment_request_hash: HashSchema,
+        merchant_id: NonEmptyStringSchema,
+        merchant_legal_name: NonEmptyStringSchema,
+        merchant_uscc: NonEmptyStringSchema,
+        order_id: OrderIdSchema,
+        line_items: z.array(SignedLineItemSchema).min(1),
+        amount: PositiveMoneySchema,
+        expires_at: TimestampSchema,
+      })
+      .strict(),
+    decision_checks: z.array(DecisionCheckSchema),
+  })
+  .strict();
+export type PaymentReview = z.infer<typeof PaymentReviewSchema>;
 
 export const PriceEvidenceSchema = z
   .object({
@@ -386,6 +419,7 @@ export const GuardianInputSchema = z
 export const GuardianVerdictSchema = z
   .object({
     verdict: z.enum(["pass", "step_up", "deny"]),
+    reason_code: z.enum(["none", "intent_mismatch", "other"]).optional(),
     reasons: z.array(NonEmptyStringSchema),
     user_explanation: NonEmptyStringSchema,
   })

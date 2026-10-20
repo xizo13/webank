@@ -1,11 +1,20 @@
 export type Agent = {
   agent_id: string;
   display_name: string;
+  client_app_id?: string | null;
+  client_app_name?: string | null;
+  last_used_at?: string | null;
+  idle_expires_at?: string | null;
+  reauthorization_required?: boolean;
   status: "active" | "frozen" | "revoked";
   licence: {
-    level: "L" | "P" | "FULL" | "SUSPENDED";
+    level: "AMBER" | "GREEN" | "RED";
     clean_purchases: number;
     drills_passed: number;
+    drills_failed: number;
+    flags_30d: number;
+    reason: string;
+    updated_at: string;
   };
 };
 
@@ -23,6 +32,9 @@ export type Approval = {
   title: string;
   lines: string[];
   payload_hash: string;
+  trust_light?: Agent["licence"]["level"];
+  trust_reason?: string;
+  review_schema?: "payment_review.v1";
   level: "zero_trust" | "everyday" | "in_app";
   expires_at: string;
   status: "pending" | "approved" | "rejected" | "expired";
@@ -37,6 +49,7 @@ export type Payment = {
   status: "paid" | "denied" | "awaiting_user";
   reason: string;
   at: string;
+  approvalSource?: "owner" | "auto" | null;
   chainTx?: string;
   auditTx?: string;
 };
@@ -119,9 +132,11 @@ export function queuePairing(state: DemoState, now = Date.now()): DemoState {
       "Anthropic - MacBook Pro, Shenzhen",
       "Can request payments and see its own history",
       "Cannot view your main account or change limits",
-      "Starts on an L-plate licence",
+      "Starts Amber: every purchase needs your approval",
     ],
     payload_hash: "sha256:demo-pair-claude",
+    trust_light: "AMBER",
+    trust_reason: "New agent, no history yet",
     level: "zero_trust",
     expires_at: approvalExpiry(now, 600_000),
     status: "pending",
@@ -157,6 +172,7 @@ export function queueFirstPayment(
     !state.enabled ||
     state.frozenAll ||
     agent?.status !== "active" ||
+    agent.licence.level === "RED" ||
     state.walletBalance < 27900 ||
     state.perPaymentMax < 27900 ||
     spentToday + 27900 > state.dailyMax
@@ -178,10 +194,12 @@ export function queueFirstPayment(
     lines: [
       "To: Shop A Electronics Co., Ltd. (mock verified merchant)",
       "For: Sony WH-1000XM5 Black",
-      "Why asking: first payment on L-plates",
+      "Why asking: first Amber payment needs your approval",
       "Mandate: headphones, maximum ¥300.00",
     ],
     payload_hash: "sha256:demo-pay-first",
+    trust_light: agent.licence.level,
+    trust_reason: agent.licence.reason,
     level: "zero_trust",
     expires_at: approvalExpiry(now),
     status: "pending",
@@ -308,7 +326,15 @@ export function applyDemoBiometricApproval(
           agent_id: "agt_claude",
           display_name: "Claude (Anthropic)",
           status: "active",
-          licence: { level: "L", clean_purchases: 0, drills_passed: 0 },
+          licence: {
+            level: "AMBER",
+            clean_purchases: 0,
+            drills_passed: 0,
+            drills_failed: 0,
+            flags_30d: 0,
+            reason: "New agent, no history yet",
+            updated_at: new Date(now).toISOString(),
+          },
         },
       ],
     };

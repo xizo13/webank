@@ -166,6 +166,12 @@ const rules: Record<
       "The purchase does not match the user's confirmed request.",
     fixable: true,
   },
+  guardian_other: {
+    code: "guardian_denied",
+    user_explanation:
+      "WeBank's Guardian could not safely approve this purchase.",
+    fixable: true,
+  },
   user_rejected: {
     code: "approval_rejected",
     user_explanation: "You rejected this payment in WeBank.",
@@ -180,8 +186,19 @@ export function denial(rule: DenialRule, detail: Record<string, unknown> = {}) {
 export function denialFromChecks(checks: Check[]) {
   const failed = checks.find((check) => check.result === "deny");
   const reason = failed?.detail?.reason;
-  if (failed?.name === "rail_validation" && reason === "fire_drill_decoy")
-    return denial("merchant_honeypot");
+  if (failed?.name === "rail_validation") {
+    const mapped: Record<string, DenialRule> = {
+      fire_drill_decoy: "merchant_honeypot",
+      per_payment_cap_exceeded: "over_per_payment_cap",
+      daily_cap_exceeded: "over_daily_cap",
+      monthly_cap_exceeded: "over_monthly_cap",
+      insufficient_wallet_funds: "insufficient_wallet_funds",
+      duplicate_payment: "duplicate_payment",
+      merchant_unknown: "merchant_unknown",
+    };
+    const rule = mapped[String(reason)];
+    if (rule) return denial(rule);
+  }
   if (failed?.name === "mandate") {
     const mapped: Record<string, DenialRule> = {
       mandate_expired: "mandate_expired",
@@ -218,6 +235,9 @@ export function denialFromChecks(checks: Check[]) {
     return denial("duplicate_payment");
   if (failed?.name === "risk" && reason === "velocity_blocked")
     return denial("velocity_blocked");
-  if (failed?.name === "guardian") return denial("intent_mismatch");
+  if (failed?.name === "guardian")
+    return denial(
+      reason === "intent_mismatch" ? "intent_mismatch" : "guardian_other",
+    );
   throw new Error("Unmapped payment denial check");
 }

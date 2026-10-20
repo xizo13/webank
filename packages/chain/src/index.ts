@@ -134,6 +134,13 @@ export type FiscoChain = {
     merchantId: Hex,
     amount: bigint,
   ): Promise<Hex>;
+  /** Executes the exact wallet pay call in read-only simulation; no transaction is sent. */
+  simulatePay(
+    address: Address,
+    paymentId: Hex,
+    merchantId: Hex,
+    amount: bigint,
+  ): Promise<void>;
   setFrozen(address: Address, frozen: boolean): Promise<Hex>;
   setCaps(
     address: Address,
@@ -145,7 +152,7 @@ export type FiscoChain = {
     address: Address,
     agentId: Hex,
     keyHash: Hex,
-    level: 1 | 2 | 3 | 4,
+    level: 1 | 2 | 4,
   ): Promise<Hex>;
   getMerchant(address: Address, merchantId: Hex): Promise<MerchantRecord>;
   getLicence(address: Address, agentId: Hex): Promise<LicenceRecord>;
@@ -155,6 +162,17 @@ export type FiscoChain = {
     main: Address,
     wallet: Address,
   ): Promise<WalletSnapshot>;
+  getPolicyCapsSnapshot(address: Address): Promise<{
+    perPaymentCap: bigint;
+    dailyCap: bigint;
+    monthlyCap: bigint;
+    spentToday: bigint;
+    spentMonth: bigint;
+    blockNumber: bigint;
+    observedAt: string;
+    nextDailyResetAt: string;
+    nextMonthlyResetAt: string;
+  }>;
   isFundingApplied(token: Address, fundingId: Hex): Promise<boolean>;
   fundAgentWallet(token: Address, fundingId: Hex, amount: bigint): Promise<Hex>;
   transferMain(token: Address, payout: Address, amount: bigint): Promise<Hex>;
@@ -366,6 +384,25 @@ export async function connectFisco(
         throw normalizeChainError(error, AgentWalletAbi);
       }
     },
+    async simulatePay(
+      address: Address,
+      paymentId: Hex,
+      merchantId: Hex,
+      amount: bigint,
+    ) {
+      const { account } = signer();
+      try {
+        await publicClient.simulateContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "pay",
+          args: [paymentId, merchantId, amount],
+          account,
+        });
+      } catch (error) {
+        throw normalizeChainError(error, AgentWalletAbi);
+      }
+    },
     async setFrozen(address: Address, frozen: boolean) {
       const { walletClient, account } = signer();
       try {
@@ -409,7 +446,7 @@ export async function connectFisco(
       address: Address,
       agentId: Hex,
       keyHash: Hex,
-      level: 1 | 2 | 3 | 4,
+      level: 1 | 2 | 4,
     ) {
       const { walletClient, account } = signer();
       try {
@@ -503,6 +540,101 @@ export async function connectFisco(
         walletFrozen,
         blockNumber,
         observedAt: new Date().toISOString(),
+      };
+    },
+    async getPolicyCapsSnapshot(address: Address) {
+      const blockNumber = await publicClient.getBlockNumber();
+      const [
+        perPaymentCap,
+        dailyCap,
+        monthlyCap,
+        dayIndex,
+        monthIndex,
+        nativeTimestamp,
+        milliseconds,
+      ] = await Promise.all([
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "perPaymentCap",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "dailyCap",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "monthlyCap",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "currentDayIndex",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "currentMonthIndex",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "currentTimestamp",
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "timestampIsMilliseconds",
+          blockNumber,
+        }),
+      ]);
+      const [spentToday, spentMonth] = await Promise.all([
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "spentByDay",
+          args: [dayIndex],
+          blockNumber,
+        }),
+        publicClient.readContract({
+          address,
+          abi: AgentWalletAbi,
+          functionName: "spentByMonth",
+          args: [monthIndex],
+          blockNumber,
+        }),
+      ]);
+      const observedMs = Number(
+        milliseconds ? nativeTimestamp : nativeTimestamp * 1000n,
+      );
+      if (!Number.isSafeInteger(observedMs))
+        throw new Error("Invalid wallet timestamp");
+      const observed = new Date(observedMs);
+      if (Number.isNaN(observed.getTime()))
+        throw new Error("Invalid wallet timestamp");
+      const nextMonth = new Date(
+        Date.UTC(observed.getUTCFullYear(), observed.getUTCMonth() + 1, 1),
+      );
+      return {
+        perPaymentCap,
+        dailyCap,
+        monthlyCap,
+        spentToday,
+        spentMonth,
+        blockNumber,
+        observedAt: observed.toISOString(),
+        nextDailyResetAt: new Date(
+          (Number(dayIndex) + 1) * 86_400_000,
+        ).toISOString(),
+        nextMonthlyResetAt: nextMonth.toISOString(),
       };
     },
     async isFundingApplied(token: Address, fundingId: Hex) {

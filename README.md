@@ -1,4 +1,4 @@
-# Agent Wallet MVP
+# We-AIlowance Agent Wallet prototype
 
 This independent WeBank Fintechathon 2026 prototype explores a separate wallet for AI agents, user-approved mandates, spending limits, and visible payment decisions.
 It is not a WeBank product or a live banking service.
@@ -10,8 +10,8 @@ All merchants and currency in this repository are simulated, and no real funds m
 | --- | --- |
 | Expo app | Browser walkthrough by default; explicit loopback web mode reads simulated balances and Gateway state and submits visibly simulated local approvals; an iOS development build has not been verified. |
 | Shops | Local Next.js storefront and Shop MCP tools with mock products, carts, orders, and Ed25519-signed payment requests. |
-| Connector | Nine stdio MCP tools with device-code pairing, user-intent mandate proposal before shopping, local P-256 key, scoped tokens, and signed agent requests; tested through MCP and Gateway HTTP. |
-| Gateway | Fastify payment and pairing logic with scoped agent authentication, replay protection, policy and mandate checks, optional Guardian verdict, receipts, audit records, and an opt-in loopback FISCO composition. |
+| Connector | Nine stdio MCP tools with a separate self-reported client-app identity, device-code pairing, user-intent mandate proposal before shopping, local P-256 key, scoped tokens, and signed agent requests. |
+| Gateway | Fastify payment and pairing logic with scoped agent authentication, replay protection, attended purchase approval, Amber/Green/Red trust rules, optional fixed-call Guardian review, receipts, audit records, and an opt-in loopback FISCO composition. |
 | Chain | Five Solidity demo contracts and a viem adapter tested against a local non-SM FISCO BCOS v3.17.1 chain. |
 | Treasurer | Separate in-memory proposal, funding, and monitor simulation; it is not connected to live bank accounts or chain settlement. |
 
@@ -19,6 +19,22 @@ The CLI integration driver has exercised shop checkout, the actual connector cli
 An owner browser session has also completed a fresh agent pairing with an audit anchor on the local chain.
 The completed payment path was a CLI run, not a live Claude shopping session or a bank-verifiable phone approval.
 The separate limited Gateway fixture supports read, reject, and freeze demonstrations but cannot approve a card or move money.
+The owner transfer and policy limit controls are built in the browser app and Gateway, with simulated owner approval in the local demo.
+A real local FISCO cap write and refreshed owner browser acceptance of those controls remain pending.
+
+## Current owner controls
+
+One pairing covers every chat in the named MCP host app; a second app name needs its own pairing and agent identity.
+The app name is self-reported by the host, so this prototype does not prove the operating-system app behind it.
+A connection idle for seven full days needs owner Re-approval for the same key before it can spend again.
+An attended purchase first locks a non-spendable `pending_checkout` mandate, then presents one payment approval with the locked request and merchant-signed order when owner review is required.
+Amber agents need approval for every purchase, and their first payment also needs a request number.
+Green agents can auto-pay only within the owner's threshold after every deterministic, risk, and Guardian check passes.
+Red agents cannot spend, and a separate owner freeze overrides every trust light.
+An unattended or standing mandate can need approval when it is created.
+The local demo can use a dedicated Nous Research Hermes Agent profile for one fixed Guardian review call, with no tools or carried conversation.
+That zero-tool profile passed a live synthetic smoke test, and the full signed shop-to-app Guardian flow remains pending acceptance.
+The path fails closed to owner review when Hermes or its isolation proof is unavailable.
 
 ## Requirements and checks
 

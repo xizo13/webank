@@ -6,6 +6,7 @@ import {
   ApprovalLevelSchema,
   AuditIdSchema,
   CheckResultSchema,
+  ClientAppNameSchema,
   CommitmentIdSchema,
   DateSchema,
   DecisionIdSchema,
@@ -26,24 +27,72 @@ import {
   UserIdSchema,
 } from "./common.js";
 
-export const AgentSchema = z
+export const TrustLightSchema = LicenceLevelSchema;
+export const TrustEventSchema = z
+  .object({
+    schema: z.literal("trust_event.v1"),
+    event_id: z.string().regex(/^tev_[A-Za-z0-9_-]+$/),
+    agent_id: AgentIdSchema,
+    kind: z.enum([
+      "clean_purchase",
+      "flag",
+      "drill_passed",
+      "drill_failed",
+      "dispute_reported",
+      "dispute_upheld",
+      "transition",
+      "demo_override",
+    ]),
+    source_id: NonEmptyStringSchema,
+    evidence_hash: HashSchema.optional(),
+    from: TrustLightSchema.optional(),
+    to: TrustLightSchema.optional(),
+    reason: NonEmptyStringSchema,
+    occurred_at: TimestampSchema,
+    confirmed_at: TimestampSchema.optional(),
+    audit_hash: HashSchema,
+    chain_tx: TransactionHashSchema.optional(),
+  })
+  .strict();
+export type TrustEvent = z.infer<typeof TrustEventSchema>;
+
+const CurrentAgentSchema = z
   .object({
     schema: z.literal("agent.v1"),
     agent_id: AgentIdSchema,
     user_id: UserIdSchema,
     display_name: NonEmptyStringSchema,
     provider: NonEmptyStringSchema,
+    client_app_id: z
+      .string()
+      .regex(/^app_[0-9a-f]{64}$/)
+      .nullable()
+      .optional(),
+    client_app_name: ClientAppNameSchema.nullable().optional(),
     public_key: z.string().startsWith("p256:").min(6),
     scopes: z.array(AgentScopeSchema),
     licence: z
       .object({
         level: LicenceLevelSchema,
-        points: z.number().int().safe(),
         clean_purchases: z.number().int().safe().nonnegative(),
         drills_passed: z.number().int().safe().nonnegative(),
+        drills_failed: z.number().int().safe().nonnegative(),
+        flags_30d: z.number().int().safe().nonnegative(),
+        reason: NonEmptyStringSchema,
+        updated_at: TimestampSchema,
+        legacy_points: z.number().int().safe().optional(),
       })
       .strict(),
     status: z.enum(["active", "frozen", "revoked"]),
+    legacy_red_evidence: z
+      .object({
+        kind: z.literal("legacy_red"),
+        reason: NonEmptyStringSchema,
+        created_at: TimestampSchema,
+        audit_ids: z.array(NonEmptyStringSchema).optional(),
+      })
+      .strict()
+      .optional(),
     lineage: z
       .object({
         root_agent_id: AgentIdSchema,
@@ -57,6 +106,52 @@ export const AgentSchema = z
     last_used_at: TimestampSchema.nullable(),
   })
   .strict();
+/** Old durable agents remain readable without assigning them newly earned trust. */
+export const AgentSchema = z.preprocess((value) => {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = value as Record<string, unknown>;
+  if (
+    !record.licence ||
+    typeof record.licence !== "object" ||
+    Array.isArray(record.licence)
+  )
+    return value;
+  const licence = record.licence as Record<string, unknown>;
+  const old = licence.level;
+  if (old !== "L" && old !== "P" && old !== "FULL" && old !== "SUSPENDED")
+    return value;
+  const level = old === "L" ? "AMBER" : old === "SUSPENDED" ? "RED" : "GREEN";
+  return {
+    ...record,
+    ...(old === "SUSPENDED"
+      ? {
+          legacy_red_evidence: {
+            kind: "legacy_red",
+            reason:
+              typeof licence.reason === "string" && licence.reason.length > 0
+                ? licence.reason
+                : "Historical SUSPENDED licence state",
+            created_at:
+              typeof licence.updated_at === "string"
+                ? licence.updated_at
+                : record.created_at,
+          },
+        }
+      : {}),
+    licence: {
+      level,
+      clean_purchases: licence.clean_purchases,
+      drills_passed: licence.drills_passed,
+      drills_failed: 0,
+      flags_30d: 0,
+      reason: `Migrated legacy ${old} licence; prior history retained`,
+      updated_at: record.created_at,
+      ...(typeof licence.points === "number"
+        ? { legacy_points: licence.points }
+        : {}),
+    },
+  };
+}, CurrentAgentSchema);
 export type Agent = z.infer<typeof AgentSchema>;
 
 export const PolicySchema = z
@@ -219,10 +314,13 @@ export const MandateSchema = z
     agent_key_binding: z.string().startsWith("p256:").min(6),
     description: NonEmptyStringSchema,
     intent_level: z.enum(["open", "product", "listing"]),
+    /** Missing only on records created before checkout-bound consent existed. */
+    approval_timing: z.enum(["payment", "upfront"]).optional(),
     user_text: NonEmptyStringSchema,
     user_text_source: z.enum(["webank_screen", "agent_reported"]),
     constraints: MandateConstraintsSchema,
     status: z.enum([
+      "pending_checkout",
       "pending_user",
       "active",
       "exhausted",
@@ -244,6 +342,39 @@ export const MandateSchema = z
   })
   .strict()
   .superRefine((mandate, ctx) => {
+    const recurrence = mandate.constraints.find(
+      (item) => item.type === "recurrence",
+    );
+    if (
+      mandate.approval_timing === "payment" &&
+      (recurrence?.frequency !== "NONE" || recurrence.max_occurrences !== 1)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["approval_timing"],
+        message: "Payment-timed mandate must be single-use",
+      });
+    }
+    if (
+      mandate.status === "pending_checkout" &&
+      (mandate.approval_timing !== "payment" || mandate.approved_by !== null)
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["status"],
+        message: "Checkout-bound mandate must be unapproved",
+      });
+    }
+    if (
+      mandate.approval_timing === "payment" &&
+      mandate.status === "pending_user"
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["status"],
+        message: "Payment-timed mandate cannot have an upfront approval",
+      });
+    }
     if (mandate.status === "pending_user" && mandate.approved_by !== null) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
@@ -471,6 +602,9 @@ export const ApprovalSchema = z
     title: NonEmptyStringSchema,
     lines: z.array(NonEmptyStringSchema).min(1),
     payload_hash: HashSchema,
+    trust_light: TrustLightSchema.optional(),
+    trust_reason: NonEmptyStringSchema.optional(),
+    review_schema: z.literal("payment_review.v1").optional(),
     level: ApprovalLevelSchema,
     expires_at: TimestampSchema,
     status: z.enum(["pending", "approved", "rejected", "expired"]),
