@@ -24,6 +24,7 @@ export class DurableState<T> {
   private readonly lockPath: string;
   private readonly initializedPath: string;
   private closed = false;
+  private ambiguous = false;
 
   constructor(private readonly path: string) {
     if (!isAbsolute(path))
@@ -87,6 +88,10 @@ export class DurableState<T> {
 
   save(payload: T): void {
     if (this.closed) throw new Error("Gateway state writer is closed");
+    if (this.ambiguous)
+      throw new Error(
+        "Gateway state write was ambiguous; restart to reconcile from disk",
+      );
     const temporary = join(
       dirname(this.path),
       `.${basename(this.path)}.${process.pid}.tmp`,
@@ -104,6 +109,7 @@ export class DurableState<T> {
       closeSync(descriptor);
     }
     renameSync(temporary, this.path);
+    this.ambiguous = true;
     if (!existsSync(this.initializedPath)) {
       const marker = openSync(this.initializedPath, "wx", 0o600);
       try {
@@ -119,6 +125,7 @@ export class DurableState<T> {
     } finally {
       closeSync(directory);
     }
+    this.ambiguous = false;
   }
 
   close(): void {

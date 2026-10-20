@@ -4,6 +4,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,7 +24,7 @@ import {
   evaluateWithTransport,
 } from "@webank/guardian";
 import { keccak256, stringToHex } from "viem";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   newAgentKey,
   signAgentRequest,
@@ -35,6 +36,7 @@ import {
   assertAuditedPolicyIntent,
 } from "../src/bank-policy-intent.js";
 import { canonicalJson, sha256 } from "../src/crypto.js";
+import { DurableState } from "../src/durable-state.js";
 import type {
   GatewayDependencies,
   Merchant,
@@ -442,6 +444,7 @@ describe("Gateway HTTP decision slice", () => {
   const openApps: ReturnType<typeof createGateway>[] = [];
   const temporaryDirs: string[] = [];
   afterEach(async () => {
+    vi.restoreAllMocks();
     await Promise.all(openApps.splice(0).map((app) => app.close()));
     for (const directory of temporaryDirs.splice(0))
       rmSync(directory, { recursive: true, force: true });
@@ -1858,7 +1861,21 @@ describe("Gateway HTTP decision slice", () => {
     );
   });
 
-  it("restores drill state and bank visibility when the owner drill start cannot be saved", async () => {
+  const drillRequest = (action: "start" | "stop", key: string) => ({
+    method: "POST" as const,
+    url: `/v1/app/demo/drills/${action}`,
+    headers: { authorization: "Bearer test-app", "idempotency-key": key },
+    payload: {},
+  });
+  const readState = (statePath: string) =>
+    JSON.parse(readFileSync(statePath, "utf8")).payload;
+  const breakStateAfterReplacement = (statePath: string) => {
+    const marker = `${statePath}.initialized`;
+    rmSync(marker, { force: true });
+    symlinkSync(`${statePath}.missing`, marker);
+  };
+
+  it("restores drill state and bank visibility when a drill start or stop save fails before replacement", async () => {
     const directory = mkdtempSync(join(tmpdir(), "webank-drill-save-"));
     temporaryDirs.push(directory);
     const statePath = join(directory, "gateway.json");
@@ -1868,66 +1885,133 @@ describe("Gateway HTTP decision slice", () => {
       demoTrustControlsEnabled: true,
       setDrillVisibility: async (enabled) => {
         visibility.push(enabled);
-        if (enabled)
-          writeFileSync(
-            join(directory, `.gateway.json.${process.pid}.tmp`),
-            "",
-          );
-        else
-          rmSync(join(directory, `.gateway.json.${process.pid}.tmp`), {
-            force: true,
-          });
       },
     });
     openApps.push(app);
-    const started = await app.inject({
-      method: "POST",
-      url: "/v1/app/demo/drills/start",
-      headers: {
-        authorization: "Bearer test-app",
-        "idempotency-key": "start-unsaved-drill",
-      },
-      payload: {},
-    });
+    await app.ready();
+    visibility.length = 0;
+    const failing = vi
+      .spyOn(DurableState.prototype, "save")
+      .mockImplementation(() => {
+        throw new Error("disk full");
+      });
+    const started = await app.inject(drillRequest("start", "start-unsaved"));
     expect(started.statusCode).toBeGreaterThanOrEqual(500);
     expect(visibility).toEqual([true, false]);
-    const status = await app.inject({
+    failing.mockRestore();
+    const idle = await app.inject({
       method: "GET",
       url: "/v1/app/demo/drills",
       headers: { authorization: "Bearer test-app" },
     });
-    expect(status.json()).toEqual({ active: false, drill_id: null });
+    expect(idle.json()).toEqual({ active: false, drill_id: null });
+    expect(readState(statePath).activeDrill ?? null).toBeNull();
+
+    expect(
+      (await app.inject(drillRequest("start", "start-saved"))).statusCode,
+    ).toBe(200);
+    visibility.length = 0;
+    const failingStop = vi
+      .spyOn(DurableState.prototype, "save")
+      .mockImplementation(() => {
+        throw new Error("disk full");
+      });
+    const stopped = await app.inject(drillRequest("stop", "stop-unsaved"));
+    expect(stopped.statusCode).toBeGreaterThanOrEqual(500);
+    expect(visibility).toEqual([false, true]);
+    failingStop.mockRestore();
+    const still = await app.inject({
+      method: "GET",
+      url: "/v1/app/demo/drills",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(still.json().active).toBe(true);
+    expect(readState(statePath).activeDrill).not.toBeNull();
   });
 
-  it("keeps the prior licence and no trust event when the final trust save fails", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "webank-trust-save-"));
+  it("fails closed and reconciles from disk when a drill save fails after replacement", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-drill-ambiguous-"));
     temporaryDirs.push(directory);
     const statePath = join(directory, "gateway.json");
-    const fence = join(directory, `.gateway.json.${process.pid}.tmp`);
+    const first = fixture({
+      statePath,
+      demoTrustControlsEnabled: true,
+      setDrillVisibility: async () => {},
+    });
+    breakStateAfterReplacement(statePath);
+    const started = await first.app.inject(
+      drillRequest("start", "start-ambiguous"),
+    );
+    expect(started.statusCode).toBeGreaterThanOrEqual(500);
+    const refused = await first.app.inject({
+      method: "GET",
+      url: "/v1/app/demo/drills",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(refused.statusCode).toBeGreaterThanOrEqual(500);
+    const durableDrill = readState(statePath).activeDrill;
+    expect(durableDrill).not.toBeNull();
+    await first.app.close();
+    rmSync(`${statePath}.initialized`, { force: true });
+    writeFileSync(`${statePath}.initialized`, "1\n");
+
+    const visibility: boolean[] = [];
+    const restarted = fixture({
+      statePath,
+      demoTrustControlsEnabled: true,
+      setDrillVisibility: async (enabled) => {
+        visibility.push(enabled);
+      },
+    });
+    openApps.push(restarted.app);
+    const status = await restarted.app.inject({
+      method: "GET",
+      url: "/v1/app/demo/drills",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(status.json()).toEqual({
+      active: true,
+      drill_id: durableDrill.drillId,
+    });
+    expect(visibility).toEqual([true]);
+  });
+
+  async function startedDecoyFixture(directory: string, statePath: string) {
     const decoy = { ...merchant, honeypot: true };
-    const { app } = fixture({
+    const built = fixture({
       statePath,
       seedMandate: activeMandate(),
       merchant: decoy,
       demoTrustControlsEnabled: true,
       setDrillVisibility: async () => {},
-      setTrustLight: async () => {
-        writeFileSync(fence, "");
-        return `0x${"b".repeat(64)}`;
-      },
     });
+    const started = await built.app.inject(
+      drillRequest("start", "start-drill"),
+    );
+    expect(started.statusCode).toBe(200);
+    void directory;
+    return built;
+  }
+
+  it("keeps the prior licence and a durable pending intent when the final trust save fails before replacement", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-trust-save-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    const { app } = await startedDecoyFixture(directory, statePath);
     openApps.push(app);
-    await app.inject({
-      method: "POST",
-      url: "/v1/app/demo/drills/start",
-      headers: {
-        authorization: "Bearer test-app",
-        "idempotency-key": "start-trust-drill",
-      },
-      payload: {},
-    });
+    const original = DurableState.prototype.save;
+    const failing = vi
+      .spyOn(DurableState.prototype, "save")
+      .mockImplementation(function (this: unknown, payload: unknown) {
+        if (
+          ((payload as { trustEvents?: unknown[] }).trustEvents ?? []).length >
+          0
+        )
+          throw new Error("disk full");
+        return original.call(this as DurableState<unknown>, payload);
+      });
     await payment(app, "mdt_seed", signedPayreq(), "unsaved-trust");
-    rmSync(fence, { force: true });
+    failing.mockRestore();
     const agents = await app.inject({
       method: "GET",
       url: "/v1/app/agents",
@@ -1940,6 +2024,55 @@ describe("Gateway HTTP decision slice", () => {
       headers: { authorization: "Bearer test-app" },
     });
     expect(history.json().items).toEqual([]);
+    const durable = readState(statePath);
+    expect(durable.trustEvents).toEqual([]);
+    expect(durable.trustPending).toHaveLength(1);
+  });
+
+  it("fails closed and finishes the trust change on restart when a trust save fails after replacement", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-trust-ambiguous-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    const first = await startedDecoyFixture(directory, statePath);
+    const original = DurableState.prototype.save;
+    const arm = vi
+      .spyOn(DurableState.prototype, "save")
+      .mockImplementation(function (this: unknown, payload: unknown) {
+        const pending = (payload as { trustPending?: unknown[] }).trustPending;
+        if ((pending ?? []).length > 0) breakStateAfterReplacement(statePath);
+        return original.call(this as DurableState<unknown>, payload);
+      });
+    await payment(first.app, "mdt_seed", signedPayreq(), "ambiguous-trust");
+    arm.mockRestore();
+    const refused = await first.app.inject({
+      method: "GET",
+      url: "/v1/app/agents",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(refused.statusCode).toBeGreaterThanOrEqual(500);
+    await first.app.close();
+    rmSync(`${statePath}.initialized`, { force: true });
+    writeFileSync(`${statePath}.initialized`, "1\n");
+
+    const restarted = fixture({
+      statePath,
+      merchant: { ...merchant, honeypot: true },
+      demoTrustControlsEnabled: true,
+      setDrillVisibility: async () => {},
+    });
+    openApps.push(restarted.app);
+    const agents = await restarted.app.inject({
+      method: "GET",
+      url: "/v1/app/agents",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(agents.json().items[0].licence.level).toBe("RED");
+    const history = await restarted.app.inject({
+      method: "GET",
+      url: `/v1/app/agents/${agent.agent_id}/trust-events`,
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(history.json().items).toHaveLength(1);
   });
 
   it("requires an owner-active drill before a verified decoy attempt turns Red, then returns only to Amber", async () => {
