@@ -120,6 +120,7 @@ Pending historical pairings lose their old replacement choice on restart and nee
 An audit anchor failure leaves pairing pending with no new agent grant; retry with a fresh idempotency key after chain recovery.
 Before accepting requests after startup, Gateway releases and durably cancels active mandates left on revoked or deleted agents; it does not release a mandate with an in-flight payment.
 If an orphan hold cannot be released, startup fails and preserves the mandate for operator recovery.
+If a state write fails after the snapshot may have been replaced, Gateway fences itself: every request, including one already in flight, returns `503 service_unavailable` with no external side effects until restart reconciles from disk.
 
 ## Verification
 

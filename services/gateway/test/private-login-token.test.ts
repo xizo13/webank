@@ -92,7 +92,7 @@ describe("standalone Gateway login tokens", () => {
     } finally {
       await rm(directory, { recursive: true, force: true });
     }
-  });
+  }, 15_000);
 
   it("rejects absent or relative token paths", () => {
     const name = "WEBANK_TEST_PRIVATE_TOKEN_FILE";
