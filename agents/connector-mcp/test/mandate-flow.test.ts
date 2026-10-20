@@ -15,6 +15,7 @@ import {
   GET as shopGet,
   POST as shopPost,
 } from "../../../apps/shops/app/api/shop/route.js";
+import { POST as shopOperatorControl } from "../../../apps/shops/app/internal/demo-control/route.js";
 import { POST as shopDrillVisibility } from "../../../apps/shops/app/internal/drill-visibility/route.js";
 import { merchantPublicKeyHex } from "../../../apps/shops/lib/signing.js";
 import { resetDemo } from "../../../apps/shops/lib/store.js";
@@ -537,9 +538,11 @@ describe("agent-facing mandate flow through MCP and Gateway HTTP", () => {
     const shopDataDir = mkdtempSync(join(tmpdir(), "webank-trust-shop-"));
     const priorShopDataDir = process.env.SHOP_DATA_DIR;
     const priorShopToken = process.env.SHOP_INTERNAL_TOKEN;
+    const priorShopOperatorToken = process.env.SHOP_OPERATOR_TOKEN;
     const originalFetch = globalThis.fetch;
     process.env.SHOP_DATA_DIR = shopDataDir;
     process.env.SHOP_INTERNAL_TOKEN = "isolated-trust-test-token";
+    process.env.SHOP_OPERATOR_TOKEN = "isolated-trust-operator-token";
     resetDemo({ clearDrill: true });
     globalThis.fetch = async (input, init = {}) => {
       const url = new URL(String(input));
@@ -568,6 +571,9 @@ describe("agent-facing mandate flow through MCP and Gateway HTTP", () => {
       else process.env.SHOP_DATA_DIR = priorShopDataDir;
       if (priorShopToken === undefined) delete process.env.SHOP_INTERNAL_TOKEN;
       else process.env.SHOP_INTERNAL_TOKEN = priorShopToken;
+      if (priorShopOperatorToken === undefined)
+        delete process.env.SHOP_OPERATOR_TOKEN;
+      else process.env.SHOP_OPERATOR_TOKEN = priorShopOperatorToken;
       rmSync(shopDataDir, { recursive: true, force: true });
     });
     const shopTools = await shopClient.listTools();
@@ -592,16 +598,26 @@ describe("agent-facing mandate flow through MCP and Gateway HTTP", () => {
       shop_name: "BaoTao Shop",
     });
     const setShopPrice = async (amount: number) => {
-      const result = await shopPost(
-        new Request("http://127.0.0.1:3001/api/shop", {
+      const request = new Request(
+        "http://127.0.0.1:3001/internal/demo-control",
+        {
           method: "POST",
-          headers: { "content-type": "application/json" },
+          headers: {
+            "content-type": "application/json",
+            authorization: "Bearer isolated-trust-operator-token",
+          },
           body: JSON.stringify({
             operation: "set_price",
             sku: "NOVA-Q3-BLK",
             amount,
           }),
-        }) as Parameters<typeof shopPost>[0],
+        },
+      );
+      Object.defineProperty(request, "nextUrl", {
+        value: new URL(request.url),
+      });
+      const result = await shopOperatorControl(
+        request as Parameters<typeof shopOperatorControl>[0],
       );
       expect(result.status).toBe(200);
     };

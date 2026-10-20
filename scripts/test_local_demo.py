@@ -3,8 +3,10 @@
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import os
+import platform
 import tempfile
 import types
 import unittest
@@ -20,6 +22,10 @@ chain_spec = importlib.util.spec_from_file_location("chain_manage", Path(__file_
 assert chain_spec and chain_spec.loader
 chain_manage = importlib.util.module_from_spec(chain_spec)
 chain_spec.loader.exec_module(chain_manage)
+treasurer_spec = importlib.util.spec_from_file_location("treasurer_simulation", Path(__file__).with_name("treasurer-simulation.py"))
+assert treasurer_spec and treasurer_spec.loader
+treasurer_simulation = importlib.util.module_from_spec(treasurer_spec)
+treasurer_spec.loader.exec_module(treasurer_simulation)
 
 
 def address(letter: str) -> str:
@@ -42,6 +48,33 @@ def receipt(hash_value: str, *, to=None, deployed=None, logs=None) -> dict:
 
 
 class LauncherProcessIdentityTests(unittest.TestCase):
+    def test_local_chain_artifacts_select_linux_x86_64_without_mac_archive(self):
+        with mock.patch.object(platform, "system", return_value="Linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"):
+            artifacts = local_demo.chain_artifact_paths()
+        self.assertEqual(artifacts["FISCO_ARCHIVE_FILE"].name, "fisco-bcos-linux-x86_64.tar.gz")
+        self.assertEqual(artifacts["FISCO_TASSL_BINARY"].name, "tassl-1.1.1b")
+
+    def test_pinned_linux_release_is_distinct_from_mac_release(self):
+        with mock.patch.object(platform, "system", return_value="Linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"):
+            linux = chain_manage.platform_release()
+        with mock.patch.object(platform, "system", return_value="Darwin"), \
+             mock.patch.object(platform, "machine", return_value="arm64"):
+            mac = chain_manage.platform_release()
+        self.assertEqual(linux["archive_name"], "fisco-bcos-linux-x86_64.tar.gz")
+        self.assertEqual(linux["tassl_member"], "tassl-1.1.1b-linux-x86_64")
+        self.assertNotEqual(linux["binary_sha256"], mac["binary_sha256"])
+        self.assertEqual(mac["archive_name"], "fisco-bcos-v3.17.1-macOS-arm.tar.gz")
+
+    def test_unsupported_native_windows_host_fails_before_artifact_selection(self):
+        with mock.patch.object(platform, "system", return_value="Windows"), \
+             mock.patch.object(platform, "machine", return_value="AMD64"):
+            with self.assertRaisesRegex(RuntimeError, "Unsupported local FISCO host"):
+                chain_manage.platform_release()
+            with self.assertRaisesRegex(RuntimeError, "Unsupported local FISCO host"):
+                local_demo.chain_artifact_paths()
+
     def test_launcher_selects_node_22_and_places_it_before_other_nodes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -425,6 +458,8 @@ class FreshResetJournalTests(unittest.TestCase):
         runtime.mkdir(mode=0o700)
         self.patches = [
             mock.patch.object(local_demo, "RUNTIME", runtime),
+            mock.patch.object(local_demo, "CONSOLE_SIMULATION", runtime / "console-simulation.jsonl"),
+            mock.patch.object(local_demo, "SHOP_OPERATOR_TOKEN", runtime / "shop-operator-token"),
             mock.patch.object(local_demo, "FRESH_RESET", runtime / "fresh-reset.json"),
             mock.patch.object(local_demo, "GATEWAY_STATE", runtime / "gateway-state.json"),
             mock.patch.object(local_demo, "ADDRESSES", root / "addresses.json"),
@@ -471,6 +506,164 @@ class FreshResetJournalTests(unittest.TestCase):
                 with self.assertRaises(RuntimeError):
                     local_demo.fresh_reset_journal()
                 self.assertFalse(local_demo.FRESH_RESET.exists())
+
+    def test_expired_pairing_is_quiescent_but_live_pairing_blocks(self):
+        self.populate(True)
+        raw = json.loads(local_demo.GATEWAY_STATE.read_text())
+        for expires_at, blocked in ((0, False), (int(local_demo.time.time() * 1000) + 60_000, True)):
+            payload = {**raw["payload"], "pairings": [{"status": "pending", "expiresAt": expires_at}]}
+            digest = hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()).hexdigest()
+            self.source(local_demo.GATEWAY_STATE, json.dumps({"version": 1, "payload": payload, "sha256": digest}))
+            if blocked:
+                with self.assertRaisesRegex(RuntimeError, "Resolve pairings status pending"):
+                    local_demo.verify_reset_quiescent(local_demo.GATEWAY_STATE)
+            else:
+                local_demo.verify_reset_quiescent(local_demo.GATEWAY_STATE)
+
+    def test_console_simulation_is_archived_without_touching_chain_or_signers(self):
+        self.populate(True)
+        self.source(local_demo.CONSOLE_SIMULATION, '{"schema":"console_simulation.v1"}\n')
+        journal = local_demo.fresh_reset_journal()
+        archive = local_demo.archive_fresh_inputs(journal)
+        self.assertEqual((archive / "console-simulation").read_text(), '{"schema":"console_simulation.v1"}\n')
+        self.assertFalse(local_demo.CONSOLE_SIMULATION.exists())
+        self.assertEqual(json.loads((archive / "addresses").read_text())["agentWallet"], address("d"))
+
+    def test_shop_operator_token_is_private_and_reset_uses_protected_route(self):
+        local_demo.write_private_token(local_demo.SHOP_OPERATOR_TOKEN, "x" * 43)
+        self.assertEqual(local_demo.SHOP_OPERATOR_TOKEN.stat().st_mode & 0o777, 0o600)
+        calls = []
+        def fake_request(url, *, payload=None, headers=None):
+            calls.append((url, payload, headers))
+            return 200, b'{"ok":true,"reset":true,"attack":false,"coffee_price":8800}'
+        with mock.patch.object(local_demo, "request", side_effect=fake_request):
+            local_demo.recording_shop_reset()
+        self.assertEqual(calls[0][0], "http://127.0.0.1:3001/internal/demo-control")
+        self.assertEqual(calls[0][1], {"operation": "reset"})
+        self.assertEqual(calls[0][2]["Authorization"], "Bearer " + "x" * 43)
+        with mock.patch.object(local_demo, "request", return_value=(409, b'{}')):
+            with self.assertRaisesRegex(RuntimeError, "stop the bank drill"):
+                local_demo.recording_shop_reset()
+
+    def test_recording_readback_uses_private_owner_token_and_actual_session_cookie(self):
+        token_file = local_demo.RUNTIME / "app-login-token"
+        self.source(token_file, "x" * 32 + "\n")
+        login = mock.MagicMock()
+        login.__enter__.return_value.headers.get.return_value = (
+            "webank_local_demo_session=session-value; HttpOnly; SameSite=Lax"
+        )
+        status = mock.MagicMock()
+        status.__enter__.return_value.read.return_value = b'{"agent_wallet":{"enabled":false}}'
+        with mock.patch.object(local_demo, "TOKEN", token_file), \
+             mock.patch.object(local_demo.urllib.request, "urlopen", side_effect=[login, status]) as opened:
+            result = local_demo.recording_owner_readback("/v1/app/home")
+        self.assertFalse(result["agent_wallet"]["enabled"])
+        login_request = opened.call_args_list[0].args[0]
+        self.assertEqual(login_request.get_header("Authorization"), "Bearer " + "x" * 32)
+        self.assertEqual(login_request.get_header("Content-type"), "application/json")
+        self.assertEqual(login_request.data, b"{}")
+        self.assertEqual(opened.call_args_list[1].args[0].get_header("Cookie"), "webank_local_demo_session=session-value")
+
+    def test_recording_home_readback_waits_for_transient_chain_unavailable(self):
+        token_file = local_demo.RUNTIME / "app-login-token"
+        self.source(token_file, "x" * 32 + "\n")
+        login = mock.MagicMock()
+        login.__enter__.return_value.headers.get.return_value = "webank_local_demo_session=session-value; HttpOnly"
+        home = mock.MagicMock()
+        home.__enter__.return_value.read.return_value = b'{"agent_wallet":{"enabled":false}}'
+        transient = local_demo.urllib.error.HTTPError(
+            "http://127.0.0.1:3002/v1/app/home", 503, "Unavailable", {},
+            io.BytesIO(b'{"error":{"code":"chain_unavailable"}}'),
+        )
+        with mock.patch.object(local_demo, "TOKEN", token_file), \
+             mock.patch.object(local_demo.urllib.request, "urlopen", side_effect=[login, transient, home]) as opened, \
+             mock.patch.object(local_demo.time, "sleep") as slept:
+            result = local_demo.recording_owner_readback("/v1/app/home")
+        self.assertFalse(result["agent_wallet"]["enabled"])
+        self.assertEqual(opened.call_count, 3)
+        slept.assert_called_once()
+
+    def test_recording_home_readback_exhausts_transient_retry_without_secrets(self):
+        token_file = local_demo.RUNTIME / "app-login-token"
+        self.source(token_file, "x" * 32 + "\n")
+        login = mock.MagicMock()
+        login.__enter__.return_value.headers.get.return_value = "webank_local_demo_session=session-value; HttpOnly"
+        def opened(request, **_kwargs):
+            if request.full_url.endswith("/demo/login"):
+                return login
+            raise local_demo.urllib.error.HTTPError(
+                request.full_url, 503, "Unavailable", {},
+                io.BytesIO(b'{"error":{"code":"chain_unavailable","message":"private diagnostic"}}'),
+            )
+        with mock.patch.object(local_demo, "TOKEN", token_file), \
+             mock.patch.object(local_demo.urllib.request, "urlopen", side_effect=opened) as urlopen, \
+             mock.patch.object(local_demo.time, "sleep") as slept:
+            with self.assertRaisesRegex(RuntimeError, "HTTP 503 chain_unavailable after .* attempts") as error:
+                local_demo.recording_owner_readback("/v1/app/home")
+        self.assertNotIn("private diagnostic", str(error.exception))
+        self.assertNotIn("x" * 32, str(error.exception))
+        self.assertGreater(urlopen.call_count, 2)
+        self.assertEqual(slept.call_count, urlopen.call_count - 2)
+
+    def test_recording_readback_does_not_retry_non_chain_errors(self):
+        token_file = local_demo.RUNTIME / "app-login-token"
+        self.source(token_file, "x" * 32 + "\n")
+        for path, code, body in (
+            ("/v1/app/home", 403, b'{"error":{"code":"unauthorized"}}'),
+            ("/v1/app/home", 503, b'{"error":{"code":"policy_unavailable"}}'),
+            ("/v1/app/policy", 503, b'{"error":{"code":"chain_unavailable"}}'),
+        ):
+            with self.subTest(path=path, code=code, body=body):
+                login = mock.MagicMock()
+                login.__enter__.return_value.headers.get.return_value = "webank_local_demo_session=session-value; HttpOnly"
+                problem = local_demo.urllib.error.HTTPError(
+                    f"http://127.0.0.1:3002{path}", code, "Failure", {}, io.BytesIO(body),
+                )
+                with mock.patch.object(local_demo, "TOKEN", token_file), \
+                     mock.patch.object(local_demo.urllib.request, "urlopen", side_effect=[login, problem]) as opened, \
+                     mock.patch.object(local_demo.time, "sleep") as slept:
+                    with self.assertRaisesRegex(RuntimeError, f"HTTP {code}"):
+                        local_demo.recording_owner_readback(path)
+                self.assertEqual(opened.call_count, 2)
+                slept.assert_not_called()
+
+    def test_stage_status_is_read_only_and_blocks_running_demo(self):
+        self.populate(False)
+        state = local_demo.RUNTIME / "state.json"
+        with mock.patch.object(local_demo, "STATE", state), \
+             mock.patch.object(local_demo, "FUNDING_CUTOVER", local_demo.RUNTIME / "funding-cutover.json"), \
+             mock.patch.object(local_demo, "chain_pids", return_value={}), \
+             mock.patch.object(local_demo, "port_busy", return_value=False):
+            self.assertEqual(local_demo.recording_stage_issues(), [])
+            self.assertFalse(local_demo.FRESH_RESET.exists())
+            self.assertFalse(local_demo.SHOP_OPERATOR_TOKEN.exists())
+            self.source(state, "owned")
+            self.assertIn("Stop the launcher-owned demo with local-demo-down.sh first", local_demo.recording_stage_issues())
+
+    def test_stage_execute_stops_owned_demo_before_fresh_setup_and_readback(self):
+        state = local_demo.RUNTIME / "state.json"
+        self.source(state, json.dumps({"version": 1, "children": {}}))
+        calls = []
+        with mock.patch.object(local_demo, "STATE", state), \
+             mock.patch.object(local_demo, "recording_stage_issues", side_effect=[[], []]), \
+             mock.patch.object(local_demo, "down", side_effect=lambda _state: calls.append("down") or True), \
+             mock.patch.object(local_demo, "up", side_effect=lambda fresh: calls.append(("up", fresh))), \
+             mock.patch.object(local_demo, "recording_shop_reset", side_effect=lambda: calls.append("shop-reset")), \
+             mock.patch.object(local_demo, "verify_recording_stage", side_effect=lambda: calls.append("readback")):
+            local_demo.stage_recording(True)
+        self.assertEqual(calls, ["down", ("up", True), "shop-reset", "readback"])
+
+    def test_stage_refuses_reset_when_launcher_cannot_verify_stop(self):
+        state = local_demo.RUNTIME / "state.json"
+        self.source(state, json.dumps({"version": 1, "children": {}}))
+        with mock.patch.object(local_demo, "STATE", state), \
+             mock.patch.object(local_demo, "recording_stage_issues", return_value=[]), \
+             mock.patch.object(local_demo, "down", return_value=False), \
+             mock.patch.object(local_demo, "up") as fresh_up:
+            with self.assertRaisesRegex(RuntimeError, "could not be stopped safely"):
+                local_demo.stage_recording(True)
+            fresh_up.assert_not_called()
+
 
     def test_unknown_status_and_missing_core_field_fail_closed(self):
         self.populate(False)
@@ -545,6 +738,38 @@ class FreshResetJournalTests(unittest.TestCase):
         self.assertFalse(local_demo.FRESH_RESET.exists())
 
 
+class TreasurerSimulationTests(unittest.TestCase):
+    def test_renewal_and_poisoned_topup_are_display_only_owner_files(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            runtime.chmod(0o700)
+            first = treasurer_simulation.events("renewal", 4900, "2026-10-20T00:00:00Z")
+            second = treasurer_simulation.events("poisoned-topup", None, "2026-10-20T00:00:01Z")
+            self.assertEqual([item["scene"] for item in first + second], [
+                "treasurer_renewal_reserved", "treasurer_renewal_paid", "treasurer_topup_blocked",
+            ])
+            treasurer_simulation.append_events(runtime, first + second)
+            path = runtime / "console-simulation.jsonl"
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual([json.loads(line) for line in path.read_text().splitlines()], first + second)
+            self.assertEqual(second[0]["amount_fen"], 200000)
+            with self.assertRaises(ValueError):
+                treasurer_simulation.events("renewal", None, "2026-10-20T00:00:00Z")
+            with self.assertRaises(ValueError):
+                treasurer_simulation.events("poisoned-topup", 1, "2026-10-20T00:00:00Z")
+
+    def test_simulation_rejects_symlink_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            runtime = Path(directory)
+            runtime.chmod(0o700)
+            target = runtime / "target"
+            target.write_text("unchanged")
+            (runtime / "console-simulation.jsonl").symlink_to(target)
+            with self.assertRaises(OSError):
+                treasurer_simulation.append_events(runtime, treasurer_simulation.events("poisoned-topup", None, "2026-10-20T00:00:00Z"))
+            self.assertEqual(target.read_text(), "unchanged")
+
+
 class FreshLauncherFlowTests(FreshResetJournalTests):
     def test_fresh_gateway_start_failure_then_forward_resume(self):
         for migrated in (False, True):
@@ -616,6 +841,7 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                     mock.patch.object(local_demo, "APP", app),
                     mock.patch.object(local_demo, "STATE", local_demo.RUNTIME / "state.json"),
                     mock.patch.object(local_demo, "TOKEN", local_demo.RUNTIME / "app-login-token"),
+                    mock.patch.object(local_demo, "SHOP_OPERATOR_TOKEN", local_demo.RUNTIME / "shop-operator-token"),
                     mock.patch.object(local_demo, "FUNDING_CUTOVER", local_demo.RUNTIME / "funding-cutover.json"),
                     mock.patch.object(local_demo, "FUNDING_STAGE", chain / "funding-stage.json"),
                     mock.patch.object(local_demo, "SHOP_KEYS", shop / "merchant-keys.json"),

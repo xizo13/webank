@@ -27,3 +27,5 @@ No mock verdict is presented as a real model result.
 
 Run `pnpm exec vitest run services/guardian/test/hermes.test.ts redteam/guardian.redteam.test.ts` from the workspace root for focused transport and attack-boundary tests.
 These tests use fake Hermes responses and do not measure a live model's resistance to prompt injection.
+The dedicated zero-tool profile also passed a signed local shop-to-app acceptance run with an Amber owner card, a Green ¥77.00 FISCO payment without a card, and a contradictory signed order denied by live Hermes without a wallet debit.
+That run used simulated currency and owner approval proof, and it does not establish general prompt-injection resistance.

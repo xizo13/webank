@@ -848,6 +848,35 @@ button:disabled {
   grid-template-columns: repeat(2, 1fr);
   gap: 20px;
 }
+.demo-auth {
+  display: grid;
+  gap: 8px;
+  max-width: 580px;
+  margin: 0 0 24px;
+  padding: 18px 20px;
+  border: 1px solid #d9d1db;
+  background: #fff;
+}
+.demo-auth label {
+  font-size: 13px;
+  font-weight: 700;
+}
+.demo-auth input {
+  width: 100%;
+  min-height: 42px;
+  padding: 10px 12px;
+  border: 1px solid #c9c0cf;
+  border-radius: 4px;
+}
+.demo-auth p {
+  margin: 0;
+  color: #726b77;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.demo-auth code {
+  overflow-wrap: anywhere;
+}
 .demo-card {
   background: #fff;
   border: 1px solid #e5dde7;
@@ -872,6 +901,22 @@ button:disabled {
 }
 .demo-card .button + .button {
   margin-top: 10px;
+}
+.demo-watch {
+  margin-top: 18px;
+  padding: 15px;
+  border-left: 3px solid #8958b7;
+  background: #f4edf9;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.demo-watch p {
+  margin: 8px 0;
+  color: #3d3344;
+  max-width: none;
+}
+.demo-watch small {
+  color: #62576a;
 }
 .demo-number {
   font-size: 10px;

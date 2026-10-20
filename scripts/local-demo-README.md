@@ -6,8 +6,25 @@ Run from the repository root after the pinned workspace dependencies and FISCO r
 ./scripts/local-demo-up.sh
 ```
 
+On Windows, use Ubuntu x86_64 under WSL2 from a checkout in the Linux filesystem, such as `~/webank`.
+Native Windows is not supported.
+The Linux chain artifacts are pinned and selected automatically, but the complete WSL2 recording flow still needs teammate end-to-end verification.
+For a first local setup in WSL2, install Node 22, Corepack, Python 3, `curl`, and `lsof`, then prepare the pinned workspace and chain before the launcher:
+
+```sh
+corepack pnpm install --frozen-lockfile
+./scripts/chain-up.sh
+./scripts/chain-down.sh
+./scripts/local-demo-up.sh
+```
+
+Run these commands in Ubuntu, not PowerShell.
+The first chain run creates local signer files and node state; the final launcher starts the shop, seeds merchants, and starts the same chain again.
+Do not copy the owner's runtime directory, tokens, signer files, or Hermes credentials to another machine.
+
 The app is served at `http://127.0.0.1:8081` from a static Expo web export.
 The simulated shop uses `127.0.0.1:3001`, the strict local-demo Gateway uses `127.0.0.1:3002`, and the four-node non-SM FISCO BCOS chain exposes Web3 RPC at `127.0.0.1:8545`.
+The read-only Bank Console is at `http://127.0.0.1:3002/demo/console` and accepts only local loopback requests.
 The launcher does not open a browser or install dependencies.
 It selects an installed Node 22 binary and puts that binary's directory first on PATH for child services, Corepack, and the chain seed process.
 Set `WEBANK_NODE_BINARY` to a specific executable Node 22 path when the automatic search cannot find one.
@@ -24,7 +41,8 @@ The Gateway can call a dedicated local Nous Research Hermes Agent profile for on
 Set the Hermes URL, key, and operator verification flag only in local uncommitted configuration after checking that the profile has no callable tools, MCP servers, plugins, memory, or skills.
 The [Guardian guide](../services/guardian/README.md) lists the exact environment names and isolation checks.
 Without verified configuration, Guardian fails closed to owner review.
-The deterministic tests cover this transport, but a live isolated Hermes decision is still pending acceptance.
+The deterministic tests cover this transport, and the dedicated zero-tool profile passed a live synthetic smoke test.
+The signed local shop-to-app acceptance run later showed one Amber owner card, a Green ¥77.00 FISCO payment without a card, and a contradictory signed order denied by Hermes without a wallet debit.
 
 Before a fresh reset, stop the launcher and inspect free disk space from the repository root:
 
@@ -34,7 +52,12 @@ df -h .
 ```
 
 The launcher requires at least 1 GiB free and builds locally, so leave additional room above that minimum for chain data and build output.
+For the recording setup, run `./scripts/local-demo-stage.sh` first to see a read-only staging status.
+After resolving active financial work, run `./scripts/local-demo-stage.sh --execute` to stop the launcher-owned demo, archive the old owner and shop state, deploy new contracts on the same FISCO chain, and verify the recording baseline.
+The staging command checks that the Agent Wallet service is off, its new contract balance and UTC day and month spending are zero, there are no new agents or pairings, the bank fire drill is off, and the protected shop reset has restored ordinary prices and controls.
+It stops the newly started services if those checks fail; inspect the preserved archive and logs before retrying.
 Resolve pending pairings, approvals, mandates, payments, funding, sweeps, human payments, and any historical agent replacement fence before resetting; the launcher refuses to archive unresolved Gateway financial state.
+An expired pairing may still be stored as `pending`; the reset accepts it only after its verified deadline has passed.
 To archive the current local demo state and deploy a new funded wallet on the same preserved chain history, run:
 
 ```sh
@@ -43,6 +66,7 @@ To archive the current local demo state and deploy a new funded wallet on the sa
 
 The chain operator reseeds all four simulated merchants after deployment and verifies the native deployment, opening mint, and wallet configuration receipts.
 The new deployment mints 866,000 fen to the simulated main account and starts its Agent Wallet at zero.
+In a fresh funded local demo, the Agent Wallet starts disabled; the signed-in owner must review and simulate its one-time enable action in the app before pairing, funding, mandates, or payment requests.
 Fund the Agent Wallet through the app's visibly simulated owner approval before creating a mandate or running a payment flow.
 The `--fresh` option preserves signer keys, merchant keys, the connector's local credential, and FISCO chain history.
 It archives the prior private Gateway state and receipt signing identity, address manifest, and shop state under `scripts/local-demo-runtime/fresh-reset-archives/<timestamp-random>/`.
@@ -51,6 +75,8 @@ An ordinary restart keeps the deployment, Gateway state, shop state, and identit
 Startup does not submit a merchant payment.
 After `--fresh`, call `connect_webank({ re_pair: true })` in the MCP host to replace the old local connector pairing, then approve the new pairing in the app.
 The launcher does not delete or silently rotate the connector credential.
+The recording stage generates a separate owner-only shop operator token at `scripts/local-demo-runtime/shop-operator-token` and uses it only over loopback for the protected shop reset.
+The token never appears in the URL or logs.
 The connector cannot unfreeze an agent or restore a prior licence.
 
 The fresh reset takes an exclusive Gateway writer lock while it validates and archives private state.
@@ -103,6 +129,7 @@ Preserve the state, logs, and chain history if that verification remains uncerta
 
 `scripts/local-demo-e2e.mts` exercises the real local shop checkout, connector client, Gateway, FISCO test-token settlement, shop callback, and app payment-detail endpoint without an MCP host or browser.
 It reads the private bootstrap login token through `WEBANK_DEMO_LOGIN_TOKEN` and accepts `success`, `security-only`, and `callback-failure` values through `WEBANK_E2E_MODE`.
+In success mode, it also reads the mode-`0600` `shop-operator-token` file to reset shop data through the protected loopback operator route after the Gateway fire drill stops.
 The driver does not fund a zero-balance Agent Wallet, so fund it in the app before any mode that creates a mandate.
 The `success` mode resets shop demo state and submits a local-chain payment that uses wallet balance and daily cap; run it only on an isolated funded deployment.
 The `security-only` mode is stateful because it creates mandates and freezes an agent, even when it avoids another payment.
@@ -120,5 +147,20 @@ All merchants and e-CNY balances are simulated, while contract deployments and a
 Web approval uses an explicitly simulated proof and is not Face ID or a Secure Enclave signature.
 Gateway session, mandates, reservations, token grants, replay nonces, payment intents, receipts, and the receipt signing identity persist across an ordinary restart in the ignored owner-only runtime directory.
 If an unclean stop leaves `scripts/local-demo-runtime/gateway-state.json.lock`, confirm that its recorded PID has exited and follow the exact lock recovery commands in the [Gateway guide](../services/gateway/README.md).
-The shop's demo controls have no authentication, so all listeners must remain bound to loopback.
+The shop's price and reset controls use the separate owner-only operator token and stay bound to loopback.
 This web view is for final owner acceptance only; interim automated checks should use CLI requests or an isolated VM.
+
+## Treasurer recording simulation
+
+The Treasurer is not wired to the wallet in this build.
+The runner appends fixed, display-only Bank Console scenes to an owner-only file and makes no funding, payment, audit, or policy call.
+After the Console is open, run these commands separately for the two recording beats:
+
+```sh
+./scripts/treasurer-simulation.py renewal --amount-fen 4900
+./scripts/treasurer-simulation.py poisoned-topup
+```
+
+Use `--dry-run` to inspect the selected scene without writing an event.
+The Console labels every line `SIMULATION` and reads only the three allowlisted Treasurer scenes from `scripts/local-demo-runtime/console-simulation.jsonl`.
+The next recording stage archives that file with the previous demo state, so old simulated lines do not appear in a new take.

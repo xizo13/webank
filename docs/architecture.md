@@ -8,10 +8,10 @@ It is a local hackathon prototype with simulated merchants and currency, not a d
 | Component | Implemented role | State or trust boundary |
 | --- | --- | --- |
 | `apps/webank-app` | Expo source for the browser wallet, pairing, mandates, approvals, owner transfers, policy limits, payments, and agent controls. | The isolated web export and app tests passed; refreshed owner browser acceptance and an iOS build remain pending. |
-| `apps/shops` | Next.js mock storefront and Shop MCP tools for products, carts, checkout, order status, and signed payment requests. | Merchant identities, inventory, orders, and payments are demo data; local operator controls have no authentication. |
+| `apps/shops` | Next.js mock storefront and Shop MCP tools for products, carts, checkout, order status, and signed payment requests. | Merchant identities, inventory, orders, and payments are demo data; price and reset controls require a separate local operator token. |
 | `agents/connector-mcp` | Nine local MCP tools for per-app pairing, wallet status, mandates, payments, approval waits, and own history. | The host supplies its own app name; the P-256 software key is readable by a process with the same user's filesystem access. |
-| `services/gateway` | Pairing, scoped agent authentication, attended payment review, owner cap change review, Amber/Green/Red trust, receipts, and audit records. | The limited fixture is in memory; the separate loopback FISCO demo stores private state on disk for one local process. |
-| `services/guardian` | Optional fixed-call Nous Research Hermes Agent review that can make a decision stricter. | A dedicated zero-tool profile passed synthetic live decisions; a full signed shop-to-app Guardian run remains pending. |
+| `services/gateway` | Pairing, scoped agent authentication, attended payment review, owner wallet enablement and cap changes, Amber/Green/Red trust, receipts, audit records, and the read-only Bank Console. | The limited fixture is in memory; the separate loopback FISCO demo stores private state on disk for one local process, and the Console accepts only loopback requests. |
+| `services/guardian` | Optional fixed-call Nous Research Hermes Agent review that can make a decision stricter. | A dedicated zero-tool profile passed synthetic live decisions and a signed local shop-to-app acceptance run; no production model security claim follows from this. |
 | `packages/chain` and `onchain` | Viem adapter and five Solidity contracts for local FISCO settlement and audit anchors. | The chain uses simulated CNY units, not e-CNY. |
 | `services/treasurer` and `services/monitor` | Proposal, funding-rule, and invariant-alert simulations. | They do not connect to core banking or the local payment settlement path. |
 
@@ -25,6 +25,7 @@ It is a local hackathon prototype with simulated merchants and currency, not a d
 3. The owner enters that number and uses the explicitly simulated local approval step.
 4. Each approved pairing creates a new independent Amber agent identity, while old agent and audit records remain.
 5. The owner funds the simulated Agent Wallet before a purchase.
+   In a fresh local deployment, the signed-in owner first enables the wallet with a visibly simulated approval.
 6. The connector proposes a bounded, non-spendable `pending_checkout` mandate for an attended purchase before shopping.
 7. A mock shop signs a checkout request with the merchant, order, amount, lines, expiry, and nonce.
 8. The connector submits that unchanged request with an agent token, P-256 signed HTTP request, idempotency key, and fresh nonce.
@@ -38,12 +39,14 @@ Seven days without a completed payment or owner authorization pauses an app's ag
 Trust lights change through bank-owned evidence and owner actions; a separate owner freeze always overrides them.
 The local Guardian makes one structured Hermes call without prior conversation only after the operator verifies its dedicated no-tool profile.
 An unavailable Hermes instance or uncertain tool isolation produces owner step-up, not automatic payment.
+The local Bank Console projects bank-owned event fields, short identifiers, allowlisted text, and clearly marked Treasurer simulations without exposing request numbers, keys, raw prompts, or personal data.
 
 The CLI integration driver exercised a simulated-currency purchase across the shop, connector client, loopback Gateway, and local FISCO chain.
 That run used simulated app approval, reservation, and risk inputs.
 A separate owner browser session completed fresh agent pairing and anchored its audit record on the local chain.
 A live Claude shopping session with a bank-verifiable phone approval has not been demonstrated.
-The isolated Hermes profile passed a live synthetic smoke test, while a full signed shop-to-app Guardian run remains pending.
+The isolated Hermes profile passed a live synthetic smoke test and a signed local shop-to-app acceptance run.
+That run included an Amber owner card, a Green ¥77.00 FISCO payment without a card, and a contradictory signed order that Hermes denied without a wallet debit.
 
 The owner transfer code requests simulated CNY moves into the Agent Wallet after labelled simulated biometric confirmation.
 It also returns unreserved funds to the fixed main account after explicit owner confirmation without a biometric step.
@@ -66,6 +69,6 @@ The browser approval proof is a demo marker, not a biometric or Secure Enclave s
 The iOS source has not been built and tested on an iPhone for this release.
 The connector's local software key is readable by a same-user process with filesystem access.
 The loopback Gateway persists private state across an ordinary restart but supports only one process and no replicas.
-The mock shop's admin controls must remain on loopback.
+The mock shop's operator controls require a separate local token and remain on loopback.
 The local Gateway does not have an automatic recovery worker for uncertain chain or shop callback results.
 The Treasurer and monitor are separate simulations and do not move real money.

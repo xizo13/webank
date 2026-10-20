@@ -7,6 +7,7 @@ import {
   timingSafeEqual,
 } from "node:crypto";
 import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import type { ChainAddresses, FiscoChain } from "@webank/chain";
 import type { Mandate, Policy } from "@webank/contracts";
 import { createGuardianEvaluator } from "@webank/guardian";
@@ -15,6 +16,7 @@ import { createGateway } from "./app.js";
 import { createLocalBankExecutor } from "./bank-executor.js";
 import { DurableState } from "./durable-state.js";
 import { createFiscoFundingRail, createFiscoGatewayAdapters } from "./fisco.js";
+import { isActiveFundedDeployment } from "./funded-deployment.js";
 import { assessLocalDemoRisk } from "./local-demo-risk.js";
 import { createShopPaymentNotifier } from "./shop-notifier.js";
 import { trustOrdinal } from "./trust-light.js";
@@ -216,7 +218,7 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
   const identity = demoIdentity(options.statePath);
   const { loginToken, sessionToken } = identity;
   const receiptKey = identity.receiptPrivateKey;
-  const fundingEnabled = options.addresses.migration?.state === "active";
+  const fundingEnabled = isActiveFundedDeployment(options.addresses);
   if (fundingEnabled && (!options.addresses.bank || !options.statePath))
     throw new Error(
       "Active funding deployment needs the bank address and durable Gateway state",
@@ -296,6 +298,17 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
         throw new Error("Shop drill visibility mismatch");
     },
     walletFunding,
+    initialWalletEnabled: !fundingEnabled,
+    verifyWalletEnableProof: async (actionHash, verification) => {
+      const value = verification as {
+        action_hash?: unknown;
+        device_signature?: unknown;
+      };
+      return (
+        value?.action_hash === actionHash &&
+        value.device_signature === "simulated-local-wallet-enable"
+      );
+    },
     verifyFundingProof: fundingEnabled
       ? async (actionHash, verification) => {
           const value = verification as {
@@ -371,6 +384,20 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
       operatorVerified: env.WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED === "1",
       fetcher,
     }),
+    guardianSource: "Hermes",
+    getPaymentBlock: async (paymentTx) => {
+      const evidence = await options.chain.getTransactionEvidence(paymentTx);
+      if (evidence.status !== "success")
+        throw new Error("Payment transaction has no successful chain receipt");
+      return evidence.blockNumber;
+    },
+    bankConsoleEnabled: true,
+    consoleSimulationPath: fileURLToPath(
+      new URL(
+        "../../../scripts/local-demo-runtime/console-simulation.jsonl",
+        import.meta.url,
+      ),
+    ),
     notifyMerchantPayment: createShopPaymentNotifier({
       shopOrigin,
       internalToken: options.shopToken,

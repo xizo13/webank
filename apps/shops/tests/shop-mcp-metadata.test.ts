@@ -18,6 +18,9 @@ it("describes the shop name and checkout boundary to MCP clients", async () => {
       tools.find((tool) => tool.name === "search_products")?.description,
     ).toContain("shopA is BaoTao Shop");
     expect(
+      tools.find((tool) => tool.name === "search_products")?.description,
+    ).toContain("does not schedule a price watch");
+    expect(
       tools.find((tool) => tool.name === "checkout")?.description,
     ).toContain("This does not create a WeBank approval or payment");
   } finally {

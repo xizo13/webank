@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { ChainAddresses } from "@webank/chain";
 import type { Address, Hex } from "viem";
+import { isActiveFundedDeployment } from "./funded-deployment.js";
 
 const childPath = fileURLToPath(
   new URL(
@@ -17,7 +18,7 @@ export function createLocalBankExecutor(
   statePath: string,
   addresses: ChainAddresses & { bank?: Address; migration?: { state: string } },
 ) {
-  if (addresses.migration?.state !== "active" || !addresses.bank)
+  if (!isActiveFundedDeployment(addresses) || !addresses.bank)
     throw new Error("Bank executor requires an active funding deployment");
   const submit = (
     kind: "fund" | "sweep" | "human" | "trust" | "policy",

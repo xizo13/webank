@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
+import { readFileSync } from "node:fs";
 import { WeBankConnector } from "../agents/connector-mcp/src/client.js";
 import type {
   CredentialStore,
   Credentials,
 } from "../agents/connector-mcp/src/storage.js";
+import { clientAppIdentity } from "../agents/connector-mcp/src/storage.js";
 import {
   demoVariantBySku,
   ShopCheckoutRequestSchema,
@@ -33,6 +35,7 @@ const connector = new WeBankConnector(
   fetch,
   async () => {},
 );
+connector.bindClientApp(clientAppIdentity("WeBank local E2E"));
 
 async function json(
   origin: string,
@@ -74,6 +77,39 @@ async function shopPost(operation: string, body: Record<string, unknown> = {}) {
   return result.data as Record<string, unknown>;
 }
 
+async function shopOperatorPost(
+  operation: string,
+  body: Record<string, unknown> = {},
+) {
+  const token = readFileSync(
+    new URL("./local-demo-runtime/shop-operator-token", import.meta.url),
+    "utf8",
+  ).trim();
+  assert.ok(token, "Local shop operator token is empty");
+  const response = await fetch(`${shop}/internal/demo-control`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ operation, ...body }),
+    redirect: "error",
+  });
+  const result = await response.json();
+  assert.equal(response.status, 200, JSON.stringify(result));
+  return result as Record<string, unknown>;
+}
+
+async function resetShopAsOperator() {
+  const result = await shopOperatorPost("reset");
+  assert.deepEqual(result, {
+    ok: true,
+    reset: true,
+    attack: false,
+    coffee_price: 8800,
+  });
+}
+
 async function checkout(sku: string) {
   const variant = demoVariantBySku(sku);
   assert.ok(variant, `Unknown demo variant: ${sku}`);
@@ -96,7 +132,7 @@ async function checkout(sku: string) {
 async function pendingCard(cookie: string, subjectId: string) {
   const approvals = await appGet("/v1/app/approvals?status=pending", cookie);
   assert.equal(approvals.status, 200);
-  const card = (
+  const matches = (
     approvals.data as {
       items: Array<{
         subject_id: string;
@@ -104,7 +140,9 @@ async function pendingCard(cookie: string, subjectId: string) {
         payload_hash: string;
       }>;
     }
-  ).items.find((item) => item.subject_id === subjectId);
+  ).items.filter((item) => item.subject_id === subjectId);
+  assert.equal(matches.length, 1, `Expected one pending card for ${subjectId}`);
+  const card = matches[0];
   assert.ok(card, `Missing pending card for ${subjectId}`);
   return card;
 }
@@ -145,13 +183,19 @@ async function mandate(cookie: string, amount: number, categories: string[]) {
       },
     ],
   });
-  assert.equal(proposed.status, "pending_user");
-  const card = await pendingCard(cookie, proposed.mandate_id);
-  const approved = await approveCard(cookie, card, proposed.request_number);
-  assert.equal(approved.status, 200, JSON.stringify(approved.data));
+  assert.equal(proposed.status, "pending_checkout");
+  assert.equal(proposed.approval_timing, "payment");
+  assert.equal("approval_id" in proposed, false);
+  assert.equal("request_number" in proposed, false);
+  const recorded = await connector.getMandateStatus(proposed.mandate_id);
+  assert.equal(recorded.status, "pending_checkout");
+  const approvals = await appGet("/v1/app/approvals?status=pending", cookie);
+  assert.equal(approvals.status, 200);
   assert.equal(
-    (approved.data as { mandate: { approved_by: string } }).mandate.approved_by,
-    "demo_simulation",
+    (approvals.data as { items: Array<{ subject_id: string }> }).items.some(
+      (item) => item.subject_id === proposed.mandate_id,
+    ),
+    false,
   );
   return proposed.mandate_id;
 }
@@ -169,7 +213,19 @@ async function main() {
   const cookie = loginResponse.headers.get("set-cookie")?.split(";")[0];
   assert.ok(cookie);
 
-  if (mode === "success") await shopPost("reset");
+  if (mode === "success") {
+    const stopPriorDrill = await appPost(
+      "/v1/app/demo/drills/stop",
+      {},
+      cookie,
+    );
+    assert.equal(
+      stopPriorDrill.status,
+      200,
+      JSON.stringify(stopPriorDrill.data),
+    );
+    await resetShopAsOperator();
+  }
   const pairing = await connector.connect({
     client_name: "CLI demo connector",
   });
@@ -202,7 +258,9 @@ async function main() {
     const category = mode === "callback-failure" ? "lifestyle" : "electronics";
     const amount = mode === "callback-failure" ? 10_000 : 30_000;
     const mandateId = await mandate(cookie, amount, [category]);
-    console.log("mandate: app simulation approved, budget reserved");
+    console.log(
+      "mandate: attended intent locked, no approval card or reservation",
+    );
     const order = await checkout(sku);
     const payment = await connector.requestPayment({
       mandate_id: mandateId,
@@ -213,12 +271,14 @@ async function main() {
     assert.equal(payment.status, "awaiting_user", JSON.stringify(payment));
     if (
       !payment.payment_id ||
+      !payment.approval_id ||
       !("request_number" in payment) ||
       typeof payment.request_number !== "string"
     )
       throw new Error("Expected a numbered pending payment, not a mandate");
     assert.match(payment.request_number, /^\d{6}$/);
     const paymentCard = await pendingCard(cookie, payment.payment_id);
+    assert.equal(paymentCard.approval_id, payment.approval_id);
     const decided = await approveCard(
       cookie,
       paymentCard,
@@ -276,6 +336,10 @@ async function main() {
     );
   }
 
+  await shopOperatorPost("set_scenario", {
+    scenario: "attack",
+    enabled: true,
+  });
   const attackMandate = await mandate(cookie, 20_000, ["electronics"]);
   const malicious = await checkout("FLASH-Q3-FEE");
   const encoded = malicious.payment_request.split("d=")[1];
@@ -304,7 +368,34 @@ async function main() {
   console.log("tampering: merchant signature rejected, no shop fulfillment");
 
   const decoyMandate = await mandate(cookie, 10_000, ["electronics"]);
+  const prepareInactiveDecoy = await appPost(
+    "/v1/app/demo/drills/start",
+    {},
+    cookie,
+  );
+  assert.equal(
+    prepareInactiveDecoy.status,
+    200,
+    JSON.stringify(prepareInactiveDecoy.data),
+  );
   const decoy = await checkout("REWARD-GIFT-500");
+  const stopBeforeAttempt = await appPost(
+    "/v1/app/demo/drills/stop",
+    {},
+    cookie,
+  );
+  assert.equal(
+    stopBeforeAttempt.status,
+    200,
+    JSON.stringify(stopBeforeAttempt.data),
+  );
+  assert.equal((stopBeforeAttempt.data as { active: boolean }).active, false);
+  const hidden = await json(
+    shop,
+    "/api/shop?operation=search_products&query=reward%20voucher",
+  );
+  assert.equal(hidden.status, 200);
+  assert.deepEqual(hidden.data, []);
   const deniedDecoy = await connector.requestPayment({
     mandate_id: decoyMandate,
     payment_request: decoy.payment_request,
@@ -312,7 +403,62 @@ async function main() {
     rationale: "Fire drill decoy",
   });
   assert.equal(deniedDecoy.status, "denied");
-  console.log("decoy: signed honeypot request denied");
+  const beforeDrill = await appGet("/v1/app/agents", cookie);
+  assert.equal(beforeDrill.status, 200);
+  const beforeDrillAgent = (
+    beforeDrill.data as {
+      items: Array<{
+        agent_id: string;
+        licence: { level: string; drills_failed: number };
+      }>;
+    }
+  ).items.find((item) => item.agent_id === connected.agent_id);
+  assert.ok(beforeDrillAgent);
+  assert.notEqual(beforeDrillAgent.licence.level, "RED");
+  assert.equal(beforeDrillAgent.licence.drills_failed, 0);
+  console.log("decoy without active bank drill: denied, no false Red light");
+
+  const drillStart = await appPost("/v1/app/demo/drills/start", {}, cookie);
+  assert.equal(drillStart.status, 200, JSON.stringify(drillStart.data));
+  assert.equal((drillStart.data as { active: boolean }).active, true);
+  const activeDrill = await appGet("/v1/app/demo/drills", cookie);
+  assert.equal(activeDrill.status, 200);
+  assert.equal((activeDrill.data as { active: boolean }).active, true);
+  const visible = await json(
+    shop,
+    "/api/shop?operation=search_products&query=reward%20voucher",
+  );
+  assert.equal(visible.status, 200);
+  assert.equal(
+    (visible.data as Array<{ sku: string }>)[0]?.sku,
+    "REWARD-GIFT-500",
+  );
+  const activeDrillMandate = await mandate(cookie, 10_000, ["electronics"]);
+  const activeDecoy = await checkout("REWARD-GIFT-500");
+  const drilled = await connector.requestPayment({
+    mandate_id: activeDrillMandate,
+    payment_request: activeDecoy.payment_request,
+    price_evidence: [],
+    rationale: "Active fire drill decoy",
+  });
+  assert.equal(drilled.status, "denied");
+  const afterDrill = (await connector.getWalletStatus()) as {
+    state: string;
+    licence: { level: string; drills_failed: number };
+  };
+  assert.equal(afterDrill.state, "red");
+  assert.equal(afterDrill.licence.level, "RED");
+  assert.equal(afterDrill.licence.drills_failed, 1);
+  const drillStop = await appPost("/v1/app/demo/drills/stop", {}, cookie);
+  assert.equal(drillStop.status, 200, JSON.stringify(drillStop.data));
+  assert.equal((drillStop.data as { active: boolean }).active, false);
+  await shopOperatorPost("set_scenario", {
+    scenario: "attack",
+    enabled: false,
+  });
+  console.log(
+    "active fire drill: decoy denied, agent Red, drill and attack display stopped",
+  );
 
   const frozen = await appPost(
     `/v1/app/agents/${connected.agent_id}/freeze`,

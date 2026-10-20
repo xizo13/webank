@@ -1,6 +1,10 @@
 import type { GuardianInput, GuardianVerdict } from "@webank/contracts";
 import { describe, expect, it, vi } from "vitest";
-import { createGuardianEvaluator, GUARDIAN_UNAVAILABLE } from "../src/index.js";
+import {
+  buildGuardianPrompt,
+  createGuardianEvaluator,
+  GUARDIAN_UNAVAILABLE,
+} from "../src/index.js";
 
 const endpoint = "http://127.0.0.1:8642/p/guardian";
 const secret = "isolated-test-key";
@@ -54,6 +58,7 @@ function input(rationale = "Buy the verified headphones"): GuardianInput {
       constraints: [],
     },
     merchant_verified: {
+      merchant_id: "mch_shopA",
       name: "BaoTao Shop",
       category: "electronics",
       first_seen: false,
@@ -101,6 +106,53 @@ const json = (value: unknown, status = 200) =>
   });
 
 describe("Hermes Guardian fixed-call transport", () => {
+  it("shows the bank-verified merchant ID beside the locked allowlist", () => {
+    const locked = input();
+    locked.mandate.intent_level = "listing";
+    locked.mandate.constraints = [
+      { type: "allowed_merchants", merchant_ids: ["mch_shopA"] },
+    ];
+    const prompt = buildGuardianPrompt(locked);
+    const payload = JSON.parse(prompt.user.split("\n").slice(1).join("\n"));
+    expect(payload.quoted_merchant_data.merchant_verified).toMatchObject({
+      merchant_id: "mch_shopA",
+      name: "BaoTao Shop",
+    });
+    expect(payload.locked_intent.constraints).toContainEqual({
+      type: "allowed_merchants",
+      merchant_ids: ["mch_shopA"],
+    });
+    expect(prompt.system).toContain(
+      "do not ask the user to confirm it from the display name",
+    );
+  });
+
+  it.each([undefined, "shopA", "mch_"])(
+    "fails closed before any network call for missing or malformed merchant ID %s",
+    async (merchantId) => {
+      const invalid = {
+        ...input(),
+        merchant_verified: {
+          ...input().merchant_verified,
+          merchant_id: merchantId,
+        },
+      } as unknown as GuardianInput;
+      let calls = 0;
+      const fetcher: typeof fetch = async () => {
+        calls++;
+        throw new Error("Unexpected network call");
+      };
+      const verdict = await createGuardianEvaluator({
+        baseUrl: endpoint,
+        apiKey: secret,
+        operatorVerified: true,
+        fetcher,
+      })(invalid);
+      expect(verdict).toEqual(GUARDIAN_UNAVAILABLE);
+      expect(calls).toBe(0);
+    },
+  );
+
   it("checks tools before each stateless call and accepts a coherent pass", async () => {
     const calls: Array<{ url: string; init?: RequestInit }> = [];
     const fetcher: typeof fetch = async (target, init) => {

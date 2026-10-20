@@ -8,6 +8,7 @@ import {
   http,
   parseAbiItem,
 } from "viem";
+import { isActiveFundedDeployment } from "./funded-deployment.js";
 import {
   attachHumanPaymentEvidence,
   inspectHumanPaymentRecovery,
@@ -52,11 +53,13 @@ const addresses = JSON.parse(readFileSync(addressesPath, "utf8")) as {
   ecnySim: `0x${string}`;
   agentWallet: `0x${string}`;
   migration?: { state: string };
+  deploymentFingerprint?: string;
+  txHashes?: Record<string, string>;
 };
 if (
   addresses.chainId !== FISCO_CHAIN_ID ||
   addresses.rpcUrl !== "http://127.0.0.1:8545" ||
-  addresses.migration?.state !== "active"
+  !isActiveFundedDeployment(addresses)
 )
   throw new Error("Recovery deployment is not the active loopback demo");
 const bank = getAddress(addresses.bank);

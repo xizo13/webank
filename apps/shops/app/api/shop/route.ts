@@ -2,7 +2,6 @@ import { type NextRequest, NextResponse } from "next/server";
 import { formatCny, type ShopId, shops } from "../../../lib/catalog";
 import {
   addToCart,
-  advanceDemoClock,
   checkout,
   clearCart,
   demoClock,
@@ -12,9 +11,6 @@ import {
   listProducts,
   productBySku,
   removeFromCart,
-  resetDemo,
-  setDemoPrice,
-  setDemoScenario,
 } from "../../../lib/store";
 
 export const runtime = "nodejs";
@@ -134,35 +130,14 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ cart: clearCart() });
       case "checkout":
         return agentResponse(checkout(body.shipping_address));
-      case "set_scenario": {
-        if (body.scenario === "drill")
-          return NextResponse.json(
-            {
-              error: {
-                message: "Start or stop fire drills in the WeBank owner app",
-              },
-            },
-            { status: 403 },
-          );
-        if (body.scenario !== "attack")
-          throw new Error("Unknown demo scenario");
-        if (typeof body.enabled !== "boolean")
-          throw new Error("Demo scenario enabled must be boolean");
-        return NextResponse.json({
-          scenarios: { attack: setDemoScenario("attack", body.enabled).attack },
-        });
-      }
+      case "set_scenario":
       case "set_price":
-        return NextResponse.json({
-          product: setDemoPrice(String(body.sku || ""), Number(body.amount)),
-        });
       case "advance_clock":
-        return NextResponse.json({
-          now: advanceDemoClock(Number(body.minutes)),
-        });
       case "reset":
-        resetDemo();
-        return NextResponse.json({ ok: true });
+        return NextResponse.json(
+          { error: { message: "Use the operator demo controls" } },
+          { status: 403 },
+        );
       default:
         throw new Error("Unknown operation");
     }

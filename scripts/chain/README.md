@@ -1,6 +1,9 @@
 # Local FISCO BCOS chain
 
-Run these commands from the repository root on macOS arm64.
+Run these commands from the repository root on macOS arm64 or Linux x86_64.
+On Windows, use Ubuntu x86_64 under WSL2 and clone into the Linux filesystem, such as `~/webank`, so owner-only file permissions work as expected.
+Native Windows is not supported by this chain runner.
+The Linux artifact selection and checksum checks have unit coverage; a full teammate WSL2 chain rehearsal is still pending.
 The scripts use the pinned FISCO BCOS v3.17.1 non-SM Air builder and create four nodes with Web3 chain ID 20200.
 The Web3 RPC is `http://127.0.0.1:8545` on node0.
 All P2P and native RPC listeners also bind to `127.0.0.1`.
@@ -32,7 +35,7 @@ Alternatively, save the shop response and pass `--merchants-file PATH`.
 Seeding registers the raw Ed25519 public keys, mock legal names, mock USCCs, categories, and payout addresses; the shop's `honeypot` flag remains an off-chain policy signal.
 The on-chain merchant ID is `keccak256(UTF-8 merchant_id)`.
 
-For an offline first run, set `FISCO_ARCHIVE_FILE`, `FISCO_BUILDER_FILE`, `FISCO_TASSL_BINARY`, and `FISCO_ACCOUNT_HELPER_FILE` to local copies with the pinned SHA-256 values embedded in `manage.py`.
+For an offline first run, set `FISCO_ARCHIVE_FILE`, `FISCO_BUILDER_FILE`, `FISCO_TASSL_BINARY`, and `FISCO_ACCOUNT_HELPER_FILE` to same-platform local copies with the pinned SHA-256 values embedded in `manage.py`.
 Without these variables, the same pinned official artifacts are downloaded.
 
 After startup, run `corepack pnpm --filter @webank/onchain smoke` for a real payment, denial audit anchor, cap, freeze, registry, and receipt verification on the local chain.

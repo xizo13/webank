@@ -102,6 +102,7 @@ function input(overrides: Partial<GuardianInput> = {}): GuardianInput {
       constraints: mandate.constraints,
     },
     merchant_verified: {
+      merchant_id: merchant.merchant_id,
       name: merchant.name,
       category: merchant.category,
       first_seen: merchant.first_seen,

@@ -7,6 +7,7 @@ import {
   ClientAppNameSchema,
   HashSchema,
   MandateIdSchema,
+  MerchantIdSchema,
   MoneySchema,
   NonEmptyStringSchema,
   OrderIdSchema,
@@ -399,6 +400,7 @@ export const GuardianInputSchema = z
       .strict(),
     merchant_verified: z
       .object({
+        merchant_id: MerchantIdSchema,
         name: NonEmptyStringSchema,
         category: NonEmptyStringSchema,
         first_seen: z.boolean(),

@@ -20,6 +20,8 @@ The package does not start a listener by itself.
 - Agent mandate, payment, status, and own-history routes enforce scope, signature time, nonce replay, mandate constraints, merchant signature, policy, licence, risk, Guardian, and approval rules.
 - `POST /v1/agent/mandates` proposes a bounded mandate from the user's request before shopping and returns a pending or active mandate.
 - App routes expose pairing consent, filtered approvals, agents and freeze, payment history and receipt detail, audit history, and `/v1/app/events?after=<cursor>` polling.
+- In the opt-in local demo, `/demo/console` displays an allowlisted, read-only timeline of pairing, mandate, payment checks, Guardian verdict, approval, and verified settlement evidence.
+- The Console and its JSON event feed accept only loopback peers and hosts, reject mismatched browser origins, and omit tokens, keys, raw prompts, and personal data.
 
 The six named `Decision.checks` represent protocol checks 1 through 6.
 The seventh protocol check is the strictest-result merge into `Decision.outcome`.
@@ -49,6 +51,7 @@ The Guardian can use a dedicated local Nous Research Hermes Agent profile for on
 The Gateway requires local operator confirmation of tool isolation and checks the advertised API-server toolsets before each call.
 Missing configuration, uncertain isolation, invalid output, or an unavailable Hermes instance causes owner step-up.
 The [Guardian guide](../guardian/README.md) details the isolation requirements and transport limits.
+The fixed Guardian input carries a bank-verified merchant ID bound to the signed request, so the model does not infer merchant identity from merchant-authored display text.
 
 ## FISCO adapter
 
@@ -88,6 +91,12 @@ The normal `scripts/local-demo-up.sh` launcher sets that path to `scripts/local-
 The listener verifies the shop's merchant identities against the bank-controlled manifest and the FISCO registry before accepting requests.
 It creates the local app login token file with mode `0600` before listening and never prints the token.
 `POST /demo/login` with the token sets a local HttpOnly session cookie and explicitly says `simulated: true`.
+Fresh funded local demo state starts with the Agent Wallet disabled, and `GET /v1/app/home` exposes that persisted status.
+The funding rail and bank executor recognize completed migration manifests and native fresh funded manifests with the bank address, deployment fingerprint, and all seven deployment transaction hashes; a partial funded manifest fails startup.
+The authenticated owner prepares a 60-second `wallet_enable.v1` action at `/v1/app/agent-wallet/enable/prepare` and commits it at `/v1/app/agent-wallet/enable` with the exact labeled simulated owner proof and an idempotency key.
+Gateway anchors the exact action before durably enabling the wallet; an uncertain state write fences ingress until restart and durable reconciliation.
+Pairing, agent mandates and payments, owner funding, and owner payment approval fail closed while the wallet is disabled.
+An older durable snapshot without this field remains enabled on ordinary restart, preserving its established authority.
 The connector uses the normal OAuth device flow and RFC 9421 P-256 signatures, and Gateway checks the shop's Ed25519-signed payment request.
 Local app approval uses the literal `simulated-local-approval` proof, records the mandate source as `demo_simulation`, and is not a biometric or bank-verifiable approval.
 The funds reservation and risk signal are local simulations; Guardian uses fail-closed owner step-up unless an operator has configured and verified the dedicated local Hermes profile.
@@ -141,7 +150,9 @@ The separate limited `demo` fixture keeps state in memory.
 No production biometric challenge verifier, persistent reservation hold, risk service, SSE delivery, or recovery worker is wired here yet.
 The local action verifier accepts only the explicit demo proof and is not Face ID or a bank-verifiable device signature.
 Merchant fulfillment confirmation is wired only in the opt-in loopback composition.
-The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable; three synthetic live Hermes cases have passed against the dedicated isolated profile, but the full signed shop-to-app Guardian run is not yet accepted as release evidence.
+The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable.
+The dedicated isolated Hermes profile passed three synthetic live decisions and a full signed local shop-to-app acceptance run with an Amber owner card, a Green ¥77.00 auto-payment on FISCO without a card, and a contradictory signed order denied by Hermes without a wallet debit.
+This uses simulated currency, merchants, and browser approval proof.
 Demo proof approval requires `demoApprovalsEnabled: true` plus either a test process or `WEBANK_DEMO_APPROVALS=1`, and the Gateway refuses demo proof mode in production.
 The app event endpoint uses JSON polling.
 The app freeze endpoint blocks future Gateway requests immediately, while on-chain freeze is a separate bank-controlled operation.

@@ -192,6 +192,8 @@ function fixture(
     anchorAudit?: GatewayDependencies["anchorAudit"];
     setDrillVisibility?: GatewayDependencies["setDrillVisibility"];
     demoTrustControlsEnabled?: true;
+    bankConsoleEnabled?: true;
+    getPaymentBlock?: GatewayDependencies["getPaymentBlock"];
     pauseAuthenticatedApp?: { entered: () => void; release: Promise<void> };
     authenticateDrillService?: GatewayDependencies["authenticateDrillService"];
     authenticateBankOperator?: GatewayDependencies["authenticateBankOperator"];
@@ -285,6 +287,8 @@ function fixture(
         : false;
     },
     demoTrustControlsEnabled: options.demoTrustControlsEnabled,
+    bankConsoleEnabled: options.bankConsoleEnabled,
+    getPaymentBlock: options.getPaymentBlock,
     authenticateDrillService: options.authenticateDrillService,
     authenticateBankOperator: options.authenticateBankOperator,
     setDrillVisibility: options.setDrillVisibility,
@@ -574,6 +578,143 @@ describe("Gateway HTTP decision slice", () => {
       deps,
     };
   }
+
+  it("streams actual payment checks, owner proof, and verified chain block to the read-only console", async () => {
+    const { app } = fixture({
+      seedMandate: activeMandate(),
+      bankConsoleEnabled: true,
+      getPaymentBlock: async () => 412n,
+    });
+    openApps.push(app);
+    const submitted = await payment(
+      app,
+      "mdt_seed",
+      signedPayreq(),
+      "console-payment",
+    );
+    expect(submitted.statusCode).toBe(202);
+    const read = (after: number) =>
+      app.inject({
+        method: "GET",
+        url: `/v1/demo/console/events?after=${after}`,
+        headers: { host: "127.0.0.1:3002" },
+      });
+    const pending = (await read(0)).json();
+    expect(pending.schema).toBe("bank_console_feed.v1");
+    expect(
+      pending.events.filter((item: { kind: string }) => item.kind === "check"),
+    ).toHaveLength(5);
+    expect(
+      pending.events.find((item: { kind: string }) => item.kind === "guardian"),
+    ).toMatchObject({ result: "pass", source: null });
+    expect(
+      pending.events.find(
+        (item: { kind: string; status?: string }) =>
+          item.kind === "settlement" && item.status === "waiting",
+      ),
+    ).toBeTruthy();
+    const cards = await app.inject({
+      method: "GET",
+      url: "/v1/app/approvals?status=pending",
+      headers: { authorization: "Bearer test-app" },
+    });
+    const card = cards.json().items[0];
+    const approved = await app.inject({
+      method: "POST",
+      url: `/v1/app/approvals/${card.approval_id}/decide`,
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "console-approve",
+      },
+      payload: {
+        decision: "approve",
+        verification: {
+          action_hash: card.payload_hash,
+          device_signature: "test-biometric-proof",
+          request_number: submitted.json().request_number,
+        },
+      },
+    });
+    expect(approved.statusCode).toBe(200);
+    const tail = (await read(pending.next_cursor)).json().events;
+    expect(
+      tail.find((item: { kind: string }) => item.kind === "owner_approval"),
+    ).toMatchObject({ request_number_matched: true, biometric: "verified" });
+    expect(
+      tail.find(
+        (item: { kind: string; status?: string }) =>
+          item.kind === "settlement" && item.status === "paid",
+      ),
+    ).toMatchObject({ block_number: "412", tx_preview: "0x111111…" });
+  });
+
+  it("streams a successful pairing and mandate lock without the private request number", async () => {
+    const { app } = fixture({ bankConsoleEnabled: true });
+    openApps.push(app);
+    const publicKey = newAgentKey().publicKey;
+    const paired = await app.inject({
+      method: "POST",
+      url: "/v1/oauth/device_authorization",
+      payload: {
+        client_name: "Claude recording agent",
+        provider: "anthropic",
+        client_app_name: "Claude Code",
+        client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
+        agent_public_key: publicKey,
+        requested_scopes: [
+          "wallet:pay",
+          "wallet:mandate",
+          "wallet:history:self",
+        ],
+      },
+    });
+    expect(paired.statusCode).toBe(200);
+    const consent = await app.inject({
+      method: "GET",
+      url: `/v1/app/pairing/${paired.json().user_code}`,
+      headers: { authorization: "Bearer test-app" },
+    });
+    const approved = await app.inject({
+      method: "POST",
+      url: `/v1/app/pairing/${paired.json().user_code}/approve`,
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "console-pair",
+      },
+      payload: {
+        verification: {
+          action_hash: consent.json().approval.payload_hash,
+          device_signature: "test-biometric-proof",
+          request_number: paired.json().request_number,
+        },
+      },
+    });
+    expect(approved.statusCode).toBe(200);
+    const created = await checkoutMandate(app, "console-mandate");
+    expect(created.statusCode).toBe(201);
+    const feed = await app.inject({
+      method: "GET",
+      url: "/v1/demo/console/events",
+      headers: { host: "127.0.0.1:3002" },
+    });
+    expect(
+      feed
+        .json()
+        .events.find((item: { kind: string }) => item.kind === "pairing"),
+    ).toMatchObject({
+      app: "Claude Code",
+      light: "AMBER",
+      request_number_matched: true,
+      biometric: "verified",
+    });
+    expect(
+      feed
+        .json()
+        .events.find((item: { kind: string }) => item.kind === "mandate_lock"),
+    ).toBeTruthy();
+    expect(feed.body).not.toContain(paired.json().request_number);
+    expect(feed.body).not.toContain(publicKey);
+  });
 
   it("scans only a pending local pairing QR and rejects unknown or unsigned content without paying", async () => {
     const { app, payCalls } = await humanScanFixture();
@@ -1326,6 +1467,7 @@ describe("Gateway HTTP decision slice", () => {
   });
 
   it("auto-pays an eligible Green checkout only after actual Guardian pass and shows no card", async () => {
+    const guardianInputs: unknown[] = [];
     const green = AgentSchema.parse({
       ...agent,
       licence: {
@@ -1341,7 +1483,15 @@ describe("Gateway HTTP decision slice", () => {
     const { app, executed } = fixture({
       agent: green,
       risk: "pass",
-      guardian: "pass",
+      guardianEvaluator: async (input) => {
+        guardianInputs.push(input);
+        return {
+          verdict: "pass",
+          reason_code: "none",
+          reasons: ["Verified purchase matches the mandate"],
+          user_explanation: "Verified purchase matches your request.",
+        };
+      },
     });
     openApps.push(app);
     const created = await checkoutMandate(app, "green-under-cap");
@@ -1367,6 +1517,13 @@ describe("Gateway HTTP decision slice", () => {
     expect(submitted.statusCode).toBe(200);
     expect(submitted.json().status).toBe("paid");
     expect(executed).toHaveLength(1);
+    expect(guardianInputs).toHaveLength(1);
+    expect(guardianInputs[0]).toMatchObject({
+      merchant_verified: {
+        merchant_id: merchant.merchant_id,
+        name: merchant.name,
+      },
+    });
     const cards = await app.inject({
       method: "GET",
       url: "/v1/app/approvals?status=pending",
@@ -1385,6 +1542,66 @@ describe("Gateway HTTP decision slice", () => {
       headers: { authorization: "Bearer test-app" },
     });
     expect(agents.json().items[0].licence.clean_purchases).toBe(1);
+  });
+
+  it("does not auto-pay when the verified merchant ID cannot form a Guardian input", async () => {
+    const evaluateGuardian = vi.fn(async () => ({
+      verdict: "pass" as const,
+      reason_code: "none" as const,
+      reasons: ["Fixture verdict"],
+      user_explanation: "Verified purchase matches the mandate.",
+    }));
+    const green = AgentSchema.parse({
+      ...agent,
+      licence: {
+        level: "GREEN",
+        clean_purchases: 1,
+        drills_passed: 1,
+        drills_failed: 0,
+        flags_30d: 0,
+        reason: "Bank trust threshold met",
+        updated_at: "2026-10-14T00:00:00Z",
+      },
+    });
+    const { app, executed } = fixture({
+      agent: green,
+      risk: "pass",
+      merchant: { ...merchant, merchant_id: "bad-registry-id" },
+      guardianEvaluator: evaluateGuardian,
+    });
+    openApps.push(app);
+    const created = await checkoutMandate(app, "bad-verified-merchant");
+    expect(created.statusCode).toBe(201);
+    const submitted = await payment(
+      app,
+      created.json().mandate.mandate_id,
+      signedPayreq({
+        amount: { amount: 5_000, currency: "CNY" },
+        line_items: [
+          {
+            sku: "SONY-XM5-BLK",
+            gtin: "4548736132597",
+            name: "Sony WH-1000XM5 Black",
+            condition: "new",
+            qty: 1,
+            unit_price: { amount: 5_000, currency: "CNY" },
+          },
+        ],
+      }),
+      "bad-verified-merchant-payment",
+    );
+    expect(submitted.statusCode).toBe(202);
+    expect(submitted.json().status).toBe("awaiting_user");
+    expect(submitted.json().decision.outcome).toBe("STEP_UP");
+    expect(submitted.json().decision.checks).toContainEqual(
+      expect.objectContaining({
+        name: "guardian",
+        result: "step_up",
+        detail: expect.objectContaining({ reason: "guardian_unavailable" }),
+      }),
+    );
+    expect(executed).toHaveLength(0);
+    expect(evaluateGuardian).not.toHaveBeenCalled();
   });
 
   it.each(["pass", "deny", "other", "unavailable", "unverified"] as const)(

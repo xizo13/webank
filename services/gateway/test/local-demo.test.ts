@@ -295,6 +295,36 @@ describe("loopback FISCO demo composition", () => {
     return { ...result, ...fixtureData, trustBank };
   }
 
+  async function enableWallet(
+    app: Awaited<ReturnType<typeof makeApp>>["app"],
+    cookie: string,
+  ) {
+    const prepared = await app.inject({
+      method: "POST",
+      url: "/v1/app/agent-wallet/enable/prepare",
+      headers: { cookie },
+    });
+    expect(prepared.statusCode).toBe(200);
+    const challenge = prepared.json();
+    const completed = await app.inject({
+      method: "POST",
+      url: "/v1/app/agent-wallet/enable",
+      headers: {
+        cookie,
+        "idempotency-key": `enable-${challenge.challenge_id}`,
+      },
+      payload: {
+        challenge_id: challenge.challenge_id,
+        verification: {
+          action_hash: challenge.action_hash,
+          device_signature: "simulated-local-wallet-enable",
+        },
+      },
+    });
+    expect(completed.statusCode).toBe(200);
+    expect(completed.json()).toEqual({ enabled: true, simulated: true });
+  }
+
   it("requires both opt-ins, loopback origins, and matching shop identity", async () => {
     const data = fixture();
     const base = {
@@ -333,6 +363,29 @@ describe("loopback FISCO demo composition", () => {
         env: demoEnv,
       }),
     ).rejects.toThrow("Merchant identity mismatch");
+  });
+
+  it("accepts a JSON owner login body and rejects the form body sent by urllib by default", async () => {
+    const { app, loginToken } = await makeApp();
+    const authorization = `Bearer ${loginToken}`;
+    const form = await app.inject({
+      method: "POST",
+      url: "/demo/login",
+      headers: {
+        authorization,
+        "content-type": "application/x-www-form-urlencoded",
+      },
+      payload: "",
+    });
+    expect(form.statusCode).toBe(415);
+    const json = await app.inject({
+      method: "POST",
+      url: "/demo/login",
+      headers: { authorization, "content-type": "application/json" },
+      payload: "{}",
+    });
+    expect(json.statusCode).toBe(200);
+    expect(json.headers["set-cookie"]).toContain("webank_local_demo_session=");
   });
 
   it.each([
@@ -682,447 +735,492 @@ describe("loopback FISCO demo composition", () => {
     },
   );
 
-  it("funds an empty active wallet, enforces chain-backed holds, pays from wallet, and sweeps only available funds", async () => {
-    const directory = mkdtempSync(join(tmpdir(), "webank-active-funding-"));
-    temporaryDirs.push(directory);
-    const statePath = join(directory, "gateway.json");
-    const data = fixture();
-    const activeAddresses = {
-      ...addresses,
-      bank: `0x${"9".repeat(40)}` as Hex,
-      migration: { state: "active" },
-    };
-    let mainBalance = 866_000n;
-    let walletBalance = 0n;
-    let blockNumber = 1n;
-    const funding = new Map<
-      string,
-      { hash: Hex; amount: bigint; blockNumber: bigint; main: Hex; wallet: Hex }
-    >();
-    const sweeps = new Map<
-      string,
-      { hash: Hex; amount: bigint; blockNumber: bigint; main: Hex; wallet: Hex }
-    >();
-    let fundingCalls = 0;
-    const trustWrites: number[] = [];
-    const tx = () =>
-      `0x${(++blockNumber).toString(16).padStart(64, "0")}` as Hex;
-    const bankExecutor = {
-      setCaps: async () => tx(),
-      setTrustLight: async (_intentId: string, level: number) => {
-        trustWrites.push(level);
-        return tx();
-      },
-      fund: async (id: string, amount: bigint) => {
-        fundingCalls++;
-        if (mainBalance < amount)
-          throw new ChainRevertError("insufficient main");
-        mainBalance -= amount;
-        walletBalance += amount;
-        const hash = tx();
-        funding.set(id, {
-          hash,
-          amount,
-          blockNumber,
-          main: activeAddresses.bank,
-          wallet: activeAddresses.agentWallet,
-        });
-        return hash;
-      },
-      sweep: async (id: string, amount: bigint) => {
-        if (walletBalance < amount) throw new ChainRevertError("insufficient");
-        walletBalance -= amount;
-        mainBalance += amount;
-        const hash = tx();
-        sweeps.set(id, {
-          hash,
-          amount,
-          blockNumber,
-          main: activeAddresses.bank,
-          wallet: activeAddresses.agentWallet,
-        });
-        return hash;
-      },
-    };
-    const originalPay = data.chain.pay.bind(data.chain);
-    Object.assign(data.chain, {
-      getPolicyCapsSnapshot: async () => ({
-        perPaymentCap: 30_000n,
-        dailyCap: 50_000n,
-        monthlyCap: 100_000n,
-        spentToday: 0n,
-        spentMonth: 0n,
-        blockNumber,
-        observedAt: new Date().toISOString(),
-        nextDailyResetAt: new Date(Date.now() + 86_400_000).toISOString(),
-        nextMonthlyResetAt: new Date(Date.now() + 2_592_000_000).toISOString(),
-      }),
-      getWalletSnapshot: async () => ({
-        mainBalance,
-        walletBalance,
-        walletFrozen: false,
-        blockNumber,
-        observedAt: new Date().toISOString(),
-      }),
-      isFundingApplied: async (_token: Hex, id: Hex) =>
-        [...funding.keys()].some((key) => keccak256(stringToHex(key)) === id),
-      getFundingEvidence: async (hash: Hex, _token: Hex, id: Hex) => {
-        const value = [...funding].find(
-          ([key, item]) =>
-            keccak256(stringToHex(key)) === id && item.hash === hash,
-        )?.[1];
-        if (!value) throw new Error("missing Funded");
-        return { ...value, token: activeAddresses.ecnySim, fundingId: id };
-      },
-      findFundingEvidence: async (_token: Hex, id: Hex) => {
-        const value = [...funding].find(
-          ([key]) => keccak256(stringToHex(key)) === id,
-        )?.[1];
-        return value
-          ? { ...value, token: activeAddresses.ecnySim, fundingId: id }
-          : undefined;
-      },
-      getSweepEvidence: async (hash: Hex, _wallet: Hex, id: Hex) => {
-        const value = [...sweeps].find(
-          ([key, item]) =>
-            keccak256(stringToHex(key)) === id && item.hash === hash,
-        )?.[1];
-        if (!value) throw new Error("missing Swept");
-        return { ...value, token: activeAddresses.ecnySim, sweepId: id };
-      },
-      findSweepEvidence: async (_wallet: Hex, id: Hex) => {
-        const value = [...sweeps].find(
-          ([key]) => keccak256(stringToHex(key)) === id,
-        )?.[1];
-        return value
-          ? { ...value, token: activeAddresses.ecnySim, sweepId: id }
-          : undefined;
-      },
-      pay: async (
-        walletAddress: Hex,
-        paymentId: Hex,
-        merchantId: Hex,
-        amount: bigint,
-      ) => {
-        if (walletBalance < amount) throw new ChainRevertError("insufficient");
-        const hash = await originalPay(
-          walletAddress,
-          paymentId,
-          merchantId,
-          amount,
-        );
-        walletBalance -= amount;
-        return hash;
-      },
-    });
-    const options = {
-      chain: data.chain,
-      addresses: activeAddresses,
-      bankExecutor,
-      merchants: [merchant],
-      shopOrigin: "http://127.0.0.1:3001",
-      appOrigin: "http://127.0.0.1:8081",
-      gatewayOrigin: "http://127.0.0.1:3002",
-      shopToken: "local-token",
-      fetcher: data.fetcher,
-      env: demoEnv,
-      statePath,
-    };
-    const { app, loginToken } = await createLocalDemoGateway(options);
-    apps.push(app);
-    const login = await app.inject({
-      method: "POST",
-      url: "/demo/login",
-      headers: { authorization: `Bearer ${loginToken}` },
-    });
-    const cookie = login.headers["set-cookie"] as string;
-    const appHeaders = { cookie, "idempotency-key": randomUUID() };
-    expect(
-      (
-        await app.inject({
-          method: "GET",
-          url: "/v1/app/home",
-          headers: appHeaders,
-        })
-      ).json(),
-    ).toMatchObject({
-      main_account: { balance: { amount: 866_000 } },
-      agent_wallet: { balance: { amount: 0 }, available: { amount: 0 } },
-    });
-    const key = newAgentKey();
-    const pairing = (
-      await app.inject({
-        method: "POST",
-        url: "/v1/oauth/device_authorization",
-        payload: {
-          client_name: "Local Claude",
-          provider: "anthropic",
-          client_app_name: "Claude Code",
-          client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
-          agent_public_key: key.publicKey,
-          requested_scopes: [
-            "wallet:pay",
-            "wallet:mandate",
-            "wallet:history:self",
-          ],
+  it.each(["migrated", "native"] as const)(
+    "funds an empty %s wallet, enforces chain-backed holds, pays from wallet, and sweeps only available funds",
+    async (kind) => {
+      const directory = mkdtempSync(join(tmpdir(), "webank-active-funding-"));
+      temporaryDirs.push(directory);
+      const statePath = join(directory, "gateway.json");
+      const data = fixture();
+      const activeAddresses = {
+        ...addresses,
+        bank: `0x${"9".repeat(40)}` as Hex,
+        ...(kind === "migrated"
+          ? { migration: { state: "active" } }
+          : {
+              chainId: 20200,
+              rpcUrl: "http://127.0.0.1:8545",
+              deploymentFingerprint: "f".repeat(64),
+              txHashes: Object.fromEntries(
+                [
+                  "deployECnySim",
+                  "deployMerchantRegistry",
+                  "deployLicenceRegistry",
+                  "deployAuditAnchor",
+                  "deployAgentWallet",
+                  "openingMint",
+                  "configureAgentWallet",
+                ].map((name, index) => [
+                  name,
+                  `0x${(index + 1).toString(16).padStart(64, "0")}`,
+                ]),
+              ),
+            }),
+      };
+      let mainBalance = 866_000n;
+      let walletBalance = 0n;
+      let blockNumber = 1n;
+      const funding = new Map<
+        string,
+        {
+          hash: Hex;
+          amount: bigint;
+          blockNumber: bigint;
+          main: Hex;
+          wallet: Hex;
+        }
+      >();
+      const sweeps = new Map<
+        string,
+        {
+          hash: Hex;
+          amount: bigint;
+          blockNumber: bigint;
+          main: Hex;
+          wallet: Hex;
+        }
+      >();
+      let fundingCalls = 0;
+      const trustWrites: number[] = [];
+      const tx = () =>
+        `0x${(++blockNumber).toString(16).padStart(64, "0")}` as Hex;
+      const bankExecutor = {
+        setCaps: async () => tx(),
+        setTrustLight: async (_intentId: string, level: number) => {
+          trustWrites.push(level);
+          return tx();
         },
-      })
-    ).json();
-    const pairCard = (
-      await app.inject({
+        fund: async (id: string, amount: bigint) => {
+          fundingCalls++;
+          if (mainBalance < amount)
+            throw new ChainRevertError("insufficient main");
+          mainBalance -= amount;
+          walletBalance += amount;
+          const hash = tx();
+          funding.set(id, {
+            hash,
+            amount,
+            blockNumber,
+            main: activeAddresses.bank,
+            wallet: activeAddresses.agentWallet,
+          });
+          return hash;
+        },
+        sweep: async (id: string, amount: bigint) => {
+          if (walletBalance < amount)
+            throw new ChainRevertError("insufficient");
+          walletBalance -= amount;
+          mainBalance += amount;
+          const hash = tx();
+          sweeps.set(id, {
+            hash,
+            amount,
+            blockNumber,
+            main: activeAddresses.bank,
+            wallet: activeAddresses.agentWallet,
+          });
+          return hash;
+        },
+      };
+      const originalPay = data.chain.pay.bind(data.chain);
+      Object.assign(data.chain, {
+        getPolicyCapsSnapshot: async () => ({
+          perPaymentCap: 30_000n,
+          dailyCap: 50_000n,
+          monthlyCap: 100_000n,
+          spentToday: 0n,
+          spentMonth: 0n,
+          blockNumber,
+          observedAt: new Date().toISOString(),
+          nextDailyResetAt: new Date(Date.now() + 86_400_000).toISOString(),
+          nextMonthlyResetAt: new Date(
+            Date.now() + 2_592_000_000,
+          ).toISOString(),
+        }),
+        getWalletSnapshot: async () => ({
+          mainBalance,
+          walletBalance,
+          walletFrozen: false,
+          blockNumber,
+          observedAt: new Date().toISOString(),
+        }),
+        isFundingApplied: async (_token: Hex, id: Hex) =>
+          [...funding.keys()].some((key) => keccak256(stringToHex(key)) === id),
+        getFundingEvidence: async (hash: Hex, _token: Hex, id: Hex) => {
+          const value = [...funding].find(
+            ([key, item]) =>
+              keccak256(stringToHex(key)) === id && item.hash === hash,
+          )?.[1];
+          if (!value) throw new Error("missing Funded");
+          return { ...value, token: activeAddresses.ecnySim, fundingId: id };
+        },
+        findFundingEvidence: async (_token: Hex, id: Hex) => {
+          const value = [...funding].find(
+            ([key]) => keccak256(stringToHex(key)) === id,
+          )?.[1];
+          return value
+            ? { ...value, token: activeAddresses.ecnySim, fundingId: id }
+            : undefined;
+        },
+        getSweepEvidence: async (hash: Hex, _wallet: Hex, id: Hex) => {
+          const value = [...sweeps].find(
+            ([key, item]) =>
+              keccak256(stringToHex(key)) === id && item.hash === hash,
+          )?.[1];
+          if (!value) throw new Error("missing Swept");
+          return { ...value, token: activeAddresses.ecnySim, sweepId: id };
+        },
+        findSweepEvidence: async (_wallet: Hex, id: Hex) => {
+          const value = [...sweeps].find(
+            ([key]) => keccak256(stringToHex(key)) === id,
+          )?.[1];
+          return value
+            ? { ...value, token: activeAddresses.ecnySim, sweepId: id }
+            : undefined;
+        },
+        pay: async (
+          walletAddress: Hex,
+          paymentId: Hex,
+          merchantId: Hex,
+          amount: bigint,
+        ) => {
+          if (walletBalance < amount)
+            throw new ChainRevertError("insufficient");
+          const hash = await originalPay(
+            walletAddress,
+            paymentId,
+            merchantId,
+            amount,
+          );
+          walletBalance -= amount;
+          return hash;
+        },
+      });
+      const options = {
+        chain: data.chain,
+        addresses: activeAddresses,
+        bankExecutor,
+        merchants: [merchant],
+        shopOrigin: "http://127.0.0.1:3001",
+        appOrigin: "http://127.0.0.1:8081",
+        gatewayOrigin: "http://127.0.0.1:3002",
+        shopToken: "local-token",
+        fetcher: data.fetcher,
+        env: demoEnv,
+        statePath,
+      };
+      const { app, loginToken } = await createLocalDemoGateway(options);
+      apps.push(app);
+      const login = await app.inject({
+        method: "POST",
+        url: "/demo/login",
+        headers: { authorization: `Bearer ${loginToken}` },
+      });
+      const cookie = login.headers["set-cookie"] as string;
+      const appHeaders = { cookie, "idempotency-key": randomUUID() };
+      const home = await app.inject({
         method: "GET",
-        url: `/v1/app/pairing/${pairing.user_code}`,
+        url: "/v1/app/home",
         headers: appHeaders,
-      })
-    ).json().approval;
-    expect(
-      (
+      });
+      expect(home.statusCode).toBe(200);
+      expect(home.json()).toMatchObject({
+        main_account: { balance: { amount: 866_000 } },
+        agent_wallet: {
+          enabled: false,
+          balance: { amount: 0 },
+          available: { amount: 0 },
+        },
+      });
+      await enableWallet(app, cookie);
+      const key = newAgentKey();
+      const pairing = (
         await app.inject({
           method: "POST",
-          url: `/v1/app/pairing/${pairing.user_code}/approve`,
-          headers: appHeaders,
+          url: "/v1/oauth/device_authorization",
           payload: {
-            verification: {
-              action_hash: pairCard.payload_hash,
-              device_signature: "simulated-local-approval",
-              request_number: pairing.request_number,
-            },
+            client_name: "Local Claude",
+            provider: "anthropic",
+            client_app_name: "Claude Code",
+            client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
+            agent_public_key: key.publicKey,
+            requested_scopes: [
+              "wallet:pay",
+              "wallet:mandate",
+              "wallet:history:self",
+            ],
           },
         })
-      ).statusCode,
-    ).toBe(200);
-    expect(trustWrites).toEqual([1]);
-    const auth = (
-      await app.inject({
-        method: "POST",
-        url: "/v1/oauth/token",
-        payload: {
-          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
-          device_code: pairing.device_code,
-        },
-      })
-    ).json();
-    const agentPost = async (path: string, body: unknown) => {
-      const json = JSON.stringify(body);
-      return app.inject({
-        method: "POST",
-        url: path,
-        headers: {
-          ...signAgentRequest({
+      ).json();
+      const pairCard = (
+        await app.inject({
+          method: "GET",
+          url: `/v1/app/pairing/${pairing.user_code}`,
+          headers: appHeaders,
+        })
+      ).json().approval;
+      expect(
+        (
+          await app.inject({
             method: "POST",
-            path,
-            body: json,
-            idempotencyKey: randomUUID(),
-            agentId: auth.agent_id,
-            privateKeyPem: key.privateKeyPem,
-          }),
-          authorization: `Bearer ${auth.access_token}`,
-          "content-type": "application/json",
-        },
-        payload: json,
+            url: `/v1/app/pairing/${pairing.user_code}/approve`,
+            headers: appHeaders,
+            payload: {
+              verification: {
+                action_hash: pairCard.payload_hash,
+                device_signature: "simulated-local-approval",
+                request_number: pairing.request_number,
+              },
+            },
+          })
+        ).statusCode,
+      ).toBe(200);
+      expect(trustWrites).toEqual([1]);
+      const auth = (
+        await app.inject({
+          method: "POST",
+          url: "/v1/oauth/token",
+          payload: {
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+            device_code: pairing.device_code,
+          },
+        })
+      ).json();
+      const agentPost = async (path: string, body: unknown) => {
+        const json = JSON.stringify(body);
+        return app.inject({
+          method: "POST",
+          url: path,
+          headers: {
+            ...signAgentRequest({
+              method: "POST",
+              path,
+              body: json,
+              idempotencyKey: randomUUID(),
+              agentId: auth.agent_id,
+              privateKeyPem: key.privateKeyPem,
+            }),
+            authorization: `Bearer ${auth.access_token}`,
+            "content-type": "application/json",
+          },
+          payload: json,
+        });
+      };
+      const mandateBody = (budget: number) => ({
+        description: "Buy Nova headphones",
+        approval_timing: "upfront",
+        user_text: "Buy Nova headphones",
+        intent_level: "open",
+        constraints: [
+          { type: "amount_range", max: { amount: 30_000, currency: "CNY" } },
+          { type: "categories", allowed: ["electronics"] },
+          { type: "budget", max: { amount: budget, currency: "CNY" } },
+          { type: "recurrence", frequency: "NONE", max_occurrences: 1 },
+          {
+            type: "execution_window",
+            not_before: null,
+            not_after: new Date(Date.now() + 3_600_000).toISOString(),
+          },
+        ],
       });
-    };
-    const mandateBody = (budget: number) => ({
-      description: "Buy Nova headphones",
-      approval_timing: "upfront",
-      user_text: "Buy Nova headphones",
-      intent_level: "open",
-      constraints: [
-        { type: "amount_range", max: { amount: 30_000, currency: "CNY" } },
-        { type: "categories", allowed: ["electronics"] },
-        { type: "budget", max: { amount: budget, currency: "CNY" } },
-        { type: "recurrence", frequency: "NONE", max_occurrences: 1 },
-        {
-          type: "execution_window",
-          not_before: null,
-          not_after: new Date(Date.now() + 3_600_000).toISOString(),
-        },
-      ],
-    });
-    const unfunded = await agentPost("/v1/agent/mandates", mandateBody(30_000));
-    expect(unfunded.statusCode).toBe(403);
-    expect(unfunded.json().error.rule).toBe("insufficient_reserved_funds");
-    const deniedMandates = await app.inject({
-      method: "GET",
-      url: "/v1/app/mandates",
-      headers: appHeaders,
-    });
-    expect(deniedMandates.json().items).toEqual([]);
-    const deniedApprovals = await app.inject({
-      method: "GET",
-      url: "/v1/app/approvals",
-      headers: appHeaders,
-    });
-    expect(deniedApprovals.json().items).toEqual([]);
-    const prepared = (
-      await app.inject({
+      const unfunded = await agentPost(
+        "/v1/agent/mandates",
+        mandateBody(30_000),
+      );
+      expect(unfunded.statusCode).toBe(403);
+      expect(unfunded.json().error.rule).toBe("insufficient_reserved_funds");
+      const deniedMandates = await app.inject({
+        method: "GET",
+        url: "/v1/app/mandates",
+        headers: appHeaders,
+      });
+      expect(deniedMandates.json().items).toEqual([]);
+      const deniedApprovals = await app.inject({
+        method: "GET",
+        url: "/v1/app/approvals",
+        headers: appHeaders,
+      });
+      expect(deniedApprovals.json().items).toEqual([]);
+      const prepared = (
+        await app.inject({
+          method: "POST",
+          url: "/v1/app/agent-wallet/funding/prepare",
+          headers: appHeaders,
+          payload: { amount: { amount: 100_000, currency: "CNY" } },
+        })
+      ).json();
+      const funded = await app.inject({
         method: "POST",
-        url: "/v1/app/agent-wallet/funding/prepare",
-        headers: appHeaders,
-        payload: { amount: { amount: 100_000, currency: "CNY" } },
-      })
-    ).json();
-    const funded = await app.inject({
-      method: "POST",
-      url: "/v1/app/agent-wallet/funding",
-      headers: { cookie, "idempotency-key": randomUUID() },
-      payload: {
-        funding_id: prepared.funding_id,
-        challenge_id: prepared.challenge_id,
-        amount: { amount: 100_000, currency: "CNY" },
-        verification: {
-          action_hash: prepared.action_hash,
-          device_signature: "simulated-local-funding",
+        url: "/v1/app/agent-wallet/funding",
+        headers: { cookie, "idempotency-key": randomUUID() },
+        payload: {
+          funding_id: prepared.funding_id,
+          challenge_id: prepared.challenge_id,
+          amount: { amount: 100_000, currency: "CNY" },
+          verification: {
+            action_hash: prepared.action_hash,
+            device_signature: "simulated-local-funding",
+          },
         },
-      },
-    });
-    expect(funded.statusCode).toBe(200);
-    expect(fundingCalls).toBe(1);
-    const fundedMandate = await agentPost(
-      "/v1/agent/mandates",
-      mandateBody(30_000),
-    );
-    expect(fundedMandate.statusCode).toBe(202);
-    const fundedCard = (
-      await app.inject({
-        method: "GET",
-        url: "/v1/app/approvals",
-        headers: appHeaders,
-      })
-    )
-      .json()
-      .items.find(
-        (item: { subject_id: string }) =>
-          item.subject_id === fundedMandate.json().mandate.mandate_id,
+      });
+      expect(funded.statusCode).toBe(200);
+      expect(fundingCalls).toBe(1);
+      const fundedMandate = await agentPost(
+        "/v1/agent/mandates",
+        mandateBody(30_000),
       );
-    const fundedApproval = await app.inject({
-      method: "POST",
-      url: `/v1/app/approvals/${fundedCard.approval_id}/decide`,
-      headers: { cookie, "idempotency-key": randomUUID() },
-      payload: {
-        decision: "approve",
-        verification: {
-          action_hash: fundedCard.payload_hash,
-          device_signature: "simulated-local-approval",
-          request_number: fundedMandate.json().request_number,
-        },
-      },
-    });
-    expect(fundedApproval.statusCode).toBe(200);
-    expect(
-      (
+      expect(fundedMandate.statusCode).toBe(202);
+      const fundedCard = (
         await app.inject({
           method: "GET",
-          url: "/v1/app/home",
+          url: "/v1/app/approvals",
           headers: appHeaders,
         })
-      ).json(),
-    ).toMatchObject({
-      main_account: { balance: { amount: 766_000 } },
-      agent_wallet: {
-        balance: { amount: 100_000 },
-        reserved: { amount: 30_000 },
-        available: { amount: 70_000 },
-      },
-    });
-    const overSweep = await app.inject({
-      method: "POST",
-      url: "/v1/app/agent-wallet/sweep",
-      headers: { cookie, "idempotency-key": randomUUID() },
-      payload: { amount: { amount: 70_001, currency: "CNY" } },
-    });
-    expect(overSweep.statusCode).toBe(403);
-    expect(overSweep.json().error.rule).toBe("insufficient_wallet_funds");
-    const payment = await agentPost("/v1/agent/payments", {
-      mandate_id: fundedMandate.json().mandate.mandate_id,
-      payment_request: signedPayreq(),
-      price_evidence: [],
-      rationale: "Untrusted agent claim",
-    });
-    expect(payment.statusCode).toBe(202);
-    const paymentCard = (
-      await app.inject({
-        method: "GET",
-        url: "/v1/app/approvals",
-        headers: appHeaders,
-      })
-    )
-      .json()
-      .items.find(
-        (item: { subject_id: string }) =>
-          item.subject_id === payment.json().payment_id,
-      );
-    const decision = await app.inject({
-      method: "POST",
-      url: `/v1/app/approvals/${paymentCard.approval_id}/decide`,
-      headers: { cookie, "idempotency-key": randomUUID() },
-      payload: {
-        decision: "approve",
-        verification: {
-          action_hash: paymentCard.payload_hash,
-          device_signature: "simulated-local-approval",
-          request_number: payment.json().request_number,
-        },
-      },
-    });
-    expect(decision.statusCode).toBe(200);
-    expect(data.pays).toHaveLength(1);
-    expect(
-      (
-        await app.inject({
-          method: "GET",
-          url: "/v1/app/home",
-          headers: appHeaders,
-        })
-      ).json(),
-    ).toMatchObject({
-      main_account: { balance: { amount: 766_000 } },
-      agent_wallet: { balance: { amount: 72_100 }, reserved: { amount: 0 } },
-    });
-    const orphan = await agentPost("/v1/agent/mandates", mandateBody(10_000));
-    expect(orphan.statusCode).toBe(202);
-    const ownerRevokeKey = randomUUID();
-    const ownerRevoke = await app.inject({
-      method: "POST",
-      url: `/v1/app/agents/${auth.agent_id}/revoke`,
-      headers: { cookie, "idempotency-key": ownerRevokeKey },
-      payload: { confirmation_agent_id: auth.agent_id },
-    });
-    expect(ownerRevoke.statusCode).toBe(200);
-    const ownerRevokeReplay = await app.inject({
-      method: "POST",
-      url: `/v1/app/agents/${auth.agent_id}/revoke`,
-      headers: { cookie, "idempotency-key": ownerRevokeKey },
-      payload: { confirmation_agent_id: auth.agent_id },
-    });
-    expect(ownerRevokeReplay.json()).toEqual(ownerRevoke.json());
-    const mandatesAfterRevoke = await app.inject({
-      method: "GET",
-      url: "/v1/app/mandates",
-      headers: appHeaders,
-    });
-    expect(
-      mandatesAfterRevoke
-        .json()
-        .items.find(
-          (item: { mandate_id: string }) =>
-            item.mandate_id === orphan.json().mandate.mandate_id,
-        )?.status,
-    ).toBe("cancelled");
-    const approvalsAfterRevoke = await app.inject({
-      method: "GET",
-      url: "/v1/app/approvals",
-      headers: appHeaders,
-    });
-    expect(
-      approvalsAfterRevoke
+      )
         .json()
         .items.find(
           (item: { subject_id: string }) =>
-            item.subject_id === orphan.json().mandate.mandate_id,
-        )?.status,
-    ).toBe("rejected");
-  });
+            item.subject_id === fundedMandate.json().mandate.mandate_id,
+        );
+      const fundedApproval = await app.inject({
+        method: "POST",
+        url: `/v1/app/approvals/${fundedCard.approval_id}/decide`,
+        headers: { cookie, "idempotency-key": randomUUID() },
+        payload: {
+          decision: "approve",
+          verification: {
+            action_hash: fundedCard.payload_hash,
+            device_signature: "simulated-local-approval",
+            request_number: fundedMandate.json().request_number,
+          },
+        },
+      });
+      expect(fundedApproval.statusCode).toBe(200);
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/v1/app/home",
+            headers: appHeaders,
+          })
+        ).json(),
+      ).toMatchObject({
+        main_account: { balance: { amount: 766_000 } },
+        agent_wallet: {
+          balance: { amount: 100_000 },
+          reserved: { amount: 30_000 },
+          available: { amount: 70_000 },
+        },
+      });
+      const overSweep = await app.inject({
+        method: "POST",
+        url: "/v1/app/agent-wallet/sweep",
+        headers: { cookie, "idempotency-key": randomUUID() },
+        payload: { amount: { amount: 70_001, currency: "CNY" } },
+      });
+      expect(overSweep.statusCode).toBe(403);
+      expect(overSweep.json().error.rule).toBe("insufficient_wallet_funds");
+      const payment = await agentPost("/v1/agent/payments", {
+        mandate_id: fundedMandate.json().mandate.mandate_id,
+        payment_request: signedPayreq(),
+        price_evidence: [],
+        rationale: "Untrusted agent claim",
+      });
+      expect(payment.statusCode).toBe(202);
+      const paymentCard = (
+        await app.inject({
+          method: "GET",
+          url: "/v1/app/approvals",
+          headers: appHeaders,
+        })
+      )
+        .json()
+        .items.find(
+          (item: { subject_id: string }) =>
+            item.subject_id === payment.json().payment_id,
+        );
+      const decision = await app.inject({
+        method: "POST",
+        url: `/v1/app/approvals/${paymentCard.approval_id}/decide`,
+        headers: { cookie, "idempotency-key": randomUUID() },
+        payload: {
+          decision: "approve",
+          verification: {
+            action_hash: paymentCard.payload_hash,
+            device_signature: "simulated-local-approval",
+            request_number: payment.json().request_number,
+          },
+        },
+      });
+      expect(decision.statusCode).toBe(200);
+      expect(data.pays).toHaveLength(1);
+      expect(
+        (
+          await app.inject({
+            method: "GET",
+            url: "/v1/app/home",
+            headers: appHeaders,
+          })
+        ).json(),
+      ).toMatchObject({
+        main_account: { balance: { amount: 766_000 } },
+        agent_wallet: { balance: { amount: 72_100 }, reserved: { amount: 0 } },
+      });
+      const orphan = await agentPost("/v1/agent/mandates", mandateBody(10_000));
+      expect(orphan.statusCode).toBe(202);
+      const ownerRevokeKey = randomUUID();
+      const ownerRevoke = await app.inject({
+        method: "POST",
+        url: `/v1/app/agents/${auth.agent_id}/revoke`,
+        headers: { cookie, "idempotency-key": ownerRevokeKey },
+        payload: { confirmation_agent_id: auth.agent_id },
+      });
+      expect(ownerRevoke.statusCode).toBe(200);
+      const ownerRevokeReplay = await app.inject({
+        method: "POST",
+        url: `/v1/app/agents/${auth.agent_id}/revoke`,
+        headers: { cookie, "idempotency-key": ownerRevokeKey },
+        payload: { confirmation_agent_id: auth.agent_id },
+      });
+      expect(ownerRevokeReplay.json()).toEqual(ownerRevoke.json());
+      const mandatesAfterRevoke = await app.inject({
+        method: "GET",
+        url: "/v1/app/mandates",
+        headers: appHeaders,
+      });
+      expect(
+        mandatesAfterRevoke
+          .json()
+          .items.find(
+            (item: { mandate_id: string }) =>
+              item.mandate_id === orphan.json().mandate.mandate_id,
+          )?.status,
+      ).toBe("cancelled");
+      const approvalsAfterRevoke = await app.inject({
+        method: "GET",
+        url: "/v1/app/approvals",
+        headers: appHeaders,
+      });
+      expect(
+        approvalsAfterRevoke
+          .json()
+          .items.find(
+            (item: { subject_id: string }) =>
+              item.subject_id === orphan.json().mandate.mandate_id,
+          )?.status,
+      ).toBe("rejected");
+    },
+  );
 });
 
 describe("shop callback adapter", () => {

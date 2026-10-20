@@ -193,6 +193,7 @@ export type LiveHome = {
   simulated: true;
   main_account: { balance: Money };
   agent_wallet: {
+    enabled: boolean;
     balance: Money;
     reserved: Money;
     available: Money;
@@ -202,6 +203,12 @@ export type LiveHome = {
   block_number: number;
   observed_at: string;
   alerts: string[];
+};
+export type WalletEnableChallenge = {
+  challenge_id: string;
+  action_hash: string;
+  expires_at: string;
+  simulated: true;
 };
 export type FundingChallenge = {
   funding_id: string;
@@ -461,6 +468,7 @@ export function createGatewayClient(
               home.agent_wallet.reserved.amount,
           ) ||
         typeof home.agent_wallet?.address !== "string" ||
+        typeof home.agent_wallet?.enabled !== "boolean" ||
         typeof home.agent_wallet?.frozen !== "boolean" ||
         !Number.isSafeInteger(home.block_number) ||
         !Number.isFinite(Date.parse(home.observed_at)) ||
@@ -470,6 +478,47 @@ export function createGatewayClient(
           "Gateway returned an invalid chain balance. Transfers are unavailable.",
         );
       return home;
+    },
+    async prepareWalletEnable(): Promise<WalletEnableChallenge> {
+      requireLocalDemo();
+      const challenge = await request<WalletEnableChallenge>(
+        "/v1/app/agent-wallet/enable/prepare",
+        { method: "POST" },
+      );
+      if (
+        !challenge.challenge_id?.startsWith("wch_") ||
+        !/^sha256:[a-f0-9]{64}$/.test(challenge.action_hash) ||
+        !Number.isFinite(Date.parse(challenge.expires_at)) ||
+        challenge.simulated !== true
+      )
+        throw new Error("Gateway returned an invalid wallet enable review.");
+      return challenge;
+    },
+    async completeWalletEnable(
+      challenge: WalletEnableChallenge,
+    ): Promise<void> {
+      requireLocalDemo();
+      if (Date.parse(challenge.expires_at) <= Date.now())
+        throw new Error("Wallet enable review expired. Prepare a new one.");
+      const result = await request<{ enabled: boolean; simulated: boolean }>(
+        "/v1/app/agent-wallet/enable",
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": `wallet-enable-${challenge.challenge_id}`,
+          },
+          body: JSON.stringify({
+            challenge_id: challenge.challenge_id,
+            verification: {
+              action_hash: challenge.action_hash,
+              device_signature: "simulated-local-wallet-enable",
+            },
+          }),
+        },
+      );
+      if (result.enabled !== true || result.simulated !== true)
+        throw new Error("Gateway did not confirm wallet enablement.");
     },
     policy(): Promise<PolicySnapshot> {
       return request("/v1/app/policy");
@@ -967,6 +1016,11 @@ function configuredClient() {
 
 export const loadGatewaySnapshot = () => configuredClient().snapshot();
 export const loadGatewayHome = () => configuredClient().home();
+export const prepareGatewayWalletEnable = () =>
+  configuredClient().prepareWalletEnable();
+export const completeSimulatedGatewayWalletEnable = (
+  challenge: WalletEnableChallenge,
+) => configuredClient().completeWalletEnable(challenge);
 export const loadGatewayPolicy = () => configuredClient().policy();
 export const prepareGatewayPolicyChange = (
   snapshot: PolicySnapshot,

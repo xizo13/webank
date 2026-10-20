@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -26,6 +27,8 @@ SCRIPTS = ROOT / "scripts"
 RUNTIME = SCRIPTS / "local-demo-runtime"
 STATE = RUNTIME / "state.json"
 TOKEN = RUNTIME / "app-login-token"
+SHOP_OPERATOR_TOKEN = RUNTIME / "shop-operator-token"
+CONSOLE_SIMULATION = RUNTIME / "console-simulation.jsonl"
 GATEWAY_STATE = RUNTIME / "gateway-state.json"
 FUNDING_CUTOVER = RUNTIME / "funding-cutover.json"
 SHOP = ROOT / "apps/shops"
@@ -39,6 +42,24 @@ NATIVE_FUNDED_TXS = {"deployECnySim", "deployMerchantRegistry", "deployLicenceRe
 SHOP_KEYS = SHOP / ".shop-local/merchant-keys.json"
 SHOP_STATE = SHOP / ".shop-local/state.json"
 FRESH_RESET = RUNTIME / "fresh-reset.json"
+
+
+def chain_artifact_paths() -> dict[str, Path]:
+    host = (platform.system(), platform.machine())
+    if host == ("Darwin", "arm64"):
+        archive = "fisco-bcos-v3.17.1-macOS-arm.tar.gz"
+    elif host == ("Linux", "x86_64"):
+        archive = "fisco-bcos-linux-x86_64.tar.gz"
+    else:
+        fail(f"Unsupported local FISCO host {host[0]} {host[1]}; use macOS arm64 or Linux x86_64")
+    return {
+        "FISCO_ARCHIVE_FILE": CHAIN / archive,
+        "FISCO_BUILDER_FILE": CHAIN / "build_chain.sh",
+        "FISCO_TASSL_BINARY": CHAIN / "home/.fisco/tassl-1.1.1b",
+        "FISCO_ACCOUNT_HELPER_FILE": CHAIN / "home/.fisco/get_account.sh",
+    }
+
+
 def project_node() -> str | None:
     explicit = os.environ.get("WEBANK_NODE_BINARY")
     directories = os.environ.get("PATH", "").split(os.pathsep)
@@ -255,13 +276,14 @@ def port_busy(port: int) -> bool:
         return connection.connect_ex(("127.0.0.1", port)) == 0
 
 
-def request(url: str, *, payload: dict | None = None) -> tuple[int, bytes]:
+def request(url: str, *, payload: dict | None = None, headers: dict[str, str] | None = None) -> tuple[int, bytes]:
     body = json.dumps(payload).encode() if payload is not None else None
-    headers = {"Content-Type": "application/json"} if body else {}
+    request_headers = {"Content-Type": "application/json"} if body else {}
+    request_headers.update(headers or {})
     method = "POST" if body else "GET"
     try:
         with urllib.request.urlopen(
-            urllib.request.Request(url, data=body, headers=headers, method=method),
+            urllib.request.Request(url, data=body, headers=request_headers, method=method),
             timeout=2,
         ) as response:
             return response.status, response.read(1024 * 1024)
@@ -660,7 +682,28 @@ def reset_sources() -> dict[str, Path]:
         "gateway-identity": Path(f"{GATEWAY_STATE}.identity"),
         "gateway-identity-initialized": Path(f"{GATEWAY_STATE}.identity.initialized"),
         "shop-state": SHOP_STATE,
+        "console-simulation": CONSOLE_SIMULATION,
     }
+
+
+def write_private_token(path: Path, token: str) -> None:
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,}", token):
+        fail("Refusing invalid operator token")
+    temporary = path.with_name(f".{path.name}.{secrets.token_hex(8)}.tmp")
+    descriptor = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        with os.fdopen(descriptor, "w") as output:
+            output.write(token + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.replace(path)
+        directory = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def deployment_source_fingerprint() -> str:
@@ -695,6 +738,7 @@ def verify_reset_quiescent(path: Path) -> None:
 
     if records("replacingAgents"):
         fail("Resolve agent replacement before fresh reset")
+    now_ms = int(time.time() * 1000)
     for name, terminal in (
         ("mandates", {"cancelled", "exhausted", "expired"}),
         ("pairings", {"approved", "denied", "consumed"}),
@@ -706,7 +750,14 @@ def verify_reset_quiescent(path: Path) -> None:
         for item in records(name):
             if not isinstance(item, dict) or not isinstance(item.get("status"), str):
                 fail(f"Gateway {name} is incompatible; refusing fresh reset")
-            if item["status"] not in terminal:
+            expired_pairing = (
+                name == "pairings"
+                and item["status"] == "pending"
+                and isinstance(item.get("expiresAt"), (int, float))
+                and not isinstance(item.get("expiresAt"), bool)
+                and item["expiresAt"] <= now_ms
+            )
+            if item["status"] not in terminal and not expired_pairing:
                 fail(f"Resolve {name} status {item['status']} before fresh reset")
             if name == "mandates" and item.get("in_flight_payment_id") is not None:
                 fail("Resolve in-flight mandate payment before fresh reset")
@@ -861,12 +912,7 @@ def up(fresh: bool) -> None:
         fail("Node 22 and Corepack are required; no dependency install will be attempted")
     if not (ROOT / "onchain/node_modules/solc").exists():
         fail("Pinned onchain dependencies are missing; refusing automatic install")
-    local_chain_artifacts = {
-        "FISCO_ARCHIVE_FILE": CHAIN / "fisco-bcos-v3.17.1-macOS-arm.tar.gz",
-        "FISCO_BUILDER_FILE": CHAIN / "build_chain.sh",
-        "FISCO_TASSL_BINARY": CHAIN / "home/.fisco/tassl-1.1.1b",
-        "FISCO_ACCOUNT_HELPER_FILE": CHAIN / "home/.fisco/get_account.sh",
-    }
+    local_chain_artifacts = chain_artifact_paths()
     if any(not path.is_file() for path in local_chain_artifacts.values()) or not (CHAIN / "nodes").is_dir():
         fail("Pinned FISCO runtime is incomplete; refusing a download")
     if not (SHOP / "node_modules/next/dist/bin/next").is_file() or not (APP / "node_modules/expo/bin/cli").is_file():
@@ -886,6 +932,7 @@ def up(fresh: bool) -> None:
     write_state(state)
     old_keys = hashlib.sha256(SHOP_KEYS.read_bytes()).hexdigest() if SHOP_KEYS.is_file() else None
     shop_token = secrets.token_urlsafe(32)
+    shop_operator_token = secrets.token_urlsafe(32)
     reset_lock = None
     try:
         if fresh:
@@ -893,7 +940,8 @@ def up(fresh: bool) -> None:
         journal = fresh_reset_journal(owns_writer_lock=True) if fresh else None
         if journal is not None:
             archive_fresh_inputs(journal)
-        shop_env = {**environment, "SHOP_INTERNAL_TOKEN": shop_token, "NEXT_TELEMETRY_DISABLED": "1"}
+        write_private_token(SHOP_OPERATOR_TOKEN, shop_operator_token)
+        shop_env = {**environment, "SHOP_INTERNAL_TOKEN": shop_token, "SHOP_OPERATOR_TOKEN": shop_operator_token, "NEXT_TELEMETRY_DISABLED": "1"}
         shop = start("shop", [NODE, str(SHOP / "node_modules/next/dist/bin/next"), "start", "--hostname", "127.0.0.1", "--port", "3001"], SHOP, shop_env, state)
 
         def shop_ready():
@@ -974,17 +1022,162 @@ def up(fresh: bool) -> None:
         raise
 
 
+def recording_stage_issues(*, allow_owned_running: bool = False) -> list[str]:
+    issues = []
+    running = STATE.exists()
+    if running and not allow_owned_running:
+        issues.append("Stop the launcher-owned demo with local-demo-down.sh first")
+    if chain_pids() and not (running and allow_owned_running):
+        issues.append("FISCO node PIDs are still registered")
+    if not (running and allow_owned_running) and any(port_busy(port) for port in (3001, 3002, 8081, 8545)):
+        issues.append("A required loopback port is still listening")
+    if FUNDING_CUTOVER.exists() or FRESH_RESET.exists() or FRESH_PENDING.exists():
+        issues.append("A funding or fresh-deployment journal needs recovery before staging")
+    if not (running and allow_owned_running) and any(Path(f"{GATEWAY_STATE}{suffix}").exists() for suffix in (".lock", ".identity.lock")):
+        issues.append("Gateway writer lock exists; verify shutdown before staging")
+    if not issues and GATEWAY_STATE.is_file():
+        try:
+            verify_reset_quiescent(GATEWAY_STATE)
+        except (OSError, ValueError, RuntimeError) as error:
+            issues.append(str(error))
+    return issues
+
+
+def recording_shop_reset() -> None:
+    metadata = SHOP_OPERATOR_TOKEN.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        fail("Shop operator token file is not owner-only")
+    token = SHOP_OPERATOR_TOKEN.read_text().strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{40,}", token):
+        fail("Shop operator token file is invalid")
+    status, body = request(
+        "http://127.0.0.1:3001/internal/demo-control",
+        payload={"operation": "reset"},
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    if status != 200:
+        fail("Protected shop reset failed; stop the bank drill and inspect the shop")
+    result = json.loads(body)
+    if result != {"ok": True, "reset": True, "attack": False, "coffee_price": 8800}:
+        fail("Protected shop reset did not confirm default controls and coffee price")
+
+
+def recording_owner_readback(path: str) -> dict:
+    metadata = TOKEN.lstat()
+    if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid() or metadata.st_mode & 0o077:
+        fail("Owner token file is not owner-only")
+    token = TOKEN.read_text().strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32}", token):
+        fail("Owner token file is invalid")
+    login = urllib.request.Request(
+        "http://127.0.0.1:3002/demo/login",
+        data=b"{}",
+        headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(login, timeout=2) as response:
+            cookie = response.headers.get("Set-Cookie", "").split(";", 1)[0]
+    except urllib.error.HTTPError as problem:
+        fail(f"Owner login failed: HTTP {problem.code}")
+    if not cookie.startswith("webank_local_demo_session="):
+        fail("Gateway did not issue an owner demo session")
+    query = urllib.request.Request(
+        f"http://127.0.0.1:3002{path}",
+        headers={"Cookie": cookie},
+    )
+    max_attempts = 15 if path == "/v1/app/home" else 1
+    for attempt in range(1, max_attempts + 1):
+        try:
+            with urllib.request.urlopen(query, timeout=2) as response:
+                return json.load(response)
+        except urllib.error.HTTPError as problem:
+            try:
+                body = json.loads(problem.read(1024))
+                code = body.get("error", {}).get("code")
+            except (ValueError, UnicodeDecodeError, AttributeError):
+                code = None
+            if not isinstance(code, str) or not re.fullmatch(r"[A-Za-z0-9_]{1,64}", code):
+                code = "unknown"
+            if path == "/v1/app/home" and problem.code == 503 and code == "chain_unavailable":
+                if attempt < max_attempts:
+                    if attempt == 1:
+                        print("Waiting for the chain snapshot before recording readback")
+                    time.sleep(1)
+                    continue
+                fail(f"Owner readback failed at {path}: HTTP 503 chain_unavailable after {max_attempts} attempts")
+            fail(f"Owner readback failed at {path}: HTTP {problem.code} {code}")
+    raise AssertionError("Unreachable recording readback state")
+
+
+def verify_recording_stage() -> None:
+    home = recording_owner_readback("/v1/app/home")
+    policy = recording_owner_readback("/v1/app/policy")
+    agents = recording_owner_readback("/v1/app/agents")
+    pairings = recording_owner_readback("/v1/app/pairings")
+    drill = recording_owner_readback("/v1/app/demo/drills")
+    wallet = home.get("agent_wallet", {})
+    caps = policy.get("contract") or {}
+    if wallet.get("enabled") is not False or wallet.get("balance", {}).get("amount") != 0:
+        fail("Recording wallet is not disabled and empty")
+    if (policy.get("sync_status") != "consistent" or
+            caps.get("spent_today", {}).get("amount") != 0 or
+            caps.get("spent_month", {}).get("amount") != 0):
+        fail("New contract UTC spending is not zero and in sync")
+    if agents.get("items") != [] or pairings.get("items") != []:
+        fail("Recording app already has agents or pairings")
+    if drill != {"active": False, "drill_id": None}:
+        fail("Bank fire drill remains active")
+
+
+def stage_recording(execute: bool) -> None:
+    issues = recording_stage_issues(allow_owned_running=True)
+    if issues:
+        for issue in issues:
+            print(f"Recording stage blocked: {issue}")
+        if execute:
+            fail("Recording stage preflight failed without changing state")
+        return
+    if not execute:
+        if STATE.exists():
+            print("Recording stage will verify and stop only launcher-owned demo processes before archival.")
+        print("Recording stage ready. Run stage --execute to archive old demo state and deploy fresh contracts on the existing chain.")
+        return
+    if STATE.exists():
+        state = json.loads(STATE.read_text())
+        if not down(state):
+            fail("Launcher-owned demo could not be stopped safely; no reset was started")
+    stopped_issues = recording_stage_issues()
+    if stopped_issues:
+        fail("Recording stage stop left a port, writer lock, or unresolved state; inspect before retrying")
+    up(fresh=True)
+    try:
+        recording_shop_reset()
+        verify_recording_stage()
+    except BaseException:
+        if STATE.exists():
+            down(json.loads(STATE.read_text()))
+        raise
+    print("Recording stage ready: wallet off, no agents or pairings, controls reset, wallet and UTC spend zero; prior chain history and signer files preserved")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("up").add_argument("--fresh", action="store_true", help="Archive current addresses and deploy a new funded wallet")
     commands.add_parser("down")
+    commands.add_parser("stage").add_argument("--execute", action="store_true", help="Archive old demo state and prepare recording setup")
     args = parser.parse_args()
+    if args.command == "stage" and not args.execute:
+        stage_recording(False)
+        return
     private_dir()
     with (RUNTIME / "operator.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if args.command == "up":
             up(args.fresh)
+        elif args.command == "stage":
+            stage_recording(True)
         elif STATE.exists():
             if not down(json.loads(STATE.read_text())):
                 fail("Some PID identities changed; inspect state before retrying")

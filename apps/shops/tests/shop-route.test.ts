@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { GET, POST } from "../app/api/shop/route";
+import { POST as demoControl } from "../app/internal/demo-control/route";
 import { POST as setDrillVisibility } from "../app/internal/drill-visibility/route";
 import { decodePaymentUri, verifyLocalPaymentUri } from "../lib/signing";
 import { resetDemo } from "../lib/store";
@@ -21,11 +22,13 @@ const shipping_address = {
 beforeAll(() => {
   process.env.SHOP_DATA_DIR = dataDir;
   process.env.SHOP_INTERNAL_TOKEN = "isolated-test-shop-token";
+  process.env.SHOP_OPERATOR_TOKEN = "isolated-test-operator-token";
 });
 beforeEach(() => resetDemo({ clearDrill: true }));
 afterAll(() => {
   delete process.env.SHOP_DATA_DIR;
   delete process.env.SHOP_INTERNAL_TOKEN;
+  delete process.env.SHOP_OPERATOR_TOKEN;
   rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -49,7 +52,145 @@ async function get(operation: string, params: Record<string, string> = {}) {
   return { status: response.status, body: await response.json() };
 }
 
+async function operatorPost(
+  operation: string,
+  body: Record<string, unknown> = {},
+  token = "isolated-test-operator-token",
+  origin = "http://127.0.0.1:3001",
+) {
+  const response = await demoControl(
+    new NextRequest(`${origin}/internal/demo-control`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ operation, ...body }),
+    }),
+  );
+  return { status: response.status, body: await response.json() };
+}
+
 describe("shop HTTP checkout path used by MCP", () => {
+  it("protects attack, price, clock and reset controls from public and nonlocal callers", async () => {
+    const missingToken = await demoControl(
+      new NextRequest("http://127.0.0.1:3001/internal/demo-control", {
+        method: "POST",
+        body: JSON.stringify({
+          operation: "set_price",
+          sku: "FIELD-COFFEE-1KG",
+          amount: 7200,
+        }),
+      }),
+    );
+    expect(missingToken.status).toBe(401);
+    expect(
+      await post("set_scenario", { scenario: "attack", enabled: true }),
+    ).toMatchObject({ status: 403 });
+    expect(
+      (
+        await operatorPost(
+          "set_scenario",
+          { scenario: "attack", enabled: true },
+          "wrong-token",
+        )
+      ).status,
+    ).toBe(401);
+    expect((await get("scenarios")).body.scenarios).toEqual({ attack: false });
+    expect(
+      await post("set_price", { sku: "FIELD-COFFEE-1KG", amount: 7200 }),
+    ).toMatchObject({ status: 403 });
+    expect(await post("advance_clock", { minutes: 1440 })).toMatchObject({
+      status: 403,
+    });
+    expect(await post("reset")).toMatchObject({ status: 403 });
+    expect(
+      (await get("get_product", { sku: "FIELD-COFFEE-1KG" })).body.price.amount,
+    ).toBe(8800);
+    expect(
+      (
+        await operatorPost(
+          "set_price",
+          { sku: "FIELD-COFFEE-1KG", amount: 7200 },
+          "wrong-token",
+        )
+      ).status,
+    ).toBe(401);
+    expect(
+      (
+        await operatorPost(
+          "set_price",
+          { sku: "FIELD-COFFEE-1KG", amount: 7200 },
+          "isolated-test-operator-token",
+          "https://shop.example",
+        )
+      ).status,
+    ).toBe(403);
+    expect(
+      (await get("get_product", { sku: "FIELD-COFFEE-1KG" })).body.price.amount,
+    ).toBe(8800);
+  });
+
+  it("drops coffee from ¥88 to ¥72, signs the ¥77 checkout, and resets safely", async () => {
+    expect(
+      (await get("search_products", { query: "coffee", max_price: "8000" }))
+        .body,
+    ).toEqual([]);
+    const product = await get("get_product", { sku: "FIELD-COFFEE-1KG" });
+    expect(product.body).toMatchObject({
+      shop: "shopB",
+      price: { amount: 8800 },
+    });
+    const dropped = await operatorPost("set_price", {
+      sku: "FIELD-COFFEE-1KG",
+      amount: 7200,
+    });
+    expect(dropped).toMatchObject({
+      status: 200,
+      body: { product: { sku: "FIELD-COFFEE-1KG", price: 7200 } },
+    });
+    expect(
+      (await get("search_products", { query: "coffee", max_price: "8000" }))
+        .body[0].sku,
+    ).toBe("FIELD-COFFEE-1KG");
+    expect(
+      (await get("get_product", { sku: "FIELD-COFFEE-1KG" })).body.price.amount,
+    ).toBe(7200);
+    const cart = await post("add_to_cart", {
+      sku: "FIELD-COFFEE-1KG",
+      qty: 1,
+      options: { size: "1 kg" },
+    });
+    expect(cart.status).toBe(200);
+    const checkout = await post("checkout", { shipping_address });
+    expect(checkout.body).toMatchObject({
+      shop: "shopB",
+      total: { amount: 7700 },
+    });
+    const signed = checkout.body.payment_request as string;
+    const payreq = decodePaymentUri(signed);
+    expect(payreq.merchant_id).toBe("mch_shopB");
+    expect(payreq.amount.amount).toBe(7700);
+    expect(payreq.line_items[0]).toMatchObject({
+      sku: "FIELD-COFFEE-1KG",
+      unit_price: { amount: 7200 },
+    });
+    expect(verifyLocalPaymentUri(signed)).toBe(true);
+    const reset = await operatorPost("reset");
+    expect(reset).toEqual({
+      status: 200,
+      body: { ok: true, reset: true, attack: false, coffee_price: 8800 },
+    });
+    expect(
+      (await get("get_product", { sku: "FIELD-COFFEE-1KG" })).body.price.amount,
+    ).toBe(8800);
+    expect((await get("get_cart")).body.cart.items).toEqual([]);
+    expect(
+      (await get("get_order", { order_id: checkout.body.order_id })).status,
+    ).toBe(404);
+    expect(verifyLocalPaymentUri(signed)).toBe(true);
+  });
+
   it("only the authenticated Gateway can change drill visibility", async () => {
     const endpoint = "http://127.0.0.1:3001/internal/drill-visibility";
     const missing = await setDrillVisibility(
@@ -71,8 +212,8 @@ describe("shop HTTP checkout path used by MCP", () => {
     expect((await get("scenarios")).body.scenarios).toEqual({ attack: false });
   });
 
-  it("public attack mode reveals the malicious listing but not the registered decoy", async () => {
-    const attack = await post("set_scenario", {
+  it("operator attack mode reveals the malicious listing but not the registered decoy", async () => {
+    const attack = await operatorPost("set_scenario", {
       scenario: "attack",
       enabled: true,
     });
@@ -93,7 +234,7 @@ describe("shop HTTP checkout path used by MCP", () => {
   it("does not publish bank drill status in public shop scenario responses", async () => {
     const initial = await get("scenarios");
     expect(initial.body.scenarios).toEqual({ attack: false });
-    const attack = await post("set_scenario", {
+    const attack = await operatorPost("set_scenario", {
       scenario: "attack",
       enabled: true,
     });
@@ -107,11 +248,11 @@ describe("shop HTTP checkout path used by MCP", () => {
     );
     expect(drill.status).toBe(200);
     expect((await get("scenarios")).body.scenarios).toEqual({ attack: true });
-    const publicAttack = await post("set_scenario", {
+    const operatorAttack = await operatorPost("set_scenario", {
       scenario: "attack",
       enabled: false,
     });
-    expect(publicAttack.body.scenarios).toEqual({ attack: false });
+    expect(operatorAttack.body.scenarios).toEqual({ attack: false });
   });
 
   it("removes a chosen SKU and returns the updated cart", async () => {
@@ -169,6 +310,10 @@ describe("shop HTTP checkout path used by MCP", () => {
       enabled: true,
     });
     expect(deniedDrill.status).toBe(403);
+    expect(
+      (await operatorPost("set_scenario", { scenario: "drill", enabled: true }))
+        .status,
+    ).toBe(403);
     const drill = await setDrillVisibility(
       new NextRequest("http://127.0.0.1:3001/internal/drill-visibility", {
         method: "POST",
@@ -197,13 +342,13 @@ describe("shop HTTP checkout path used by MCP", () => {
       qty: 1,
       options: { colour: "Black", size: "One size" },
     });
-    await post("set_price", { sku: "NOVA-Q3-BLK", amount: 23_900 });
-    const activeReset = await post("reset");
-    expect(activeReset).toEqual({ status: 200, body: { ok: true } });
-    expect((await get("get_cart")).body.cart.items).toEqual([]);
+    await operatorPost("set_price", { sku: "NOVA-Q3-BLK", amount: 23_900 });
+    const activeReset = await operatorPost("reset");
+    expect(activeReset).toMatchObject({ status: 409 });
+    expect((await get("get_cart")).body.cart.items).toHaveLength(1);
     expect(
       (await get("get_product", { sku: "NOVA-Q3-BLK" })).body.price.amount,
-    ).toBe(27_900);
+    ).toBe(23_900);
     expect(
       (await get("search_products", { query: "reward voucher" })).body[0].sku,
     ).toBe("REWARD-GIFT-500");
@@ -219,7 +364,14 @@ describe("shop HTTP checkout path used by MCP", () => {
     );
     expect(stop.status).toBe(200);
     expect((await stop.json()).drill_visible).toBe(false);
-    expect(await post("reset")).toEqual({ status: 200, body: { ok: true } });
+    expect(await operatorPost("reset")).toEqual({
+      status: 200,
+      body: { ok: true, reset: true, attack: false, coffee_price: 8800 },
+    });
+    expect((await get("get_cart")).body.cart.items).toEqual([]);
+    expect(
+      (await get("get_product", { sku: "NOVA-Q3-BLK" })).body.price.amount,
+    ).toBe(27_900);
     expect(
       (await get("search_products", { query: "reward voucher" })).body,
     ).toEqual([]);
