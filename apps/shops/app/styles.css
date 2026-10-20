@@ -623,6 +623,12 @@ button:disabled {
 .cart-lines {
   border-top: 1px solid #d7d0da;
 }
+.cart-seller {
+  margin: 0 0 12px;
+  font-size: 13px;
+  font-weight: 700;
+  color: #554b5c;
+}
 .cart-line {
   display: grid;
   grid-template-columns: 90px 1fr auto;

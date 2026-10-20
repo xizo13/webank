@@ -18,7 +18,13 @@ import {
   TokenResponseSchema,
 } from "@webank/contracts";
 import { newAgentKey, signAgentRequest } from "./signing.js";
-import type { CredentialStore, Credentials } from "./storage.js";
+import {
+  type ClientAppIdentity,
+  type CredentialStore,
+  type Credentials,
+  clientAppIdentity,
+  FileCredentialStore,
+} from "./storage.js";
 
 const execFileAsync = promisify(execFile);
 const scopes = ["wallet:pay", "wallet:mandate", "wallet:history:self"] as const;
@@ -52,9 +58,12 @@ export class ConnectorError extends Error {
 }
 
 export class WeBankConnector {
+  private clientApp?: ClientAppIdentity;
+  private scopedStore?: CredentialStore;
+
   constructor(
     private readonly baseUrl: URL,
-    private readonly store: CredentialStore,
+    private readonly baseStore: CredentialStore,
     private readonly request: typeof fetch = fetch,
     private readonly notify: Notification = macNotification,
     private readonly now: () => number = Date.now,
@@ -68,6 +77,49 @@ export class WeBankConnector {
     ) {
       throw new Error("Non-local Gateway URL must use HTTPS");
     }
+  }
+
+  bindClientApp(app: ClientAppIdentity): void {
+    if (clientAppIdentity(app.name).id !== app.id) {
+      throw new ConnectorError(
+        "Invalid MCP client app identity",
+        "invalid_client_app",
+      );
+    }
+    if (this.clientApp) {
+      if (this.clientApp.id !== app.id || this.clientApp.name !== app.name) {
+        throw new ConnectorError(
+          "MCP client app identity changed",
+          "invalid_client_app",
+        );
+      }
+      return;
+    }
+    this.clientApp = app;
+    this.scopedStore =
+      this.baseStore instanceof FileCredentialStore
+        ? this.baseStore.forApp(app)
+        : this.baseStore;
+  }
+
+  private get store(): CredentialStore {
+    if (!this.clientApp || !this.scopedStore) {
+      throw new ConnectorError(
+        "Valid MCP initialize clientInfo.name is required",
+        "invalid_client_app",
+      );
+    }
+    return this.scopedStore;
+  }
+
+  private appIdentity(): ClientAppIdentity {
+    if (!this.clientApp) {
+      throw new ConnectorError(
+        "Valid MCP initialize clientInfo.name is required",
+        "invalid_client_app",
+      );
+    }
+    return this.clientApp;
   }
 
   private async json(
@@ -129,9 +181,11 @@ export class WeBankConnector {
     throw new ConnectorError(
       denied.success
         ? denied.data.user_explanation
-        : code === "agent_frozen"
-          ? "This agent cannot spend. Check its WeBank app status. Only the user can Unfreeze or Re-license it in the app; a revoked agent needs a new user-approved pairing."
-          : `WeBank request failed (${result.status}: ${code})`,
+        : code === "reauthorization_required"
+          ? "This app's WeBank connection has been idle for seven days. Ask the owner to use Re-approve connection in the WeBank app, then check wallet status again."
+          : code === "agent_frozen"
+            ? "This agent cannot spend. Check its WeBank app status. Only the owner can Unfreeze a frozen agent or review a RED light and Return to Amber; a revoked agent needs a new owner-approved pairing."
+            : `WeBank request failed (${result.status}: ${code})`,
       code,
       denied.success ? denied.data : undefined,
     );
@@ -177,6 +231,73 @@ export class WeBankConnector {
     return next;
   }
 
+  private async renew(current: Credentials): Promise<Credentials> {
+    const result = await this.json(
+      "/v1/agent/session/renew",
+      "POST",
+      {},
+      { ...current, accessToken: undefined },
+      true,
+    );
+    if (result.status !== 200) this.gatewayError(result);
+    const tokens = TokenResponseSchema.parse(result.data);
+    if (tokens.agent_id !== current.agentId) {
+      throw new ConnectorError("Gateway returned a different agent identity");
+    }
+    const next = {
+      ...current,
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      tokenExpiresAt: this.now() + tokens.expires_in * 1000,
+    };
+    await this.store.save(next);
+    return next;
+  }
+
+  private verifySessionApp(data: unknown): void {
+    const session = data as {
+      client_app_id?: unknown;
+      client_app_name?: unknown;
+    };
+    const app = this.appIdentity();
+    if (
+      session.client_app_id !== app.id ||
+      session.client_app_name !== app.name
+    ) {
+      throw new ConnectorError(
+        "This stored WeBank identity belongs to another or legacy app. Pair this app with owner approval.",
+        "client_app_mismatch",
+      );
+    }
+  }
+
+  private async restoreIdleSession(current: Credentials) {
+    let renewed: Credentials;
+    try {
+      renewed = await this.renew(current);
+    } catch (error) {
+      if (
+        !(error instanceof ConnectorError) ||
+        !["reauthorization_required", "action_changed"].includes(
+          error.code ?? "",
+        )
+      ) {
+        throw error;
+      }
+      return null;
+    }
+    const result = await this.json(
+      "/v1/agent/session",
+      "GET",
+      undefined,
+      renewed,
+      true,
+    );
+    if (result.status !== 200) this.gatewayError(result);
+    this.verifySessionApp(result.data);
+    return result.data;
+  }
+
   private async agentRequest(
     path: string,
     method: "GET" | "POST",
@@ -201,7 +322,8 @@ export class WeBankConnector {
       re_pair?: boolean;
     } = {},
   ) {
-    const clientName = input.client_name || "Claude";
+    const app = this.appIdentity();
+    const clientName = app.name;
     const provider = input.provider || "Anthropic";
     const waitSeconds = Math.min(Math.max(input.wait_seconds ?? 0, 0), 20);
     let current = await this.store.load();
@@ -213,6 +335,10 @@ export class WeBankConnector {
           agent_id?: string;
           licence?: unknown;
           active_mandates?: string[];
+          client_app_id?: string;
+          client_app_name?: string;
+          last_used_at?: string | null;
+          idle_expires_at?: string | null;
         }
       | undefined;
     if (current?.agentId) {
@@ -237,16 +363,38 @@ export class WeBankConnector {
         const { pending: _pending, quarantined: _older, ...oldKey } = current;
         quarantined = oldKey;
         current = null;
-      } else verifiedSession = status.data as typeof verifiedSession;
+      } else {
+        this.verifySessionApp(status.data);
+        verifiedSession = status.data as typeof verifiedSession;
+      }
     }
     if (current?.agentId) {
       const session = verifiedSession;
       if (!session)
         throw new ConnectorError("Gateway session was not verified");
+      if (!input.re_pair && session.state === "reauthorization_required") {
+        const restored = await this.restoreIdleSession(current);
+        if (!restored)
+          return {
+            status: "reauthorization_required",
+            agent_id: session.agent_id,
+            client_app_id: session.client_app_id,
+            client_app_name: session.client_app_name,
+            last_used_at: session.last_used_at,
+            idle_expires_at: session.idle_expires_at,
+            message:
+              "Ask the owner to use Re-approve connection in the WeBank app, then check wallet status again.",
+          };
+        verifiedSession = restored as typeof verifiedSession;
+        current = (await this.store.load()) ?? current;
+      }
+      const currentSession = verifiedSession;
+      if (!currentSession)
+        throw new ConnectorError("Gateway session was not verified");
       if (
         !input.re_pair &&
-        session.state === "connected" &&
-        (session.access_token_valid === false ||
+        currentSession.state === "connected" &&
+        (currentSession.access_token_valid === false ||
           (current.tokenExpiresAt &&
             current.tokenExpiresAt <= this.now() + 30_000))
       ) {
@@ -261,12 +409,26 @@ export class WeBankConnector {
       }
       if (!input.re_pair)
         return {
-          status: session.state,
-          agent_id: session.agent_id,
-          licence: session.licence,
-          active_mandates: session.active_mandates,
+          status: currentSession.state,
+          agent_id: currentSession.agent_id,
+          licence: currentSession.licence,
+          active_mandates: currentSession.active_mandates,
+          ...(currentSession.state === "red"
+            ? {
+                message:
+                  "RED cannot spend. The owner must review this agent's history and use Return to Amber in WeBank.",
+              }
+            : currentSession.state === "frozen"
+              ? {
+                  message:
+                    (currentSession.licence as { level?: string } | undefined)
+                      ?.level === "RED"
+                      ? "This agent is frozen and RED. The owner must separately Unfreeze it and review its history before Return to Amber in WeBank."
+                      : "This agent is frozen. Only the owner can Unfreeze it in WeBank.",
+                }
+              : {}),
         };
-      if (session.state !== "revoked") {
+      if (currentSession.state !== "revoked") {
         const revoked = await this.json(
           "/v1/agent/session/revoke",
           "POST",
@@ -299,6 +461,8 @@ export class WeBankConnector {
       const result = await this.json("/v1/oauth/device_authorization", "POST", {
         client_name: clientName,
         provider,
+        client_app_id: app.id,
+        client_app_name: app.name,
         agent_public_key: current.publicKey,
         requested_scopes: [...scopes],
       });
@@ -317,6 +481,23 @@ export class WeBankConnector {
       await this.store.save(current);
     }
     const pending = current.pending;
+    const ended = async (status: string) => {
+      await this.store.save({ ...current, pending: undefined });
+      return status === "expired"
+        ? {
+            status: "pairing_expired",
+            message:
+              "The pairing code expired. Call connect_webank again for a fresh code.",
+          }
+        : {
+            status: "not_paired",
+            message:
+              "The user rejected this pairing. Start a new pairing only if requested.",
+          };
+    };
+    const refreshed = await this.pairingWait(current, 0, false);
+    if (refreshed.status === "expired" || refreshed.status === "rejected")
+      return ended(refreshed.status);
     let notificationDelivered = true;
     try {
       await this.notify(
@@ -366,6 +547,21 @@ export class WeBankConnector {
         setTimeout(resolve, pending.interval * 1000),
       );
     } while (this.now() < until);
+    const announced = pending.requestNumber;
+    const latest = await this.pairingWait(current, 0, false);
+    if (latest.status === "expired" || latest.status === "rejected")
+      return ended(latest.status);
+    if (pending.requestNumber !== announced) {
+      try {
+        await this.notify(
+          "WeBank agent pairing",
+          `Request number ${pending.requestNumber}`,
+        );
+        notificationDelivered = true;
+      } catch {
+        notificationDelivered = false;
+      }
+    }
     return {
       status: "awaiting_user",
       user_code: pending.userCode,
@@ -403,6 +599,18 @@ export class WeBankConnector {
           };
         this.gatewayError(result);
       }
+      this.verifySessionApp(result.data);
+      if (
+        (result.data as { state?: string }).state === "reauthorization_required"
+      ) {
+        const restored = await this.restoreIdleSession(current);
+        if (restored) return restored;
+        return {
+          ...(result.data as Record<string, unknown>),
+          message:
+            "Ask the owner to use Re-approve connection in the WeBank app, then check wallet status again.",
+        };
+      }
       if (
         (result.data as { state?: string }).state === "connected" &&
         ((result.data as { access_token_valid?: boolean })
@@ -419,7 +627,22 @@ export class WeBankConnector {
           };
         }
       }
-      return result.data;
+      const session = result.data as Record<string, unknown>;
+      if (session.state === "red")
+        return {
+          ...session,
+          message:
+            "RED cannot spend. The owner must review this agent's history and use Return to Amber in WeBank.",
+        };
+      if (session.state === "frozen")
+        return {
+          ...session,
+          message:
+            (session.licence as { level?: string } | undefined)?.level === "RED"
+              ? "This agent is frozen and RED. The owner must separately Unfreeze it and review its history before Return to Amber in WeBank."
+              : "This agent is frozen. Only the owner can Unfreeze it in WeBank.",
+        };
+      return session;
     }
     if (!current.pending)
       return {
@@ -467,6 +690,7 @@ export class WeBankConnector {
   private async pairingWait(
     current: Credentials,
     waitSeconds: number,
+    notifyOnChange = true,
   ): Promise<{
     status: string;
     expires_at: string;
@@ -496,10 +720,11 @@ export class WeBankConnector {
     if (data.request_number && data.request_number !== pending.requestNumber) {
       pending.requestNumber = data.request_number;
       await this.store.save(current);
-      await this.notify(
-        "WeBank agent pairing",
-        `Request number ${data.request_number}`,
-      ).catch(() => undefined);
+      if (notifyOnChange)
+        await this.notify(
+          "WeBank agent pairing",
+          `Request number ${data.request_number}`,
+        ).catch(() => undefined);
     }
     return data;
   }
@@ -599,6 +824,7 @@ export class WeBankConnector {
     return {
       status: response.mandate.status,
       mandate_id: response.mandate.mandate_id,
+      approval_timing: response.mandate.approval_timing ?? "upfront",
       ...(response.approval_id ? { approval_id: response.approval_id } : {}),
       ...(response.level ? { level: response.level } : {}),
       ...(response.expires_at ? { expires_at: response.expires_at } : {}),
@@ -611,7 +837,9 @@ export class WeBankConnector {
       message:
         response.mandate.status === "pending_user"
           ? "Awaiting approval in the WeBank app. Confirm the mandate is active before shopping."
-          : "Mandate active. Shopping may begin within this scope.",
+          : response.mandate.status === "pending_checkout"
+            ? "Attended purchase intent recorded. No approval or payment exists yet. Shop within this scope, then call request_payment with this mandate ID and the signed checkout URI. The user must approve that payment before funds move."
+            : "Mandate active. Shopping may begin within this scope.",
     };
   }
 
@@ -627,12 +855,15 @@ export class WeBankConnector {
     return {
       mandate_id: mandate.mandate_id,
       status: mandate.status,
+      approval_timing: mandate.approval_timing ?? "upfront",
       message:
         mandate.status === "active"
           ? "Mandate active. Continue with request_payment using the original checkout URI."
-          : mandate.status === "pending_user"
-            ? "Awaiting approval in the WeBank app. Do not request payment yet."
-            : `Mandate ${mandate.status}; do not request payment.`,
+          : mandate.status === "pending_checkout"
+            ? "Attended purchase intent recorded with no spending authority. Shop within this scope, then call request_payment with this mandate ID and the signed checkout URI."
+            : mandate.status === "pending_user"
+              ? "Awaiting approval in the WeBank app. Do not request payment yet."
+              : `Mandate ${mandate.status}; do not request payment.`,
     };
   }
 
@@ -659,6 +890,8 @@ export class WeBankConnector {
       return {
         payment_id: payment.payment_id,
         status: payment.status,
+        message:
+          "WeBank settled this payment. No owner approval is pending for this payment; use the verified receipt below.",
         explanation: payment.decision.user_explanation,
         receipt: payment.receipt,
       };
@@ -679,6 +912,8 @@ export class WeBankConnector {
       return {
         payment_id: payment.payment_id,
         status: payment.status,
+        message:
+          "WeBank created a payment approval for the user. The payment has not been settled.",
         explanation: payment.decision.user_explanation,
         approval_id: payment.approval_id,
         level: payment.level,

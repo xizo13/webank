@@ -15,7 +15,9 @@ import { createGateway } from "./app.js";
 import { createLocalBankExecutor } from "./bank-executor.js";
 import { DurableState } from "./durable-state.js";
 import { createFiscoFundingRail, createFiscoGatewayAdapters } from "./fisco.js";
+import { assessLocalDemoRisk } from "./local-demo-risk.js";
 import { createShopPaymentNotifier } from "./shop-notifier.js";
+import { trustOrdinal } from "./trust-light.js";
 import type { GatewayDependencies } from "./types.js";
 
 type ManifestMerchant = {
@@ -46,6 +48,8 @@ export type LocalDemoOptions = {
     fund(fundingId: string, amount: bigint): Promise<Hex>;
     sweep(sweepId: string, amount: bigint): Promise<Hex>;
     payFromMain(confirmationId: string, amount: bigint): Promise<Hex>;
+    setTrustLight?(intentId: string, level: 1 | 2 | 4): Promise<Hex>;
+    setCaps?(changeId: string): Promise<Hex>;
   };
 };
 
@@ -217,10 +221,11 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
     throw new Error(
       "Active funding deployment needs the bank address and durable Gateway state",
     );
-  const bankExecutor = fundingEnabled
-    ? (options.bankExecutor ??
-      createLocalBankExecutor(options.statePath ?? "", options.addresses))
-    : undefined;
+  const bankExecutor =
+    options.bankExecutor ??
+    (fundingEnabled
+      ? createLocalBankExecutor(options.statePath ?? "", options.addresses)
+      : undefined);
   const walletFunding =
     fundingEnabled && options.addresses.bank && bankExecutor
       ? createFiscoFundingRail({
@@ -252,8 +257,44 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
       protected_main_balance: { amount: 30_000, currency: "CNY" },
     },
   };
+  const bankTrustWriter = bankExecutor?.setTrustLight;
+  const bankPolicyWriter = bankExecutor?.setCaps;
   const deps: GatewayDependencies = {
     ...chainAdapter,
+    policyCaps:
+      fundingEnabled && bankPolicyWriter
+        ? {
+            read: () =>
+              options.chain.getPolicyCapsSnapshot(
+                options.addresses.agentWallet,
+              ),
+            write: bankPolicyWriter,
+          }
+        : undefined,
+    demoTrustControlsEnabled: true,
+    setTrustLight: bankTrustWriter
+      ? async (_agent, level, intentId) =>
+          bankTrustWriter(intentId, trustOrdinal(level))
+      : undefined,
+    setDrillVisibility: async (enabled) => {
+      const response = await fetcher(
+        `${shopOrigin}/internal/drill-visibility`,
+        {
+          method: "POST",
+          redirect: "error",
+          signal: AbortSignal.timeout(5000),
+          headers: {
+            authorization: `Bearer ${options.shopToken}`,
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({ enabled }),
+        },
+      );
+      if (!response.ok) throw new Error("Shop drill visibility sync failed");
+      const result = (await response.json()) as { drill_visible?: unknown };
+      if (result.drill_visible !== enabled)
+        throw new Error("Shop drill visibility mismatch");
+    },
     walletFunding,
     verifyFundingProof: fundingEnabled
       ? async (actionHash, verification) => {
@@ -322,12 +363,14 @@ export async function createLocalDemoGateway(options: LocalDemoOptions) {
           reservations.set(mandate.mandate_id, mandate);
       }
     },
-    assessRisk: async () => ({
-      result: "step_up",
-      signals: [{ type: "local_demo", score: 1, action: "step_up" }],
-      explanation: "Local demo risk fixture requires user review.",
+    assessRisk: async (input) => assessLocalDemoRisk(input),
+    evaluateGuardian: createGuardianEvaluator({
+      baseUrl: env.WEBANK_GUARDIAN_HERMES_URL ?? "",
+      apiKey: env.WEBANK_GUARDIAN_HERMES_KEY ?? "",
+      model: env.WEBANK_GUARDIAN_HERMES_MODEL,
+      operatorVerified: env.WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED === "1",
+      fetcher,
     }),
-    evaluateGuardian: createGuardianEvaluator({ apiKey: "" }),
     notifyMerchantPayment: createShopPaymentNotifier({
       shopOrigin,
       internalToken: options.shopToken,

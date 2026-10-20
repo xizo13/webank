@@ -26,6 +26,163 @@ describe("Gateway app client", () => {
     status: "pending",
   });
 
+  it("uses the separate owner idle reauthorization challenge and exact hash", async () => {
+    const challenge = {
+      action: "idle_reauthorize",
+      agent_id: "agt_one",
+      action_hash: `sha256:${"b".repeat(64)}`,
+      challenge_id: "chl_one",
+      challenge: "opaque",
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      agent_summary: {
+        agent_id: "agt_one",
+        display_name: "Claude shopper",
+        client_app_id: "app_one",
+        client_app_name: "Claude Code",
+        public_key_preview: "p256:preview",
+        scopes: ["wallet:pay"],
+        last_used_at: "2026-10-01T00:00:00Z",
+        idle_expires_at: "2026-10-08T00:00:00Z",
+      },
+    };
+    const mockFetcher = vi.fn(
+      async (input: string | URL | Request, _init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/prepare-idle-reauthorization"))
+          return json(challenge);
+        if (path.endsWith("/idle-reauthorize"))
+          return json({
+            agent: { agent_id: "agt_one" },
+            renewal_expires_at: "2099-01-01T00:00:00Z",
+          });
+        throw new Error(`Unexpected path ${path}`);
+      },
+    );
+    const fetcher = mockFetcher as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:3002", fetcher, true);
+    const prepared = await client.prepareIdleReauthorization("agt_one");
+    await client.completeSimulatedIdleReauthorization("agt_one", prepared);
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://127.0.0.1:3002/v1/app/agents/agt_one/prepare-idle-reauthorization",
+      expect.objectContaining({ credentials: "include", method: "POST" }),
+    );
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://127.0.0.1:3002/v1/app/agents/agt_one/idle-reauthorize",
+      expect.objectContaining({
+        method: "POST",
+        body: JSON.stringify({
+          challenge_id: "chl_one",
+          verification: {
+            action_hash: challenge.action_hash,
+            device_signature: "simulated-local-approval",
+          },
+        }),
+      }),
+    );
+  });
+
+  it("uses owner-only trust review and separate Return to Amber and demo Green challenges", async () => {
+    const hash = `sha256:${"c".repeat(64)}`;
+    const expires_at = new Date(Date.now() + 60_000).toISOString();
+    const makeChallenge = (action: string) => ({
+      action,
+      agent_id: "agt_one",
+      action_hash: hash,
+      challenge_id: `chl_${action}`,
+      challenge: "opaque",
+      expires_at,
+      agent_summary: { agent_id: "agt_one", level: "RED" },
+    });
+    const mockFetcher = vi.fn(
+      async (input: string | URL | Request, _init?: RequestInit) => {
+        const path = new URL(String(input)).pathname;
+        if (path.endsWith("/trust-events"))
+          return json({ items: [], next_cursor: null });
+        if (path.endsWith("/prepare-return-to-amber"))
+          return json(makeChallenge("return_to_amber"));
+        if (path.endsWith("/prepare-fast-forward-green"))
+          return json(makeChallenge("demo_fast_forward_green"));
+        if (
+          path.endsWith("/return-to-amber") ||
+          path.endsWith("/fast-forward-green")
+        )
+          return json({ agent: { agent_id: "agt_one" } });
+        throw new Error(`Unexpected path ${path}`);
+      },
+    );
+    const fetcher = mockFetcher as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:3002", fetcher, true);
+    await client.trustEvents("agt_one");
+    const red = await client.prepareReturnToAmber("agt_one");
+    await client.completeSimulatedReturnToAmber("agt_one", red);
+    const green = await client.prepareDemoFastForwardGreen("agt_one");
+    await client.completeSimulatedDemoFastForwardGreen("agt_one", green);
+    const paths = mockFetcher.mock.calls.map(
+      ([input]) => new URL(String(input)).pathname,
+    );
+    expect(paths).toContain("/v1/app/agents/agt_one/trust-events");
+    expect(paths).toContain("/v1/app/agents/agt_one/prepare-return-to-amber");
+    expect(paths).toContain("/v1/app/agents/agt_one/return-to-amber");
+    expect(paths).toContain(
+      "/v1/app/demo/agents/agt_one/prepare-fast-forward-green",
+    );
+    expect(paths).toContain("/v1/app/demo/agents/agt_one/fast-forward-green");
+    expect(JSON.stringify(mockFetcher.mock.calls)).not.toContain("/relicense");
+    const submitGreen = mockFetcher.mock.calls.find(([input]) =>
+      new URL(String(input)).pathname.endsWith("/fast-forward-green"),
+    );
+    expect(JSON.parse(String(submitGreen?.[1]?.body))).toEqual({
+      simulated: true,
+      challenge_id: "chl_demo_fast_forward_green",
+      verification: {
+        action_hash: hash,
+        device_signature: "simulated-local-approval",
+      },
+    });
+  });
+
+  it("reads and controls the bank-owned local demo drill through owner routes", async () => {
+    const mockFetcher = vi.fn(async (input: string | URL | Request) => {
+      const path = new URL(String(input)).pathname;
+      if (path === "/v1/app/demo/drills")
+        return json({ drill_id: null, active: false });
+      if (path.endsWith("/start"))
+        return json({ drill_id: "drill_one", active: true });
+      if (path.endsWith("/stop"))
+        return json({ drill_id: "drill_one", active: false });
+      throw new Error(`Unexpected path ${path}`);
+    });
+    const client = createGatewayClient(
+      "http://127.0.0.1:3002",
+      mockFetcher as unknown as typeof fetch,
+      true,
+    );
+    expect((await client.demoDrillStatus()).active).toBe(false);
+    expect((await client.startDemoDrill()).active).toBe(true);
+    expect((await client.stopDemoDrill()).active).toBe(false);
+    expect(
+      mockFetcher.mock.calls.map(([input]) => new URL(String(input)).pathname),
+    ).toEqual([
+      "/v1/app/demo/drills",
+      "/v1/app/demo/drills/start",
+      "/v1/app/demo/drills/stop",
+    ]);
+  });
+
+  it("loads payment review through the owner-scoped app endpoint and rejects an incomplete review", async () => {
+    const fetcher = vi.fn(async () =>
+      json({ schema: "payment_review.v1" }),
+    ) as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:8787", fetcher, true);
+    await expect(client.paymentReview("apr_review")).rejects.toThrow(
+      "incomplete",
+    );
+    expect(fetcher).toHaveBeenCalledWith(
+      "http://127.0.0.1:8787/v1/app/approvals/apr_review/review",
+      expect.objectContaining({ credentials: "include" }),
+    );
+  });
+
   it("loads live agents, pending approvals, and payment history without exposing connector numbers", async () => {
     const fetcher = vi.fn(async (input: string | URL | Request) => {
       const path = new URL(String(input)).pathname;

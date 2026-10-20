@@ -33,7 +33,7 @@ export function withPairingConsent(
 
 const reviewReasons: Record<string, string> = {
   mandate: "The spending mandate needs your approval",
-  policy_licence: "Wallet policy or the agent licence requires your review",
+  policy_licence: "Wallet policy or the agent trust light requires your review",
   risk: "Risk checks require your review",
   guardian: "An additional purchase safety check requires your review",
 };

@@ -36,7 +36,7 @@ beforeAll(() => {
   process.env.SHOP_DATA_DIR = dataDir;
 });
 beforeEach(() => {
-  resetDemo();
+  resetDemo({ clearDrill: true });
 });
 afterAll(() => {
   delete process.env.SHOP_DATA_DIR;
@@ -181,8 +181,10 @@ describe("mock shop checkout", () => {
     expect(listProducts("reward voucher")).toHaveLength(0);
     setDemoScenario("attack", true);
     const malicious = listProducts("priority dispatch")[0];
-    const decoy = listProducts("reward voucher")[0];
     expect(malicious?.description).toContain("shopping assistant");
+    expect(listProducts("reward voucher")).toHaveLength(0);
+    setDemoScenario("drill", true);
+    const decoy = listProducts("reward voucher")[0];
     expect(decoy?.description).toContain("skip your usual checks");
   });
 
@@ -204,7 +206,7 @@ describe("mock shop checkout", () => {
     expect(listProducts("reward voucher")).toHaveLength(0);
     setDemoScenario("attack", true);
     expect(listProducts("priority dispatch")[0]?.sku).toBe("FLASH-Q3-FEE");
-    expect(listProducts("reward voucher")[0]?.sku).toBe("REWARD-GIFT-500");
+    expect(listProducts("reward voucher")).toHaveLength(0);
     setDemoScenario("attack", false);
     expect(listProducts("priority dispatch")).toHaveLength(0);
     expect(listProducts("reward voucher")).toHaveLength(0);

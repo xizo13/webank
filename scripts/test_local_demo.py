@@ -102,6 +102,167 @@ class LauncherProcessIdentityTests(unittest.TestCase):
             stop_chain.assert_not_called()
 
 
+class GuardianPrivateEnvironmentTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.runtime = Path(self.temp.name)
+        self.path = self.runtime / "guardian-hermes.env"
+        patcher = mock.patch.object(local_demo, "RUNTIME", self.runtime)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def write_config(self, content: str | None = None):
+        self.path.write_text(content or (
+            "WEBANK_GUARDIAN_HERMES_URL=http://127.0.0.1:8643\n"
+            f"WEBANK_GUARDIAN_HERMES_KEY={'a' * 64}\n"
+            "WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED=1\n"
+        ))
+        self.path.chmod(0o600)
+
+    def test_optional_private_config_is_parsed_without_shell_and_ambient_values_are_scrubbed(self):
+        self.assertEqual(local_demo.read_guardian_env(), {})
+        self.write_config()
+        values = local_demo.read_guardian_env()
+        self.assertEqual(values["WEBANK_GUARDIAN_HERMES_URL"], "http://127.0.0.1:8643")
+        self.assertEqual(values["WEBANK_GUARDIAN_HERMES_KEY"], "a" * 64)
+        self.assertEqual(values["WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED"], "1")
+        inherited = local_demo.runtime_env({
+            "PATH": "/usr/bin",
+            "WEBANK_GUARDIAN_HERMES_KEY": "ambient-secret",
+            "WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED": "1",
+            "SHOP_INTERNAL_TOKEN": "shop-only",
+        })
+        self.assertNotIn("WEBANK_GUARDIAN_HERMES_KEY", inherited)
+        self.assertNotIn("WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED", inherited)
+        self.assertEqual(inherited["SHOP_INTERNAL_TOKEN"], "shop-only")
+
+    def test_rejects_unsafe_file_identity_and_permissions(self):
+        self.write_config()
+        self.path.chmod(0o644)
+        with self.assertRaisesRegex(RuntimeError, "unsafe ownership or permissions"):
+            local_demo.read_guardian_env()
+        self.path.chmod(0o600)
+        with mock.patch.object(local_demo.os, "getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "unsafe ownership or permissions"):
+                local_demo.read_guardian_env()
+        self.path.unlink()
+        self.path.symlink_to(self.runtime / "other.env")
+        with self.assertRaisesRegex(RuntimeError, "unsafe or unreadable"):
+            local_demo.read_guardian_env()
+
+    def test_rejects_extra_duplicate_or_malformed_values(self):
+        self.write_config()
+        valid = self.path.read_text()
+        for changed in (
+            valid + "UNRECOGNIZED_KEY=value\n",
+            valid + "WEBANK_GUARDIAN_HERMES_KEY=another\n",
+            valid.replace("http://127.0.0.1:8643", "$(touch /tmp/unsafe)"),
+            valid.replace("PROFILE_VERIFIED=1", "PROFILE_VERIFIED=0"),
+            valid.replace("KEY=" + "a" * 64, "KEY=not-a-key"),
+        ):
+            with self.subTest(changed=changed.splitlines()[-1]):
+                self.write_config(changed)
+                with self.assertRaises(RuntimeError):
+                    local_demo.read_guardian_env()
+
+
+class BuildFreshnessTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.shop = self.root / "apps/shops"
+        self.app = self.root / "apps/webank-app"
+        self.runtime = self.root / "scripts/local-demo-runtime"
+        self.runtime.mkdir(parents=True)
+        self.outputs = {}
+        for name, relative in (
+            ("contracts", "packages/contracts"),
+            ("chain", "packages/chain"),
+            ("guardian", "services/guardian"),
+            ("connector-mcp", "agents/connector-mcp"),
+        ):
+            package = self.root / relative
+            (package / "src").mkdir(parents=True)
+            (package / "src/index.ts").write_text("export const value = 1;\n")
+            (package / "package.json").write_text("{}\n")
+            (package / "tsconfig.json").write_text("{}\n")
+            output = package / "dist/index.js"
+            output.parent.mkdir()
+            output.write_text("compiled\n")
+            self.outputs[name] = output
+        (self.root / "tsconfig.base.json").write_text("{}\n")
+        (self.root / "pnpm-lock.yaml").write_text("lockfileVersion: '9.0'\n")
+        for path in (self.shop / "app", self.shop / "lib", self.app / "src", self.shop / ".next"):
+            path.mkdir(parents=True)
+        for path in (self.shop / "package.json", self.app / "package.json", self.app / "App.tsx", self.app / "app.json", self.app / "index.ts"):
+            path.write_text("fixture\n")
+        (self.shop / ".next/BUILD_ID").write_text("fixture\n")
+        (self.app / "dist").mkdir()
+        (self.app / "dist/index.html").write_text("fixture\n")
+        self.patches = [
+            mock.patch.object(local_demo, "ROOT", self.root),
+            mock.patch.object(local_demo, "SHOP", self.shop),
+            mock.patch.object(local_demo, "APP", self.app),
+            mock.patch.object(local_demo, "RUNTIME", self.runtime),
+            mock.patch.object(local_demo, "NODE", "node22"),
+            mock.patch.object(local_demo, "COREPACK", "corepack"),
+        ]
+        for patcher in self.patches:
+            patcher.start()
+        self.addCleanup(lambda: [patcher.stop() for patcher in reversed(self.patches)])
+        (self.runtime / "shop-build.sha256").write_text(local_demo.fingerprint([self.shop / "app", self.shop / "lib", self.shop / "package.json"]) + "\n")
+        (self.runtime / "app-export.sha256").write_text(local_demo.fingerprint(
+            [self.app / "App.tsx", self.app / "src", self.app / "app.json", self.app / "index.ts", self.app / "package.json"],
+            ["http://127.0.0.1:3002", "1"],
+        ) + "\n")
+        self.built = []
+
+        def fake_build(name, *_args):
+            self.built.append(name)
+            if name == "app":
+                (self.app / "dist").mkdir(exist_ok=True)
+                (self.app / "dist/index.html").write_text("built\n")
+            elif name == "shop":
+                (self.shop / ".next/BUILD_ID").write_text("built\n")
+            else:
+                self.outputs[name].write_text("built\n")
+
+        self.build_patch = mock.patch.object(local_demo, "run_build", side_effect=fake_build)
+        self.build_patch.start()
+        self.addCleanup(self.build_patch.stop)
+
+    def test_source_edits_rebuild_shared_packages_and_connector(self):
+        local_demo.prepare_builds()
+        self.assertIn("contracts", self.built)
+        self.assertIn("chain", self.built)
+        self.assertIn("connector-mcp", self.built)
+        self.built.clear()
+        for name, relative in (("contracts", "packages/contracts"), ("chain", "packages/chain"), ("connector-mcp", "agents/connector-mcp")):
+            (self.root / relative / "src/index.ts").write_text("export const value = 2;\n")
+        local_demo.prepare_builds()
+        self.assertIn("contracts", self.built)
+        self.assertIn("chain", self.built)
+        self.assertIn("connector-mcp", self.built)
+
+    def test_unchanged_builds_are_skipped_and_missing_connector_output_rebuilds(self):
+        local_demo.prepare_builds()
+        self.built.clear()
+        local_demo.prepare_builds()
+        self.assertEqual(self.built, [])
+        self.outputs["connector-mcp"].unlink()
+        local_demo.prepare_builds()
+        self.assertEqual(self.built, ["connector-mcp"])
+
+    def test_contract_change_refreshes_dependent_builds(self):
+        local_demo.prepare_builds()
+        self.built.clear()
+        (self.root / "packages/contracts/src/index.ts").write_text("export const value = 3;\n")
+        local_demo.prepare_builds()
+        self.assertEqual(self.built, ["contracts", "guardian", "connector-mcp", "shop"])
+
+
 class DeploymentFundingProofTests(unittest.TestCase):
     def setUp(self):
         self.stage = {
@@ -390,9 +551,17 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
             with self.subTest(migrated=migrated):
                 self.populate(migrated)
                 root = Path(self.temp.name)
+                (root / "onchain/node_modules/solc").mkdir(parents=True, exist_ok=True)
                 fixture_state = local_demo.RUNTIME / "state.json"
                 fixture_addresses = local_demo.ADDRESSES
                 fixture_archive_root = local_demo.RUNTIME / "fresh-reset-archives"
+                guardian_config = local_demo.RUNTIME / "guardian-hermes.env"
+                guardian_config.write_text(
+                    "WEBANK_GUARDIAN_HERMES_URL=http://127.0.0.1:8643\n"
+                    f"WEBANK_GUARDIAN_HERMES_KEY={'b' * 64}\n"
+                    "WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED=1\n"
+                )
+                guardian_config.chmod(0o600)
                 chain = root / "chain"
                 shop = root / "shop"
                 app = root / "app"
@@ -414,7 +583,7 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                 proof.receipts[tx("2")]["contractAddress"] = address("7")
                 proof.receipts[tx("4")]["logs"][0]["topics"][1] = "0x" + ("7" * 40).rjust(64, "0")
                 verify_funding = local_demo.verify_deployment_funding
-                started = {"chain": False, "attempt": 0}
+                started = {"chain": False, "attempt": 0, "child_envs": {}}
 
                 def fake_chain_pids():
                     return {f"node{i}": i + 1 for i in range(4)} if started["chain"] else {}
@@ -430,7 +599,8 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                     local_demo.STATE.unlink(missing_ok=True)
                     return True
 
-                def fake_start(name, _command, _cwd, _env, state):
+                def fake_start(name, _command, _cwd, child_env, state):
+                    started["child_envs"][name] = child_env.copy()
                     state["children"][name] = {"pid": 1, "started": "fixture"}
                     local_demo.write_state(state)
                     return object()
@@ -440,6 +610,7 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                         raise RuntimeError("simulated Gateway startup failure")
 
                 patches = [
+                    mock.patch.object(local_demo, "ROOT", root),
                     mock.patch.object(local_demo, "CHAIN", chain),
                     mock.patch.object(local_demo, "SHOP", shop),
                     mock.patch.object(local_demo, "APP", app),
@@ -449,6 +620,7 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                     mock.patch.object(local_demo, "FUNDING_STAGE", chain / "funding-stage.json"),
                     mock.patch.object(local_demo, "SHOP_KEYS", shop / "merchant-keys.json"),
                     mock.patch.object(local_demo, "prepare_builds", lambda: None),
+                    mock.patch.object(local_demo, "deployment_source_fingerprint", lambda: "a" * 64),
                     mock.patch.object(local_demo, "port_busy", lambda _port: False),
                     mock.patch.object(local_demo, "chain_pids", fake_chain_pids),
                     mock.patch.object(local_demo.subprocess, "run", fake_run),
@@ -456,6 +628,10 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                     mock.patch.object(local_demo, "start", fake_start),
                     mock.patch.object(local_demo, "wait_ready", fake_ready),
                     mock.patch.object(local_demo, "read_gateway_env", lambda: {}),
+                    mock.patch.dict(os.environ, {
+                        "WEBANK_GUARDIAN_HERMES_KEY": "ambient-should-not-leak",
+                        "WEBANK_GUARDIAN_HERMES_URL": "http://127.0.0.1:9999",
+                    }),
                     mock.patch.object(local_demo, "request", lambda *_args, **_kwargs: (200, b'{"result":"0x4ee8"}')),
                     mock.patch.object(local_demo, "verify_deployment_funding", lambda addresses, staged=None: verify_funding(addresses, staged, proof.receipts.get)),
                 ]
@@ -472,6 +648,18 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                         local_demo.up(False)
                     started["attempt"] = 1
                     local_demo.up(True)
+                    self.assertEqual(
+                        started["child_envs"]["gateway"]["WEBANK_GUARDIAN_HERMES_KEY"],
+                        "b" * 64,
+                    )
+                    self.assertEqual(
+                        started["child_envs"]["gateway"]["WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED"],
+                        "1",
+                    )
+                    for role in ("shop", "app"):
+                        self.assertFalse(
+                            any(name.startswith("WEBANK_GUARDIAN_HERMES_") for name in started["child_envs"][role])
+                        )
                     self.assertFalse(local_demo.FRESH_RESET.exists())
                     self.assertTrue(local_demo.STATE.exists())
                     archives = list((local_demo.RUNTIME / "fresh-reset-archives").iterdir())
@@ -483,6 +671,7 @@ class FreshLauncherFlowTests(FreshResetJournalTests):
                     fixture_state.unlink(missing_ok=True)
                     fixture_addresses.unlink(missing_ok=True)
                     local_demo.FRESH_RESET.unlink(missing_ok=True)
+                    guardian_config.unlink(missing_ok=True)
                     for archive in fixture_archive_root.glob("*"):
                         import shutil
                         shutil.rmtree(archive)

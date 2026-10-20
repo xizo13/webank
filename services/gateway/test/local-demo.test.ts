@@ -1,4 +1,10 @@
-import { generateKeyPairSync, randomUUID, sign, verify } from "node:crypto";
+import {
+  createHash,
+  generateKeyPairSync,
+  randomUUID,
+  sign,
+  verify,
+} from "node:crypto";
 import { mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -46,10 +52,15 @@ const demoEnv = {
   WEBANK_DEMO_APPROVALS: "1",
 };
 
-function fixture(callbackFails = false, railEvidenceFails = false) {
+function fixture(
+  callbackFails = false,
+  railEvidenceFails = false,
+  withHermes = false,
+) {
   const evidence = new Map<Hex, TransactionEvidence>();
   const callbacks: Array<{ order_id: string; payment_tx: Hex }> = [];
   const pays: Hex[] = [];
+  const hermesRequests: string[] = [];
   let txNumber = 0;
   const transaction = () =>
     `0x${(++txNumber).toString(16).padStart(64, "0")}` as Hex;
@@ -89,6 +100,7 @@ function fixture(callbackFails = false, railEvidenceFails = false) {
       });
       return hash;
     },
+    simulatePay: async () => {},
     anchor: async (
       _address: Hex,
       recordHash: Hex,
@@ -118,8 +130,60 @@ function fixture(callbackFails = false, railEvidenceFails = false) {
   } as unknown as FiscoChain;
   const fetcher = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
+    if (withHermes && url.startsWith("http://127.0.0.1:54321/v1/")) {
+      expect(new Headers(init?.headers).get("authorization")).toBe(
+        "Bearer local-hermes-key",
+      );
+      hermesRequests.push(`${init?.method ?? "GET"} ${new URL(url).pathname}`);
+      if (url === "http://127.0.0.1:54321/v1/toolsets")
+        return Response.json({
+          object: "list",
+          platform: "api_server",
+          data: [
+            "terminal",
+            "file",
+            "browser",
+            "web",
+            "memory",
+            "skills",
+            "code_execution",
+            "delegation",
+          ].map((name) => ({
+            name,
+            enabled: false,
+            configured: false,
+            tools: [name],
+          })),
+        });
+      if (url === "http://127.0.0.1:54321/v1/chat/completions")
+        return Response.json({
+          object: "chat.completion",
+          choices: [
+            {
+              index: 0,
+              finish_reason: "stop",
+              message: {
+                role: "assistant",
+                content: JSON.stringify({
+                  verdict: "pass",
+                  reason_code: "none",
+                  reasons: ["The signed item matches the locked intent"],
+                  user_explanation: "The signed item matches your request.",
+                }),
+              },
+            },
+          ],
+        });
+    }
     if (url === "http://127.0.0.1:3001/api/merchants")
       return Response.json({ simulated: true, merchants: [merchant] });
+    if (url === "http://127.0.0.1:3001/internal/drill-visibility") {
+      const body = JSON.parse(String(init?.body)) as { enabled: boolean };
+      expect(init?.headers).toMatchObject({
+        authorization: "Bearer local-token",
+      });
+      return Response.json({ drill_visible: body.enabled });
+    }
     if (url === "http://127.0.0.1:3001/internal/payment-confirmed") {
       expect(init?.headers).toMatchObject({
         authorization: "Bearer local-token",
@@ -136,7 +200,7 @@ function fixture(callbackFails = false, railEvidenceFails = false) {
     }
     throw new Error(`Unexpected shop request: ${url}`);
   }) as typeof fetch;
-  return { chain, fetcher, callbacks, pays };
+  return { chain, fetcher, callbacks, pays, hermesRequests };
 }
 
 function signedPayreq() {
@@ -191,8 +255,22 @@ describe("loopback FISCO demo composition", () => {
     callbackFails = false,
     statePath?: string,
     railEvidenceFails = false,
+    withHermes = false,
+    hermesVerified = false,
   ) {
-    const fixtureData = fixture(callbackFails, railEvidenceFails);
+    const fixtureData = fixture(callbackFails, railEvidenceFails, withHermes);
+    const trustBank = {
+      fund: async () => {
+        throw new Error("unused funding");
+      },
+      sweep: async () => {
+        throw new Error("unused sweep");
+      },
+      payFromMain: async () => {
+        throw new Error("unused main payment");
+      },
+      setTrustLight: async () => `0x${"a".repeat(64)}` as Hex,
+    };
     const result = await createLocalDemoGateway({
       chain: fixtureData.chain,
       addresses,
@@ -202,11 +280,19 @@ describe("loopback FISCO demo composition", () => {
       gatewayOrigin: "http://127.0.0.1:3002",
       shopToken: "local-token",
       fetcher: fixtureData.fetcher,
-      env: demoEnv,
+      env: withHermes
+        ? {
+            ...demoEnv,
+            WEBANK_GUARDIAN_HERMES_URL: "http://127.0.0.1:54321",
+            WEBANK_GUARDIAN_HERMES_KEY: "local-hermes-key",
+            WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED: hermesVerified ? "1" : "0",
+          }
+        : demoEnv,
       statePath,
+      bankExecutor: trustBank,
     });
     apps.push(result.app);
-    return { ...result, ...fixtureData };
+    return { ...result, ...fixtureData, trustBank };
   }
 
   it("requires both opt-ins, loopback origins, and matching shop identity", async () => {
@@ -267,7 +353,15 @@ describe("loopback FISCO demo composition", () => {
         fetcher,
         callbacks,
         pays,
-      } = await makeApp(callbackFails, statePath, railEvidenceFails);
+        hermesRequests,
+        trustBank,
+      } = await makeApp(
+        callbackFails,
+        statePath,
+        railEvidenceFails,
+        _case !== "rail evidence unavailable",
+        _case === "paid",
+      );
       const login = await app.inject({
         method: "POST",
         url: "/demo/login",
@@ -284,6 +378,8 @@ describe("loopback FISCO demo composition", () => {
         payload: {
           client_name: "Local Claude",
           provider: "anthropic",
+          client_app_name: "Claude Code",
+          client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
           agent_public_key: key.publicKey,
           requested_scopes: [
             "wallet:pay",
@@ -344,6 +440,7 @@ describe("loopback FISCO demo composition", () => {
       }
       const mandate = await agentPost("/v1/agent/mandates", {
         description: "Buy Nova headphones under 300 CNY",
+        approval_timing: "upfront",
         user_text: "Buy Nova headphones under 300 CNY",
         intent_level: "open",
         constraints: [
@@ -394,6 +491,28 @@ describe("loopback FISCO demo composition", () => {
         rationale: "Untrusted agent claim",
       });
       expect(payment.statusCode).toBe(202);
+      if (_case === "paid") {
+        expect(hermesRequests).toEqual([
+          "GET /v1/toolsets",
+          "POST /v1/chat/completions",
+        ]);
+        expect(
+          payment
+            .json()
+            .decision.checks.find(
+              (check: { name: string }) => check.name === "guardian",
+            ).result,
+        ).toBe("pass");
+      } else if (_case === "callback unavailable") {
+        expect(hermesRequests).toEqual([]);
+        const guardian = payment
+          .json()
+          .decision.checks.find(
+            (check: { name: string }) => check.name === "guardian",
+          );
+        expect(guardian.result).toBe("step_up");
+        expect(guardian.detail.reason).toBe("guardian_unavailable");
+      }
       const pendingPayment = await app.inject({
         method: "GET",
         url: "/v1/app/approvals",
@@ -494,6 +613,7 @@ describe("loopback FISCO demo composition", () => {
         fetcher,
         env: demoEnv,
         statePath,
+        bankExecutor: trustBank,
       });
       apps.push(restarted.app);
       expect(restarted.loginToken).toBe(loginToken);
@@ -584,9 +704,15 @@ describe("loopback FISCO demo composition", () => {
       { hash: Hex; amount: bigint; blockNumber: bigint; main: Hex; wallet: Hex }
     >();
     let fundingCalls = 0;
+    const trustWrites: number[] = [];
     const tx = () =>
       `0x${(++blockNumber).toString(16).padStart(64, "0")}` as Hex;
     const bankExecutor = {
+      setCaps: async () => tx(),
+      setTrustLight: async (_intentId: string, level: number) => {
+        trustWrites.push(level);
+        return tx();
+      },
       fund: async (id: string, amount: bigint) => {
         fundingCalls++;
         if (mainBalance < amount)
@@ -620,6 +746,17 @@ describe("loopback FISCO demo composition", () => {
     };
     const originalPay = data.chain.pay.bind(data.chain);
     Object.assign(data.chain, {
+      getPolicyCapsSnapshot: async () => ({
+        perPaymentCap: 30_000n,
+        dailyCap: 50_000n,
+        monthlyCap: 100_000n,
+        spentToday: 0n,
+        spentMonth: 0n,
+        blockNumber,
+        observedAt: new Date().toISOString(),
+        nextDailyResetAt: new Date(Date.now() + 86_400_000).toISOString(),
+        nextMonthlyResetAt: new Date(Date.now() + 2_592_000_000).toISOString(),
+      }),
       getWalletSnapshot: async () => ({
         mainBalance,
         walletBalance,
@@ -720,6 +857,8 @@ describe("loopback FISCO demo composition", () => {
         payload: {
           client_name: "Local Claude",
           provider: "anthropic",
+          client_app_name: "Claude Code",
+          client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
           agent_public_key: key.publicKey,
           requested_scopes: [
             "wallet:pay",
@@ -752,6 +891,7 @@ describe("loopback FISCO demo composition", () => {
         })
       ).statusCode,
     ).toBe(200);
+    expect(trustWrites).toEqual([1]);
     const auth = (
       await app.inject({
         method: "POST",
@@ -784,6 +924,7 @@ describe("loopback FISCO demo composition", () => {
     };
     const mandateBody = (budget: number) => ({
       description: "Buy Nova headphones",
+      approval_timing: "upfront",
       user_text: "Buy Nova headphones",
       intent_level: "open",
       constraints: [
@@ -798,36 +939,7 @@ describe("loopback FISCO demo composition", () => {
         },
       ],
     });
-    const mandate = await agentPost("/v1/agent/mandates", mandateBody(30_000));
-    expect(mandate.statusCode).toBe(202);
-    const card = (
-      await app.inject({
-        method: "GET",
-        url: "/v1/app/approvals",
-        headers: appHeaders,
-      })
-    )
-      .json()
-      .items.find(
-        (item: { subject_id: string }) =>
-          item.subject_id === mandate.json().mandate.mandate_id,
-      );
-    const approveMandate = (idempotencyKey = randomUUID()) =>
-      app.inject({
-        method: "POST",
-        url: `/v1/app/approvals/${card.approval_id}/decide`,
-        headers: { cookie, "idempotency-key": idempotencyKey },
-        payload: {
-          decision: "approve",
-          verification: {
-            action_hash: card.payload_hash,
-            device_signature: "simulated-local-approval",
-            request_number: mandate.json().request_number,
-          },
-        },
-      });
-    const deniedKey = randomUUID();
-    const unfunded = await approveMandate(deniedKey);
+    const unfunded = await agentPost("/v1/agent/mandates", mandateBody(30_000));
     expect(unfunded.statusCode).toBe(403);
     expect(unfunded.json().error.rule).toBe("insufficient_reserved_funds");
     const deniedMandates = await app.inject({
@@ -835,27 +947,13 @@ describe("loopback FISCO demo composition", () => {
       url: "/v1/app/mandates",
       headers: appHeaders,
     });
-    expect(
-      deniedMandates
-        .json()
-        .items.find(
-          (item: { mandate_id: string }) =>
-            item.mandate_id === mandate.json().mandate.mandate_id,
-        )?.status,
-    ).toBe("cancelled");
+    expect(deniedMandates.json().items).toEqual([]);
     const deniedApprovals = await app.inject({
       method: "GET",
       url: "/v1/app/approvals",
       headers: appHeaders,
     });
-    expect(
-      deniedApprovals
-        .json()
-        .items.find(
-          (item: { subject_id: string }) =>
-            item.subject_id === mandate.json().mandate.mandate_id,
-        )?.status,
-    ).toBe("rejected");
+    expect(deniedApprovals.json().items).toEqual([]);
     const prepared = (
       await app.inject({
         method: "POST",
@@ -880,8 +978,6 @@ describe("loopback FISCO demo composition", () => {
     });
     expect(funded.statusCode).toBe(200);
     expect(fundingCalls).toBe(1);
-    expect((await approveMandate(deniedKey)).json()).toEqual(unfunded.json());
-    expect((await approveMandate()).statusCode).toBe(403);
     const fundedMandate = await agentPost(
       "/v1/agent/mandates",
       mandateBody(30_000),

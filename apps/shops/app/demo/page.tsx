@@ -6,26 +6,31 @@ import { useEffect, useState } from "react";
 export default function DemoPage() {
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
-  const [scenarios, setScenarios] = useState({ attack: false, drill: false });
+  const [scenarios, setScenarios] = useState({ attack: false });
   const [scenariosLoaded, setScenariosLoaded] = useState(false);
   useEffect(() => {
     let active = true;
-    void fetch("/api/shop?operation=scenarios")
-      .then((response) => {
-        if (!response.ok) throw new Error("Scenario status unavailable.");
-        return response.json();
-      })
-      .then((data) => {
-        if (active && data.scenarios) {
-          setScenarios(data.scenarios);
-          setScenariosLoaded(true);
-        }
-      })
-      .catch(() => {
-        if (active) setMessage("Scenario status unavailable.");
-      });
+    const refresh = () => {
+      void fetch("/api/shop?operation=scenarios")
+        .then((response) => {
+          if (!response.ok) throw new Error("Scenario status unavailable.");
+          return response.json();
+        })
+        .then((data) => {
+          if (active && data.scenarios) {
+            setScenarios(data.scenarios);
+            setScenariosLoaded(true);
+          }
+        })
+        .catch(() => {
+          if (active) setMessage("Scenario status unavailable.");
+        });
+    };
+    refresh();
+    const interval = setInterval(refresh, 3000);
     return () => {
       active = false;
+      clearInterval(interval);
     };
   }, []);
   async function action(
@@ -47,7 +52,7 @@ export default function DemoPage() {
         setScenarios(data.scenarios);
         setScenariosLoaded(true);
       }
-      if (operation === "reset") setScenarios({ attack: false, drill: false });
+      if (operation === "reset") setScenarios({ attack: false });
       setMessage(
         operation === "set_price"
           ? `Price changed to ¥${(data.product.price / 100).toFixed(2)}.`
@@ -55,7 +60,7 @@ export default function DemoPage() {
             ? `Demo clock: ${data.now}.`
             : operation === "set_scenario"
               ? `${values.scenario === "attack" ? "Attack" : "Fire drill"} ${values.enabled ? "enabled" : "disabled"}.`
-              : "Shop demo reset. Merchant signing keys were preserved.",
+              : "Shop data reset. Merchant keys and any bank fire drill were preserved.",
       );
     } catch (error) {
       setMessage(error instanceof Error ? error.message : "Demo action failed");
@@ -68,8 +73,9 @@ export default function DemoPage() {
       <div className="eyebrow dark">OPERATOR CONSOLE</div>
       <h1 className="page-title">Make the demo move.</h1>
       <p className="page-intro">
-        These local controls change only the simulated shops. Merchant keys stay
-        stable so the Gateway can keep verifying signatures.
+        These controls change simulated shop data. Start and stop fire drills in
+        the WeBank owner app so the bank and shop stay in sync. Merchant keys
+        stay stable for signature checks.
       </p>
       <div className="demo-grid">
         <section className="demo-card">
@@ -134,35 +140,23 @@ export default function DemoPage() {
         </section>
         <section className="demo-card purple-card">
           <span className="demo-number">04 / DEMO 5 FIRE DRILL</span>
-          <h2>Test the licence.</h2>
+          <h2>Test the trust light.</h2>
           <p>
-            A decoy gift-card merchant is marked as a honeypot in the registry
-            for the fire-drill scenario.
+            Start or stop this drill in the WeBank owner app. The bank activates
+            its drill record and reveals the decoy here together.
           </p>
-          <button
-            type="button"
-            className="button primary"
-            disabled={busy || !scenariosLoaded}
-            onClick={() =>
-              void action("set_scenario", {
-                scenario: "drill",
-                enabled: !scenarios.drill,
-              })
-            }
-          >
-            {scenarios.drill ? "Disable fire drill" : "Enable fire drill"}
-          </button>
-          {scenarios.drill ? (
-            <Link className="button primary" href="/p/REWARD-GIFT-500">
-              View decoy listing ↗
-            </Link>
-          ) : null}
+          <a className="button primary" href="http://127.0.0.1:8081/">
+            Open WeBank owner app ↗
+          </a>
         </section>
       </div>
       <div className="demo-reset">
         <div>
           <strong>Start fresh.</strong>
-          <p>Clear cart, orders, prices and clock offset for another run.</p>
+          <p>
+            Clear cart, orders, prices and clock offset. Bank fire drills stay
+            under WeBank owner control.
+          </p>
         </div>
         <button
           type="button"

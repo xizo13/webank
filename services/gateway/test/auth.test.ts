@@ -9,6 +9,7 @@ import {
   signAgentRequest,
 } from "../../../agents/connector-mcp/src/signing.js";
 import { createGateway } from "../src/app.js";
+import { sha256 } from "../src/crypto.js";
 import type { GatewayDependencies } from "../src/types.js";
 
 const policy: Policy = {
@@ -48,6 +49,7 @@ function fixture(statePath?: string, seedAgents: Agent[] = []) {
         : false;
     },
     recordNumberMatchFailure: async () => {},
+    setTrustLight: async () => `0x${"a".repeat(64)}`,
     lookupMerchant: async () => null,
     reserveMandate: async () => true,
     releaseMandate: async () => {},
@@ -92,6 +94,8 @@ async function startPairing(
     payload: {
       client_name: "Claude Test",
       provider,
+      client_app_name: "Claude Code",
+      client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
       agent_public_key: publicKey,
       requested_scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
     },
@@ -112,6 +116,135 @@ describe("OAuth pairing and connector HTTP signatures", () => {
     for (const directory of temporaryDirs.splice(0))
       rmSync(directory, { recursive: true, force: true });
   });
+
+  it("rejects a pairing whose client app ID does not hash its exact UTF-8 name", async () => {
+    const { app } = fixture();
+    apps.push(app);
+    const response = await app.inject({
+      method: "POST",
+      url: "/v1/oauth/device_authorization",
+      payload: {
+        client_name: "Claude Test",
+        provider: "anthropic",
+        client_app_name: "Claude Code",
+        client_app_id: `app_${createHash("sha256").update("claude code").digest("hex")}`,
+        agent_public_key: newAgentKey().publicKey,
+        requested_scopes: ["wallet:pay"],
+      },
+    });
+    expect(response.statusCode).toBe(400);
+  });
+
+  it.each(["unfreeze"] as const)(
+    "keeps %s blocked when its audit anchor fails, including after restart",
+    async (action) => {
+      const directory = mkdtempSync(join(tmpdir(), "webank-action-audit-"));
+      temporaryDirs.push(directory);
+      const statePath = join(directory, "gateway.json");
+      const target: Agent = {
+        schema: "agent.v1",
+        agent_id: `agt_audit_${action}`,
+        user_id: "usr_test",
+        display_name: "Claude Audit Test",
+        provider: "anthropic",
+        public_key: newAgentKey().publicKey,
+        scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
+        licence: {
+          level: action === "relicense" ? "SUSPENDED" : "L",
+          points: -2,
+          clean_purchases: 0,
+          drills_passed: 0,
+        },
+        status: action === "unfreeze" ? "frozen" : "active",
+        created_at: "2026-10-14T11:00:00Z",
+        last_used_at: null,
+      };
+      const first = fixture(statePath, [target]);
+      apps.push(first.app);
+      const prepared = await first.app.inject({
+        method: "POST",
+        url: `/v1/app/agents/${target.agent_id}/prepare-action`,
+        headers: {
+          authorization: "Bearer app",
+          "idempotency-key": randomUUID(),
+        },
+        payload: { action },
+      });
+      expect(prepared.statusCode).toBe(200);
+      const challenge = prepared.json();
+      first.deps.anchorAudit = async () => {
+        throw new Error("Audit chain unavailable");
+      };
+      const attempt = (app: ReturnType<typeof createGateway>) =>
+        app.inject({
+          method: "POST",
+          url: `/v1/app/agents/${target.agent_id}/${action}`,
+          headers: {
+            authorization: "Bearer app",
+            "idempotency-key": randomUUID(),
+          },
+          payload: {
+            challenge_id: challenge.challenge_id,
+            verification: {
+              action_hash: challenge.action_hash,
+              device_signature: "test-biometric-proof",
+            },
+          },
+        });
+      expect((await attempt(first.app)).statusCode).toBe(503);
+      await first.app.close();
+      const restored = fixture(statePath);
+      apps.push(restored.app);
+      const listed = await restored.app.inject({
+        method: "GET",
+        url: "/v1/app/agents",
+        headers: { authorization: "Bearer app" },
+      });
+      const retained = listed
+        .json()
+        .items.find((item: Agent) => item.agent_id === target.agent_id);
+      expect(retained.status).toBe(target.status);
+      expect(retained.licence.level).toBe("AMBER");
+      const retried = await attempt(restored.app);
+      expect(retried.statusCode).toBe(200);
+      expect(retried.json().agent.status).toBe("active");
+      expect(retried.json().agent.licence.level).toBe("AMBER");
+      const audit = await restored.app.inject({
+        method: "GET",
+        url: "/v1/app/audit",
+        headers: { authorization: "Bearer app" },
+      });
+      const record = audit
+        .json()
+        .items.find(
+          (item: { subject_id: string }) => item.subject_id === target.agent_id,
+        );
+      expect(record.record_hash).toBe(
+        sha256({
+          auditId: record.audit_id,
+          kind: action === "unfreeze" ? "freeze" : "licence_change",
+          actor: "usr_test",
+          subjectId: target.agent_id,
+          summary: `Local demo simulated ${action} approved by user`,
+          data: {
+            action,
+            agent_id: target.agent_id,
+            action_hash: challenge.action_hash,
+            challenge_id: challenge.challenge_id,
+            challenge_expires_at: challenge.expires_at,
+            session_binding: sha256("Bearer app"),
+            public_key: target.public_key,
+            scopes: target.scopes,
+            prior_status: target.status,
+            prior_licence_level: "AMBER",
+            root_agent_id: target.agent_id,
+            demerit_count: 0,
+          },
+          createdAt: record.created_at,
+        }),
+      );
+    },
+  );
 
   it("pairs a fresh identity even when a same-provider revoked record exists", async () => {
     const priorKey = newAgentKey();
@@ -168,7 +301,11 @@ describe("OAuth pairing and connector HTTP signatures", () => {
       replaces_agent_id: null,
       replaced_by_agent_id: null,
     });
-    expect(created.licence).toMatchObject({ level: "L", points: 0 });
+    expect(created.licence).toMatchObject({
+      level: "AMBER",
+      clean_purchases: 0,
+      flags_30d: 0,
+    });
     const history = await app.inject({
       method: "GET",
       url: `/v1/app/agents/${prior.agent_id}/history`,
@@ -222,6 +359,7 @@ describe("OAuth pairing and connector HTTP signatures", () => {
     expect(token.agent_id).toMatch(/^agt_/);
     const pendingBody = JSON.stringify({
       description: "Buy headphones",
+      approval_timing: "upfront",
       user_text: "Buy headphones under ¥10",
       intent_level: "open",
       constraints: [
@@ -531,7 +669,7 @@ describe("OAuth pairing and connector HTTP signatures", () => {
       },
     });
     expect(approval.statusCode).toBe(200);
-    expect(anchored).toHaveLength(1);
+    expect(anchored).toHaveLength(2);
     const token = await app.inject({
       method: "POST",
       url: "/v1/oauth/token",
@@ -590,6 +728,7 @@ describe("OAuth pairing and connector HTTP signatures", () => {
     const path = "/v1/agent/mandates";
     const body = JSON.stringify({
       description: "Buy headphones",
+      approval_timing: "upfront",
       user_text: "Buy headphones",
       intent_level: "open",
       constraints: [
@@ -1195,5 +1334,482 @@ describe("OAuth pairing and connector HTTP signatures", () => {
       headers: { authorization: "Bearer app" },
     });
     expect(expiredList.json().items[0].status).toBe("expired");
+  });
+
+  it("blocks a valid access grant at the exact idle deadline and requires audited same-key renewal after restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-idle-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    const first = fixture(statePath);
+    apps.push(first.app);
+    const key = newAgentKey();
+    const otherKey = newAgentKey();
+    const pair = await startPairing(first.app, key.publicKey);
+    const consent = await first.app.inject({
+      method: "GET",
+      url: `/v1/app/pairing/${pair.user_code}`,
+      headers: { authorization: "Bearer app" },
+    });
+    expect(consent.json().pairing.client_app_name).toBe("Claude Code");
+    expect(consent.json().approval.lines).toContain("Client app: Claude Code");
+    const approved = await first.app.inject({
+      method: "POST",
+      url: `/v1/app/pairing/${pair.user_code}/approve`,
+      headers: { authorization: "Bearer app", "idempotency-key": randomUUID() },
+      payload: {
+        verification: {
+          action_hash: consent.json().approval.payload_hash,
+          device_signature: "test-biometric-proof",
+          request_number: pair.request_number,
+        },
+      },
+    });
+    expect(approved.statusCode).toBe(200);
+    const agent = approved.json().agent as Agent;
+    expect(agent.client_app_id).toBe(
+      `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
+    );
+    expect(agent.last_used_at).toBe(first.clock.value.toISOString());
+    const token = (
+      await first.app.inject({
+        method: "POST",
+        url: "/v1/oauth/token",
+        payload: {
+          grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+          device_code: pair.device_code,
+        },
+      })
+    ).json();
+    const start = first.clock.value.getTime();
+    first.clock.value = new Date(start + 7 * 86_400_000 - 1);
+    const fresh = await first.app.inject({
+      method: "POST",
+      url: "/v1/oauth/token",
+      payload: {
+        grant_type: "refresh_token",
+        refresh_token: token.refresh_token,
+      },
+    });
+    expect(fresh.statusCode).toBe(200);
+    const validGrant = fresh.json();
+    first.clock.value = new Date(start + 7 * 86_400_000);
+    const signFor = (
+      method: string,
+      path: string,
+      body: string,
+      privateKeyPem = key.privateKeyPem,
+    ) =>
+      signAgentRequest({
+        method,
+        path,
+        body,
+        idempotencyKey: randomUUID(),
+        agentId: agent.agent_id,
+        privateKeyPem,
+        now: first.clock.value.getTime(),
+      });
+    const session = await first.app.inject({
+      method: "GET",
+      url: "/v1/agent/session",
+      headers: signFor("GET", "/v1/agent/session", ""),
+    });
+    expect(session.json()).toMatchObject({
+      state: "reauthorization_required",
+      agent_id: agent.agent_id,
+      client_app_name: "Claude Code",
+      idle_expires_at: first.clock.value.toISOString(),
+    });
+    const spendPath = "/v1/agent/payments";
+    const spendBody = JSON.stringify({
+      mandate_id: "mdt_missing",
+      payment_request: "invalid",
+    });
+    const spend = await first.app.inject({
+      method: "POST",
+      url: spendPath,
+      headers: {
+        ...signFor("POST", spendPath, spendBody),
+        authorization: `Bearer ${validGrant.access_token}`,
+        "content-type": "application/json",
+      },
+      payload: spendBody,
+    });
+    expect(spend.statusCode).toBe(401);
+    expect(spend.json().error.code).toBe("reauthorization_required");
+    const blockedRefresh = await first.app.inject({
+      method: "POST",
+      url: "/v1/oauth/token",
+      payload: {
+        grant_type: "refresh_token",
+        refresh_token: validGrant.refresh_token,
+      },
+    });
+    expect(blockedRefresh.statusCode).toBe(401);
+    expect(blockedRefresh.json().error.code).toBe("reauthorization_required");
+    first.clock.value = new Date(start + 31 * 86_400_000);
+    const expiredRefresh = await first.app.inject({
+      method: "POST",
+      url: "/v1/oauth/token",
+      payload: {
+        grant_type: "refresh_token",
+        refresh_token: token.refresh_token,
+      },
+    });
+    expect(expiredRefresh.statusCode).toBe(400);
+    expect(expiredRefresh.json().error).toBe("invalid_grant");
+    const ownerPath = `/v1/app/agents/${agent.agent_id}/prepare-idle-reauthorization`;
+    const selfPrepare = await first.app.inject({
+      method: "POST",
+      url: ownerPath,
+      headers: {
+        ...signFor("POST", ownerPath, "{}"),
+        "content-type": "application/json",
+      },
+      payload: "{}",
+    });
+    expect(selfPrepare.statusCode).toBe(401);
+    const prepared = await first.app.inject({
+      method: "POST",
+      url: ownerPath,
+      headers: { authorization: "Bearer app", "idempotency-key": randomUUID() },
+      payload: {},
+    });
+    expect(prepared.statusCode).toBe(200);
+    expect(prepared.json().agent_summary).toMatchObject({
+      client_app_id: agent.client_app_id,
+      client_app_name: "Claude Code",
+      scopes: agent.scopes,
+    });
+    const decisionPath = `/v1/app/agents/${agent.agent_id}/idle-reauthorize`;
+    const decision = () =>
+      first.app.inject({
+        method: "POST",
+        url: decisionPath,
+        headers: {
+          authorization: "Bearer app",
+          "idempotency-key": randomUUID(),
+        },
+        payload: {
+          challenge_id: prepared.json().challenge_id,
+          verification: {
+            action_hash: prepared.json().action_hash,
+            device_signature: "test-biometric-proof",
+          },
+        },
+      });
+    const anchor = first.deps.anchorAudit;
+    first.deps.anchorAudit = async () => {
+      throw new Error("audit unavailable");
+    };
+    expect((await decision()).statusCode).toBe(503);
+    expect(
+      (
+        await first.app.inject({
+          method: "POST",
+          url: "/v1/agent/session/renew",
+          headers: {
+            ...signFor("POST", "/v1/agent/session/renew", "{}"),
+            "content-type": "application/json",
+          },
+          payload: "{}",
+        })
+      ).statusCode,
+    ).toBe(409);
+    first.deps.anchorAudit = anchor;
+    const ownerApproved = await decision();
+    expect(ownerApproved.statusCode).toBe(200);
+    expect(ownerApproved.json().agent.reauthorization_required).toBe(true);
+    expect(ownerApproved.json().renewal_expires_at).toBeTruthy();
+    const audit = await first.app.inject({
+      method: "GET",
+      url: "/v1/app/audit",
+      headers: { authorization: "Bearer app" },
+    });
+    const record = audit
+      .json()
+      .items.find((item: { summary: string }) =>
+        item.summary.includes("idle re-approval"),
+      );
+    expect(record.record_hash).toBe(
+      sha256({
+        auditId: record.audit_id,
+        kind: "pairing",
+        actor: "usr_test",
+        subjectId: agent.agent_id,
+        summary: "Local demo simulated idle re-approval for Claude Code",
+        data: {
+          action: "idle_reauthorize",
+          agent_id: agent.agent_id,
+          client_app_id: agent.client_app_id,
+          client_app_name: "Claude Code",
+          public_key: agent.public_key,
+          scopes: agent.scopes,
+          last_used_at: agent.last_used_at,
+          action_hash: prepared.json().action_hash,
+          challenge_id: prepared.json().challenge_id,
+          challenge_expires_at: prepared.json().expires_at,
+          session_binding: sha256("Bearer app"),
+        },
+        createdAt: record.created_at,
+      }),
+    );
+    await first.app.close();
+    const second = fixture(statePath);
+    apps.push(second.app);
+    second.clock.value = new Date(first.clock.value);
+    const wrongKey = await second.app.inject({
+      method: "POST",
+      url: "/v1/agent/session/renew",
+      headers: {
+        ...signFor(
+          "POST",
+          "/v1/agent/session/renew",
+          "{}",
+          otherKey.privateKeyPem,
+        ),
+        "content-type": "application/json",
+      },
+      payload: "{}",
+    });
+    expect(wrongKey.statusCode).toBe(401);
+    const oldRefresh = await second.app.inject({
+      method: "POST",
+      url: "/v1/oauth/token",
+      payload: {
+        grant_type: "refresh_token",
+        refresh_token: validGrant.refresh_token,
+      },
+    });
+    expect(oldRefresh.statusCode).toBe(401);
+    const renewed = await second.app.inject({
+      method: "POST",
+      url: "/v1/agent/session/renew",
+      headers: {
+        ...signFor("POST", "/v1/agent/session/renew", "{}"),
+        "content-type": "application/json",
+      },
+      payload: "{}",
+    });
+    expect(renewed.statusCode).toBe(200);
+    expect(renewed.json().agent_id).toBe(agent.agent_id);
+    const reused = await second.app.inject({
+      method: "POST",
+      url: "/v1/agent/session/renew",
+      headers: {
+        ...signFor("POST", "/v1/agent/session/renew", "{}"),
+        "content-type": "application/json",
+      },
+      payload: "{}",
+    });
+    expect(reused.statusCode).toBe(409);
+    expect(
+      (
+        await second.app.inject({
+          method: "POST",
+          url: "/v1/oauth/token",
+          payload: {
+            grant_type: "refresh_token",
+            refresh_token: validGrant.refresh_token,
+          },
+        })
+      ).statusCode,
+    ).toBe(400);
+    const current = await second.app.inject({
+      method: "GET",
+      url: "/v1/agent/session",
+      headers: signFor("GET", "/v1/agent/session", ""),
+    });
+    expect(current.json().state).toBe("connected");
+    expect(current.json().last_used_at).toBe(second.clock.value.toISOString());
+  });
+
+  it("restores historical unlabelled agents read-only and keeps frozen and suspended precedence", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-legacy-idle-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    const keys = [newAgentKey(), newAgentKey(), newAgentKey()];
+    const appId = `app_${createHash("sha256").update("Claude Code").digest("hex")}`;
+    const seeded: Agent[] = keys.map((key, index) => ({
+      schema: "agent.v1",
+      agent_id: `agt_legacy_${index}`,
+      user_id: "usr_test",
+      display_name: `Legacy ${index}`,
+      provider: "anthropic",
+      ...(index === 0
+        ? {}
+        : { client_app_id: appId, client_app_name: "Claude Code" }),
+      public_key: key.publicKey,
+      scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
+      licence: {
+        level: index === 2 ? "SUSPENDED" : "L",
+        points: 0,
+        clean_purchases: 0,
+        drills_passed: 0,
+      },
+      status: index === 1 ? "frozen" : "active",
+      created_at: "2026-10-01T12:00:00Z",
+      last_used_at: null,
+    }));
+    const first = fixture(statePath, seeded);
+    apps.push(first.app);
+    await first.app.close();
+    const restored = fixture(statePath);
+    apps.push(restored.app);
+    const list = await restored.app.inject({
+      method: "GET",
+      url: "/v1/app/agents",
+      headers: { authorization: "Bearer app" },
+    });
+    expect(list.statusCode).toBe(200);
+    expect(list.json().items[0]).toMatchObject({
+      client_app_id: null,
+      client_app_name: null,
+      reauthorization_required: true,
+    });
+    const states = ["reauthorization_required", "frozen", "red"];
+    for (const [index, agent] of seeded.entries()) {
+      const key = keys[index];
+      if (!key) throw new Error("Missing test key");
+      const status = await restored.app.inject({
+        method: "GET",
+        url: "/v1/agent/session",
+        headers: signAgentRequest({
+          method: "GET",
+          path: "/v1/agent/session",
+          body: "",
+          idempotencyKey: randomUUID(),
+          agentId: agent.agent_id,
+          privateKeyPem: key.privateKeyPem,
+          now: restored.clock.value.getTime(),
+        }),
+      });
+      expect(status.statusCode).toBe(200);
+      expect(status.json().state).toBe(states[index]);
+      const prepare = await restored.app.inject({
+        method: "POST",
+        url: `/v1/app/agents/${agent.agent_id}/prepare-idle-reauthorization`,
+        headers: {
+          authorization: "Bearer app",
+          "idempotency-key": randomUUID(),
+        },
+        payload: {},
+      });
+      expect(prepare.statusCode).toBe(index === 0 ? 409 : 401);
+    }
+    const freshKey = newAgentKey();
+    const pair = await startPairing(restored.app, freshKey.publicKey);
+    const consent = await restored.app.inject({
+      method: "GET",
+      url: `/v1/app/pairing/${pair.user_code}`,
+      headers: { authorization: "Bearer app" },
+    });
+    const approved = await restored.app.inject({
+      method: "POST",
+      url: `/v1/app/pairing/${pair.user_code}/approve`,
+      headers: { authorization: "Bearer app", "idempotency-key": randomUUID() },
+      payload: {
+        verification: {
+          action_hash: consent.json().approval.payload_hash,
+          device_signature: "test-biometric-proof",
+          request_number: pair.request_number,
+        },
+      },
+    });
+    expect(approved.statusCode).toBe(200);
+    expect(approved.json().agent.client_app_id).toBe(appId);
+  });
+
+  it("expires the owner challenge and audited renewal window without granting authority", async () => {
+    const key = newAgentKey();
+    const agent: Agent = {
+      schema: "agent.v1",
+      agent_id: "agt_idle_window",
+      user_id: "usr_test",
+      display_name: "Claude idle",
+      provider: "anthropic",
+      client_app_id: `app_${createHash("sha256").update("Claude Code").digest("hex")}`,
+      client_app_name: "Claude Code",
+      public_key: key.publicKey,
+      scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
+      licence: { level: "L", points: 0, clean_purchases: 0, drills_passed: 0 },
+      status: "active",
+      created_at: "2026-10-01T12:00:00Z",
+      last_used_at: "2026-10-01T12:00:00Z",
+    };
+    const { app, clock, anchored } = fixture(undefined, [agent]);
+    apps.push(app);
+    const ownerHeaders = () => ({
+      authorization: "Bearer app",
+      "idempotency-key": randomUUID(),
+    });
+    const preparePath = `/v1/app/agents/${agent.agent_id}/prepare-idle-reauthorization`;
+    const decisionPath = `/v1/app/agents/${agent.agent_id}/idle-reauthorize`;
+    const prepare = () =>
+      app.inject({
+        method: "POST",
+        url: preparePath,
+        headers: ownerHeaders(),
+        payload: {},
+      });
+    const first = (await prepare()).json();
+    clock.value = new Date(Date.parse(first.expires_at));
+    const decide = (
+      challenge: typeof first,
+      actionHash = challenge.action_hash,
+    ) =>
+      app.inject({
+        method: "POST",
+        url: decisionPath,
+        headers: ownerHeaders(),
+        payload: {
+          challenge_id: challenge.challenge_id,
+          verification: {
+            action_hash: actionHash,
+            device_signature: "test-biometric-proof",
+          },
+        },
+      });
+    expect((await decide(first)).statusCode).toBe(409);
+    expect(anchored).toHaveLength(0);
+    const second = (await prepare()).json();
+    expect((await decide(second, "sha256:wrong")).statusCode).toBe(401);
+    expect(anchored).toHaveLength(0);
+    const approved = await decide(second);
+    expect(approved.statusCode).toBe(200);
+    expect(anchored).toHaveLength(1);
+    clock.value = new Date(Date.parse(approved.json().renewal_expires_at));
+    const renew = await app.inject({
+      method: "POST",
+      url: "/v1/agent/session/renew",
+      headers: {
+        ...signAgentRequest({
+          method: "POST",
+          path: "/v1/agent/session/renew",
+          body: "{}",
+          idempotencyKey: randomUUID(),
+          agentId: agent.agent_id,
+          privateKeyPem: key.privateKeyPem,
+          now: clock.value.getTime(),
+        }),
+        "content-type": "application/json",
+      },
+      payload: "{}",
+    });
+    expect(renew.statusCode).toBe(409);
+    const status = await app.inject({
+      method: "GET",
+      url: "/v1/agent/session",
+      headers: signAgentRequest({
+        method: "GET",
+        path: "/v1/agent/session",
+        body: "",
+        idempotencyKey: randomUUID(),
+        agentId: agent.agent_id,
+        privateKeyPem: key.privateKeyPem,
+        now: clock.value.getTime(),
+      }),
+    });
+    expect(status.json().state).toBe("reauthorization_required");
+    expect(status.json().last_used_at).toBe(agent.last_used_at);
   });
 });

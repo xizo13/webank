@@ -20,7 +20,7 @@ export function createLocalBankExecutor(
   if (addresses.migration?.state !== "active" || !addresses.bank)
     throw new Error("Bank executor requires an active funding deployment");
   const submit = (
-    kind: "fund" | "sweep" | "human",
+    kind: "fund" | "sweep" | "human" | "trust" | "policy",
     id: string,
     amount: bigint,
   ) =>
@@ -54,5 +54,8 @@ export function createLocalBankExecutor(
     fund: (id: string, amount: bigint) => submit("fund", id, amount),
     sweep: (id: string, amount: bigint) => submit("sweep", id, amount),
     payFromMain: (id: string, amount: bigint) => submit("human", id, amount),
+    setTrustLight: (id: string, level: 1 | 2 | 4) =>
+      submit("trust", id, BigInt(level)),
+    setCaps: (id: string) => submit("policy", id, 1n),
   };
 }

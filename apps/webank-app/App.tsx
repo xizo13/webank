@@ -25,12 +25,17 @@ import {
   View,
 } from "react-native";
 import {
+  AgentConnectionInfo,
+  canReauthorizeConnection,
+} from "./src/AgentConnectionInfo";
+import {
   pairingCountdown,
   presentApproval,
   secondsRemaining,
   withPairingConsent,
 } from "./src/approvalPresentation";
 import {
+  type Agent,
   type Approval,
   applyDemoBiometricApproval,
   type DemoState,
@@ -51,47 +56,97 @@ import {
 import { parseYuanToFen } from "./src/funding";
 import {
   approveLocalDemo,
+  completeGatewayPolicyChange,
   completeSimulatedGatewayAgentAction,
+  completeSimulatedGatewayDemoFastForwardGreen,
+  completeSimulatedGatewayIdleReauthorization,
+  completeSimulatedGatewayReturnToAmber,
   confirmSimulatedHumanPayment,
   deleteGatewayAgent,
   denyGatewayPairing,
-  type FundingChallenge,
+  type EditablePolicyLimits,
   type FundingRecord,
   freezeGatewayAgent,
   GatewayRequestError,
   gatewaySnapshotErrorMessage,
   gatewayUrl,
+  type IdleReauthorizationChallenge,
   type LiveHome,
   type LivePayment,
   type LivePaymentDetail,
-  loadGatewayAgentHistory,
+  loadGatewayDemoDrillStatus,
   loadGatewayFunding,
   loadGatewayFundingHistory,
   loadGatewayHome,
   loadGatewayPayment,
+  loadGatewayPaymentReview,
+  loadGatewayPolicy,
   loadGatewaySnapshot,
   loadGatewaySweep,
   loadGatewaySweepHistory,
+  loadGatewayTrustEvents,
   loadHumanPayment,
   loadPairingConsent,
   localDemoConfigured,
   loginLocalDemo,
   type PairingConsent,
   type PairingSummary,
+  type PolicySnapshot,
+  type PreparedPolicyChange,
   prepareGatewayAgentAction,
+  prepareGatewayDemoFastForwardGreen,
   prepareGatewayFunding,
+  prepareGatewayIdleReauthorization,
+  prepareGatewayPolicyChange,
+  prepareGatewayReturnToAmber,
   rejectGatewayApproval,
   type ScanResult,
   type SweepRecord,
   scanGatewayQrPayload,
+  startGatewayDemoDrill,
+  stopGatewayDemoDrill,
   submitSimulatedGatewayFunding,
   sweepGatewayWallet,
+  type TrustActionChallenge,
+  type TrustEvidence,
 } from "./src/gateway";
+import { PairingClientScope } from "./src/PairingClientScope";
+import { PaymentReviewCard } from "./src/PaymentReviewCard";
+import { PolicyLimitsPanel } from "./src/PolicyLimitsPanel";
+import { type PaymentReview, reviewMatchesApproval } from "./src/paymentReview";
+import {
+  policyChangeIsLoosening,
+  policyReviewStillCurrent,
+  validatePolicySnapshot,
+  validatePreparedPolicyChange,
+} from "./src/policyLimits";
 import { decodeQrImageBlob, decodeQrImageUri } from "./src/qr";
+import { TransferControl } from "./src/TransferControl";
+import { TrustEventReview } from "./src/TrustEventReview";
+import { TrustLight } from "./src/TrustLight";
+import {
+  editTransferAmount,
+  fundingPreparationIsCurrent,
+  initialTransferState,
+  reverseTransfer,
+  reviewReturnAmount,
+  transferActionsBlocked,
+} from "./src/transferFlow";
+import {
+  reviewableTrustEvidence,
+  trustEvidenceUnchanged,
+} from "./src/trustEvidence";
 
 type Tab = "home" | "wallet" | "approvals" | "agents" | "history";
 type Detail = "pair" | "demo" | "scan" | null;
-type PendingSimulation = { label: string; run: () => void } | null;
+type PendingSimulation = {
+  label: string;
+  run: () => void;
+  expiresAt?: string;
+  fundingId?: string;
+  policySnapshotHash?: string;
+  policySnapshotBlock?: string;
+} | null;
 
 const colors = {
   ink: "#16131C",
@@ -229,6 +284,18 @@ function wrapHash(hash: string): string {
   return hash.match(/.{1,16}/g)?.join("\n") ?? hash;
 }
 
+function policyChangeError(error: unknown): string {
+  if (error instanceof GatewayRequestError) {
+    if (error.code === "action_changed")
+      return "Policy, contract caps, or challenge changed. Refresh limits and review again.";
+    if (error.code === "reconciliation_required")
+      return "The limit change is being reconciled. Spending remains blocked until confirmed.";
+    if (error.code === "chain_unavailable")
+      return "Contract caps are unavailable. Refresh after the local chain recovers.";
+  }
+  return error instanceof Error ? error.message : "Limit change unavailable.";
+}
+
 function wrapApprovalLine(line: string): string {
   return line.replace(
     /\S{24,}/g,
@@ -236,16 +303,27 @@ function wrapApprovalLine(line: string): string {
   );
 }
 
-function licenceExplanation(
-  level: DemoState["agents"][number]["licence"]["level"],
-): string {
-  if (level === "L")
-    return "L plate: zero autonomous spend. Every payment needs your approval; the first also needs the connector's six-digit number.";
-  if (level === "P")
-    return "P plate: limited autonomous payments within your mandate and policy. Larger payments still need your approval.";
-  if (level === "FULL")
-    return "Full licence: autonomous payments remain bound by your mandate and policy. Some payments still need your approval.";
-  return "Suspended licence: this agent cannot spend until you re-license it.";
+function approvalTrustInfo(approval: Approval) {
+  if (approval.kind === "pairing")
+    return {
+      light: "AMBER" as const,
+      reason:
+        approval.trust_reason ||
+        "New connection starts Amber: every purchase needs approval.",
+    };
+  if (approval.kind === "payment" || approval.kind === "mandate")
+    return approval.trust_light
+      ? {
+          light: approval.trust_light,
+          reason: approval.trust_reason || "Trust reason unavailable.",
+        }
+      : null;
+  return null;
+}
+
+function ApprovalTrustDisplay({ approval }: { approval: Approval }) {
+  const trust = approvalTrustInfo(approval);
+  return trust ? <TrustLight {...trust} /> : null;
 }
 
 export default function App() {
@@ -260,26 +338,31 @@ export default function App() {
   const [homeError, setHomeError] = useState("");
   const [homeSyncedAt, setHomeSyncedAt] = useState<number | null>(null);
   const [homeLoading, setHomeLoading] = useState(false);
+  const [livePolicy, setLivePolicy] = useState<PolicySnapshot | null>(null);
+  const latestPolicy = useRef<PolicySnapshot | null>(null);
+  const [policyError, setPolicyError] = useState("");
+  const [policyMessage, setPolicyMessage] = useState("");
+  const [policyBusy, setPolicyBusy] = useState(false);
+  const policyActionInFlight = useRef(false);
   const [fundingHistory, setFundingHistory] = useState<FundingRecord[]>([]);
-  const [fundingInput, setFundingInput] = useState("1000.00");
-  const [fundingReview, setFundingReview] = useState<{
-    amountFen: number;
-    challenge: FundingChallenge;
-  } | null>(null);
+  const [transfer, setTransfer] = useState(initialTransferState);
   const [fundingInFlight, setFundingInFlight] = useState<string | null>(null);
   const [fundingBusy, setFundingBusy] = useState(false);
+  const transferEditVersion = useRef(0);
   const [fundingMessage, setFundingMessage] = useState("");
-  const [sweepReviewFen, setSweepReviewFen] = useState<number | null>(null);
   const [sweepResult, setSweepResult] = useState<SweepRecord | null>(null);
   const [sweepHistory, setSweepHistory] = useState<SweepRecord[]>([]);
   const [sweepInFlight, setSweepInFlight] = useState<string | null>(null);
   const [sweepAttemptAt, setSweepAttemptAt] = useState<number | null>(null);
-  const [expandedLicenceId, setExpandedLicenceId] = useState<string | null>(
-    null,
-  );
   const [livePaymentDetail, setLivePaymentDetail] =
     useState<LivePaymentDetail | null>(null);
   const [livePaymentError, setLivePaymentError] = useState("");
+  const [paymentReview, setPaymentReview] = useState<PaymentReview | null>(
+    null,
+  );
+  const [paymentReviewError, setPaymentReviewError] = useState("");
+  const [paymentReviewLoading, setPaymentReviewLoading] = useState(false);
+  const [paymentReviewRetry, setPaymentReviewRetry] = useState(0);
   const [livePairing, setLivePairing] = useState<PairingConsent | null>(null);
   const [livePairings, setLivePairings] = useState<PairingSummary[]>([]);
   const [livePairingCode, setLivePairingCode] = useState("");
@@ -320,6 +403,27 @@ export default function App() {
   const [numberMessage, setNumberMessage] = useState("");
   const approvalSubmissionInFlight = useRef(false);
   const [approvalBusy, setApprovalBusy] = useState(false);
+  const [idleActionBusyId, setIdleActionBusyId] = useState<string | null>(null);
+  const idleSubmissionInFlight = useRef(false);
+  const [idleRenewalWindows, setIdleRenewalWindows] = useState<
+    Record<string, string>
+  >({});
+  const [trustReview, setTrustReview] = useState<{
+    agentId: string;
+    evidence: TrustEvidence | null;
+    error: string;
+    loading: boolean;
+  } | null>(null);
+  const [trustActionBusyId, setTrustActionBusyId] = useState<string | null>(
+    null,
+  );
+  const trustActionInFlight = useRef(false);
+  const [demoDrill, setDemoDrill] = useState<{
+    drill_id: string | null;
+    active: boolean;
+  } | null>(null);
+  const [demoDrillBusy, setDemoDrillBusy] = useState(false);
+  const [demoDrillError, setDemoDrillError] = useState("");
   const [pendingSimulation, setPendingSimulation] =
     useState<PendingSimulation>(null);
   const [clock, setClock] = useState(Date.now());
@@ -331,6 +435,34 @@ export default function App() {
     typeof window !== "undefined" &&
     window.location.protocol === "http:" &&
     window.location.hostname === "127.0.0.1";
+
+  useEffect(() => {
+    if (!isLocalDemo || !demoAuthenticated) return;
+    let active = true;
+    const refresh = () => {
+      void loadGatewayDemoDrillStatus()
+        .then((status) => {
+          if (active) {
+            setDemoDrill(status);
+            setDemoDrillError("");
+          }
+        })
+        .catch((error) => {
+          if (active)
+            setDemoDrillError(
+              error instanceof Error
+                ? error.message
+                : "Drill status unavailable.",
+            );
+        });
+    };
+    refresh();
+    const interval = setInterval(refresh, 5000);
+    return () => {
+      active = false;
+      clearInterval(interval);
+    };
+  }, [isLocalDemo, demoAuthenticated]);
 
   const refreshGateway = useCallback(async () => {
     if (!isLive) return;
@@ -423,6 +555,36 @@ export default function App() {
     }
   }, [isLive, sweepAttemptAt, sweepInFlight]);
 
+  const refreshPolicy = useCallback(async () => {
+    if (!isLive) return;
+    try {
+      const snapshot = await loadGatewayPolicy();
+      validatePolicySnapshot(snapshot);
+      latestPolicy.current = snapshot;
+      setLivePolicy(snapshot);
+      setPendingSimulation((pending) =>
+        pending?.policySnapshotHash &&
+        !policyReviewStillCurrent(
+          snapshot,
+          pending.policySnapshotHash,
+          pending.policySnapshotBlock ?? "",
+        )
+          ? null
+          : pending,
+      );
+      setPolicyError("");
+    } catch (error) {
+      latestPolicy.current = null;
+      setLivePolicy(null);
+      setPendingSimulation((pending) =>
+        pending?.policySnapshotHash ? null : pending,
+      );
+      setPolicyError(
+        error instanceof Error ? error.message : "Policy values unavailable.",
+      );
+    }
+  }, [isLive]);
+
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 1000);
     return () => clearInterval(timer);
@@ -449,6 +611,20 @@ export default function App() {
   }, [refreshWallet, isLive]);
 
   useEffect(() => {
+    if (!isLive || tab !== "wallet") return;
+    void refreshPolicy();
+    const poller = setInterval(() => void refreshPolicy(), 10_000);
+    return () => clearInterval(poller);
+  }, [isLive, refreshPolicy, tab]);
+
+  useEffect(() => {
+    if (!demoAuthenticated)
+      setPendingSimulation((pending) =>
+        pending?.policySnapshotHash ? null : pending,
+      );
+  }, [demoAuthenticated]);
+
+  useEffect(() => {
     if (!isLive || !fundingInFlight) return;
     let active = true;
     const poll = async () => {
@@ -463,7 +639,7 @@ export default function App() {
           setFundingInFlight(null);
           setFundingMessage(
             record.status === "completed"
-              ? "Transfer confirmed on the simulated chain."
+              ? "Transfer confirmed on the local FISCO chain."
               : "Transfer failed without moving funds.",
           );
           await refreshWallet();
@@ -494,7 +670,7 @@ export default function App() {
         ]);
         if (record.status === "completed") {
           setSweepInFlight(null);
-          setFundingMessage("Return confirmed on the simulated chain.");
+          setFundingMessage("Return confirmed on the local FISCO chain.");
           await refreshWallet();
         }
       } catch {
@@ -545,6 +721,54 @@ export default function App() {
   const selectedApproval =
     approvals.find((approval) => approval.approval_id === selectedApprovalId) ??
     null;
+  const compositeApprovalId =
+    isLive &&
+    selectedApproval?.kind === "payment" &&
+    selectedApproval.review_schema === "payment_review.v1"
+      ? selectedApproval.approval_id
+      : null;
+  const compositeReviewRequestKey = compositeApprovalId
+    ? `${compositeApprovalId}:${selectedApproval?.payload_hash}:${paymentReviewRetry}`
+    : null;
+  useEffect(() => {
+    setPaymentReview(null);
+    setPaymentReviewError("");
+    if (!compositeApprovalId || !compositeReviewRequestKey) {
+      setPaymentReviewLoading(false);
+      return;
+    }
+    let active = true;
+    setPaymentReviewLoading(true);
+    void loadGatewayPaymentReview(compositeApprovalId)
+      .then((review) => {
+        if (active) setPaymentReview(review);
+      })
+      .catch((error) => {
+        if (active)
+          setPaymentReviewError(
+            error instanceof Error
+              ? error.message
+              : "Payment review unavailable.",
+          );
+      })
+      .finally(() => {
+        if (active) setPaymentReviewLoading(false);
+      });
+    return () => {
+      active = false;
+    };
+  }, [compositeApprovalId, compositeReviewRequestKey]);
+  const compositeReviewReady =
+    compositeApprovalId === null ||
+    reviewMatchesApproval(paymentReview, selectedApproval, clock);
+  const currentApprovalReview = useRef<{
+    approval: Approval | null;
+    review: PaymentReview | null;
+  }>({ approval: null, review: null });
+  currentApprovalReview.current = {
+    approval: selectedApproval,
+    review: paymentReview,
+  };
   const selectedPairing =
     selectedApproval?.kind === "pairing"
       ? (livePairings.find(
@@ -584,6 +808,9 @@ export default function App() {
           )
         : undefined,
     );
+  const selectedApprovalTrust = selectedApproval
+    ? approvalTrustInfo(selectedApproval)
+    : null;
   const livePaymentRows: Payment[] = [...livePayments]
     .sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))
     .map((payment) => ({
@@ -595,6 +822,7 @@ export default function App() {
       status: payment.status,
       reason: "See Gateway decision",
       at: payment.created_at,
+      approvalSource: payment.approval_source,
     }));
   const paymentRows = isLive ? livePaymentRows : demo.payments;
   const selectedPayment =
@@ -697,6 +925,29 @@ export default function App() {
       )
         return showError("This approval has expired. Start a new request.");
       if (
+        (selectedApproval.kind === "payment" ||
+          selectedApproval.kind === "mandate") &&
+        (!selectedApproval.trust_light ||
+          selectedApproval.trust_light === "RED")
+      )
+        return showError(
+          "This agent's trust light does not allow approval. Refresh the request.",
+        );
+      if (
+        selectedApproval.kind === "pairing" &&
+        !livePairing?.pairing.client_app_name
+      )
+        return showError(
+          "This pairing has no client app identity. Start a new connection from the connector.",
+        );
+      if (
+        selectedApproval.review_schema === "payment_review.v1" &&
+        !reviewMatchesApproval(paymentReview, selectedApproval, Date.now())
+      )
+        return setNumberMessage(
+          "The verified payment review is missing, changed, or expired. Reload it before approving.",
+        );
+      if (
         selectedApproval.kind === "pairing" &&
         (!selectedNumberExpiry ||
           Date.parse(selectedNumberExpiry) <= Date.now())
@@ -719,6 +970,23 @@ export default function App() {
         label: `Simulate approval of ${approvalView(card).title}`,
         run: () => {
           if (approvalSubmissionInFlight.current) return;
+          if (
+            card.review_schema === "payment_review.v1" &&
+            (!reviewMatchesApproval(
+              currentApprovalReview.current.review,
+              currentApprovalReview.current.approval,
+              Date.now(),
+            ) ||
+              currentApprovalReview.current.approval?.approval_id !==
+                card.approval_id ||
+              currentApprovalReview.current.approval.payload_hash !==
+                card.payload_hash)
+          ) {
+            setNumberMessage(
+              "The verified payment review changed or expired. Reload it before approving.",
+            );
+            return;
+          }
           if (
             card.kind === "pairing" &&
             (!selectedNumberExpiry ||
@@ -889,6 +1157,7 @@ export default function App() {
       setGatewayError("");
       await refreshGateway();
       await refreshWallet();
+      await refreshPolicy();
     } catch (error) {
       setDemoAuthenticated(false);
       setGatewayError(
@@ -897,8 +1166,148 @@ export default function App() {
     }
   };
 
+  const submitPreparedPolicy = async (
+    change: PreparedPolicyChange,
+    simulatedProof: boolean,
+    expectedPolicyHash: string,
+    expectedContractBlock: string,
+  ) => {
+    if (policyActionInFlight.current) return;
+    policyActionInFlight.current = true;
+    setPolicyBusy(true);
+    setPolicyError("");
+    setPolicyMessage("Confirming contract caps and Gateway policy...");
+    try {
+      if (
+        !policyReviewStillCurrent(
+          latestPolicy.current,
+          expectedPolicyHash,
+          expectedContractBlock,
+        ) ||
+        (simulatedProof && (!isLocalDemo || !demoAuthenticated))
+      )
+        throw new Error("Policy or owner session changed after review.");
+      const result = await completeGatewayPolicyChange(change, simulatedProof);
+      validatePolicySnapshot(result);
+      if (result.sync_status !== "consistent" || !result.contract)
+        throw new Error(
+          "Policy update was not confirmed. Refresh policy before another change.",
+        );
+      const confirmed = await loadGatewayPolicy();
+      validatePolicySnapshot(confirmed);
+      if (
+        confirmed.sync_status !== "consistent" ||
+        ![
+          "per_payment_max",
+          "daily_max",
+          "monthly_max",
+          "auto_approve_below",
+        ].every(
+          (field) =>
+            confirmed.policy[field as keyof EditablePolicyLimits].amount ===
+            change.proposed[field as keyof EditablePolicyLimits].amount,
+        )
+      )
+        throw new Error("Confirmed limits changed before policy readback.");
+      setLivePolicy(confirmed);
+      latestPolicy.current = confirmed;
+      setPolicyError("");
+      setPolicyMessage("Limit change confirmed on the local FISCO chain.");
+    } catch (error) {
+      latestPolicy.current = null;
+      setLivePolicy(null);
+      setPolicyMessage("");
+      setPolicyError(
+        `${policyChangeError(error)} Refresh policy and contract caps before another change.`,
+      );
+    } finally {
+      policyActionInFlight.current = false;
+      setPolicyBusy(false);
+    }
+  };
+
+  const handlePolicySave = (proposed: EditablePolicyLimits) => {
+    const snapshot = livePolicy;
+    const contractAtReview = snapshot?.contract;
+    if (
+      !isLive ||
+      !snapshot ||
+      snapshot.sync_status !== "consistent" ||
+      !contractAtReview ||
+      policyActionInFlight.current
+    )
+      return setPolicyError(
+        "Refresh synchronized Gateway policy and contract caps first.",
+      );
+    policyActionInFlight.current = true;
+    setPolicyBusy(true);
+    setPolicyError("");
+    setPolicyMessage("");
+    void (async () => {
+      let change: PreparedPolicyChange | null = null;
+      try {
+        validatePolicySnapshot(snapshot);
+        change = await prepareGatewayPolicyChange(snapshot, proposed);
+        validatePreparedPolicyChange(change, snapshot, proposed);
+        if (
+          !policyReviewStillCurrent(
+            latestPolicy.current,
+            snapshot.policy_hash,
+            contractAtReview.block_number,
+          )
+        )
+          throw new Error("Policy changed during review. Refresh limits.");
+        if (
+          change.requires_verification &&
+          (!isLocalDemo || !demoAuthenticated)
+        )
+          throw new Error(
+            "A registered owner biometric is required to raise these limits.",
+          );
+      } catch (error) {
+        change = null;
+        latestPolicy.current = null;
+        setLivePolicy(null);
+        setPolicyError(policyChangeError(error));
+      } finally {
+        policyActionInFlight.current = false;
+        setPolicyBusy(false);
+      }
+      if (!change) return;
+      const preparedChange = change;
+      if (!preparedChange.requires_verification) {
+        void submitPreparedPolicy(
+          preparedChange,
+          false,
+          snapshot.policy_hash,
+          contractAtReview.block_number,
+        );
+        return;
+      }
+      const formatLimits = (limits: EditablePolicyLimits) =>
+        `per payment ${formatMoney(limits.per_payment_max.amount)}, daily ${formatMoney(limits.daily_max.amount)}, monthly ${formatMoney(limits.monthly_max.amount)}, Green threshold ${formatMoney(limits.auto_approve_below.amount)}`;
+      setPendingSimulation({
+        expiresAt: preparedChange.expires_at,
+        policySnapshotHash: snapshot.policy_hash,
+        policySnapshotBlock: contractAtReview.block_number,
+        label: `${policyChangeIsLoosening(snapshot.policy, proposed) ? "Raise owner spending authority" : "Confirm owner policy change"}. Current: ${formatLimits(preparedChange.current)}. Proposed: ${formatLimits(preparedChange.proposed)}. Exact action hash: ${wrapHash(preparedChange.action_hash)}. This simulated biometric step authorizes only these limits; it does not add wallet funds or reopen denied payments.`,
+        run: () => {
+          void submitPreparedPolicy(
+            preparedChange,
+            true,
+            snapshot.policy_hash,
+            contractAtReview.block_number,
+          );
+        },
+      });
+    })();
+  };
+
   const startFundingReview = async () => {
-    const amountFen = parseYuanToFen(fundingInput);
+    if (transfer.direction !== "fund") return;
+    const requestedAmountInput = transfer.amountInput;
+    const requestVersion = transferEditVersion.current;
+    const amountFen = parseYuanToFen(transfer.amountInput);
     if (!amountFen)
       return setFundingMessage(
         "Enter a positive CNY amount with at most two decimal places.",
@@ -928,7 +1337,16 @@ export default function App() {
         throw new Error(
           "Wallet destination changed. Refresh balances before transferring.",
         );
-      setFundingReview({ amountFen, challenge });
+      setTransfer((current) =>
+        fundingPreparationIsCurrent(
+          current,
+          requestedAmountInput,
+          requestVersion,
+          transferEditVersion.current,
+        )
+          ? { ...current, fundingReview: { amountFen, challenge } }
+          : current,
+      );
     } catch (error) {
       setFundingMessage(
         error instanceof Error ? error.message : "Transfer review unavailable.",
@@ -939,18 +1357,22 @@ export default function App() {
   };
 
   const confirmFunding = () => {
-    if (!fundingReview) return;
-    const { amountFen, challenge } = fundingReview;
+    if (transfer.direction !== "fund" || !transfer.fundingReview) return;
+    const { amountFen, challenge } = transfer.fundingReview;
+    const reviewVersion = transferEditVersion.current;
     if (Date.parse(challenge.expires_at) <= Date.now()) {
-      setFundingReview(null);
+      setTransfer((current) => ({ ...current, fundingReview: null }));
       return setFundingMessage(
         "The confirmation expired. Review this transfer again.",
       );
     }
     setPendingSimulation({
       label: `Transfer ${formatMoney(amountFen)} from WeBank main account to Agent Wallet ${challenge.destination_address}. Confirm this exact amount.`,
+      fundingId: challenge.funding_id,
+      expiresAt: challenge.expires_at,
       run: () => {
-        setFundingReview(null);
+        if (reviewVersion !== transferEditVersion.current) return;
+        setTransfer((current) => ({ ...current, fundingReview: null }));
         setFundingInFlight(challenge.funding_id);
         setFundingBusy(true);
         setFundingMessage(
@@ -968,7 +1390,7 @@ export default function App() {
             ]);
             if (record.status === "completed") {
               setFundingInFlight(null);
-              setFundingMessage("Transfer confirmed on the simulated chain.");
+              setFundingMessage("Transfer confirmed on the local FISCO chain.");
               await refreshWallet();
             }
           } catch (error) {
@@ -1001,8 +1423,34 @@ export default function App() {
     });
   };
 
+  const startReturnReview = () => {
+    if (transfer.direction !== "return") return;
+    if (
+      !liveBalanceUsable ||
+      !liveHome ||
+      fundingBusy ||
+      fundingInFlight ||
+      sweepInFlight
+    )
+      return setFundingMessage(
+        "A fresh confirmed balance and no pending transfer are required.",
+      );
+    const review = reviewReturnAmount(
+      transfer.amountInput,
+      liveHome.agent_wallet.available.amount,
+    );
+    if (review.error) return setFundingMessage(review.error);
+    setFundingMessage("");
+    setTransfer((current) =>
+      current.direction === "return"
+        ? { ...current, returnReviewFen: review.amountFen }
+        : current,
+    );
+  };
+
   const confirmSweep = async () => {
-    const amountFen = sweepReviewFen;
+    if (transfer.direction !== "return") return;
+    const amountFen = transfer.returnReviewFen;
     if (
       !amountFen ||
       !liveHome ||
@@ -1014,7 +1462,7 @@ export default function App() {
       return setFundingMessage(
         "A fresh available balance is required before returning funds.",
       );
-    setSweepReviewFen(null);
+    setTransfer((current) => ({ ...current, returnReviewFen: null }));
     setSweepAttemptAt(Date.now());
     setSweepInFlight("unknown");
     setFundingBusy(true);
@@ -1029,7 +1477,7 @@ export default function App() {
       );
       setFundingMessage(
         receipt.status === "completed"
-          ? "Return confirmed on the simulated chain."
+          ? "Return confirmed on the local FISCO chain."
           : "Return requires reconciliation; funds remain unavailable.",
       );
       await refreshWallet();
@@ -1289,7 +1737,7 @@ export default function App() {
           "A registered biometric Secure Enclave key is required to unfreeze this agent.",
         );
       setPendingSimulation({
-        label: `Simulate user-only Unfreeze for ${agentId}. This does not clear a suspended licence.`,
+        label: `Simulate user-only Unfreeze for ${agentId}. This does not change a Red trust light.`,
         run: () => {
           void (async () => {
             try {
@@ -1321,6 +1769,298 @@ export default function App() {
         ),
       })),
     );
+  };
+
+  const handleIdleReauthorization = (agent: Agent) => {
+    if (!isLive || !isLocalDemo)
+      return showError(
+        "A registered biometric Secure Enclave key is required to re-approve this connection.",
+      );
+    if (!demoAuthenticated)
+      return showError("Sign in to the local owner app first.");
+    if (
+      !canReauthorizeConnection(agent) ||
+      idleActionBusyId ||
+      idleSubmissionInFlight.current
+    )
+      return showError("This connection is not eligible for idle re-approval.");
+    setIdleActionBusyId(agent.agent_id);
+    void (async () => {
+      try {
+        const challenge: IdleReauthorizationChallenge =
+          await prepareGatewayIdleReauthorization(agent.agent_id);
+        if (
+          challenge.action !== "idle_reauthorize" ||
+          challenge.agent_id !== agent.agent_id ||
+          challenge.agent_summary.agent_id !== agent.agent_id ||
+          challenge.agent_summary.client_app_id !== agent.client_app_id ||
+          challenge.agent_summary.client_app_name !== agent.client_app_name ||
+          !challenge.agent_summary.public_key_preview ||
+          !Array.isArray(challenge.agent_summary.scopes) ||
+          !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+          Date.parse(challenge.expires_at) <= Date.now()
+        )
+          throw new Error(
+            "The prepared connection details changed. Refresh and try again.",
+          );
+        setPendingSimulation({
+          expiresAt: challenge.expires_at,
+          label: `Re-approve ${challenge.agent_summary.display_name} in ${challenge.agent_summary.client_app_name}. This covers every chat in that app. Registered key: ${challenge.agent_summary.public_key_preview}. Scopes: ${challenge.agent_summary.scopes.join(", ")}. Exact action hash: ${wrapHash(challenge.action_hash)}. This owner action opens a ten-minute key renewal window; spending stays paused until the same connector key renews.`,
+          run: () => {
+            if (idleSubmissionInFlight.current) return;
+            idleSubmissionInFlight.current = true;
+            setIdleActionBusyId(agent.agent_id);
+            void (async () => {
+              try {
+                const result =
+                  await completeSimulatedGatewayIdleReauthorization(
+                    agent.agent_id,
+                    challenge,
+                  );
+                setIdleRenewalWindows((current) => ({
+                  ...current,
+                  [agent.agent_id]: result.renewal_expires_at,
+                }));
+                await refreshGateway();
+              } catch (error) {
+                showError(
+                  error instanceof GatewayRequestError &&
+                    error.code === "action_changed"
+                    ? "This re-approval challenge expired or changed. Start a fresh one."
+                    : error instanceof Error
+                      ? error.message
+                      : "Connection re-approval failed.",
+                );
+              } finally {
+                idleSubmissionInFlight.current = false;
+                setIdleActionBusyId(null);
+              }
+            })();
+          },
+        });
+      } catch (error) {
+        showError(
+          error instanceof Error
+            ? error.message
+            : "Could not prepare connection re-approval.",
+        );
+      } finally {
+        setIdleActionBusyId(null);
+      }
+    })();
+  };
+
+  const handleTrustEventReview = (agent: Agent) => {
+    if (!isLive) return;
+    setTrustReview({
+      agentId: agent.agent_id,
+      evidence: null,
+      error: "",
+      loading: true,
+    });
+    void (async () => {
+      try {
+        const result = await loadGatewayTrustEvents(agent.agent_id);
+        if (!reviewableTrustEvidence(result, agent.agent_id))
+          throw new Error("Trust evidence is unavailable or incomplete.");
+        setTrustReview({
+          agentId: agent.agent_id,
+          evidence: result,
+          error: "",
+          loading: false,
+        });
+      } catch (error) {
+        setTrustReview({
+          agentId: agent.agent_id,
+          evidence: null,
+          error:
+            error instanceof Error
+              ? error.message
+              : "Trust event history is unavailable.",
+          loading: false,
+        });
+      }
+    })();
+  };
+
+  const handleReturnToAmber = (agent: Agent) => {
+    const reviewedEvidence = trustReview?.evidence ?? null;
+    if (!isLocalDemo)
+      return showError(
+        "A registered biometric Secure Enclave key is required to return this agent to Amber.",
+      );
+    if (
+      !demoAuthenticated ||
+      agent.licence.level !== "RED" ||
+      trustReview?.agentId !== agent.agent_id ||
+      !reviewableTrustEvidence(reviewedEvidence, agent.agent_id) ||
+      trustReview.error ||
+      trustActionBusyId ||
+      trustActionInFlight.current
+    )
+      return showError(
+        "Review this agent's trust events before returning it to Amber.",
+      );
+    setTrustActionBusyId(agent.agent_id);
+    void (async () => {
+      try {
+        const latestEvents = await loadGatewayTrustEvents(agent.agent_id);
+        if (
+          !trustEvidenceUnchanged(
+            reviewedEvidence,
+            latestEvents,
+            agent.agent_id,
+          )
+        ) {
+          setTrustReview({
+            agentId: agent.agent_id,
+            evidence: null,
+            error:
+              "Trust history changed. Review the updated evidence before continuing.",
+            loading: false,
+          });
+          return;
+        }
+        const challenge: TrustActionChallenge =
+          await prepareGatewayReturnToAmber(agent.agent_id);
+        if (
+          challenge.action !== "return_to_amber" ||
+          challenge.agent_id !== agent.agent_id ||
+          challenge.agent_summary.agent_id !== agent.agent_id ||
+          challenge.agent_summary.level !== "RED" ||
+          !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+          Date.parse(challenge.expires_at) <= Date.now()
+        )
+          throw new Error(
+            "Return to Amber challenge changed. Review the current agent state again.",
+          );
+        setPendingSimulation({
+          expiresAt: challenge.expires_at,
+          label: `Return ${agent.display_name} from Red to Amber after reviewing ${reviewedEvidence.items.length} recorded trust events and ${reviewedEvidence.legacy_evidence.length} restored legacy records. App: ${challenge.agent_summary.client_app_name ?? agent.client_app_name ?? "legacy identity"}. Key: ${challenge.agent_summary.public_key_preview ?? "see agent record"}. Reason: ${challenge.agent_summary.reason ?? agent.licence.reason}. Flags in 30 days: ${challenge.agent_summary.flags_30d ?? agent.licence.flags_30d}. Failed drills: ${challenge.agent_summary.drills_failed ?? agent.licence.drills_failed}. Evidence IDs: ${challenge.agent_summary.latest_evidence_ids?.join(", ") || "none"}. Exact action hash: ${wrapHash(challenge.action_hash)}. This keeps the history and any separate freeze; it does not approve a payment or promote to Green.`,
+          run: () => {
+            if (trustActionInFlight.current) return;
+            trustActionInFlight.current = true;
+            setTrustActionBusyId(agent.agent_id);
+            void (async () => {
+              try {
+                await completeSimulatedGatewayReturnToAmber(
+                  agent.agent_id,
+                  challenge,
+                );
+                setTrustReview(null);
+                await refreshGateway();
+              } catch (error) {
+                showError(
+                  error instanceof Error
+                    ? error.message
+                    : "Return to Amber failed.",
+                );
+              } finally {
+                trustActionInFlight.current = false;
+                setTrustActionBusyId(null);
+              }
+            })();
+          },
+        });
+      } catch (error) {
+        showError(
+          error instanceof Error
+            ? error.message
+            : "Could not prepare Return to Amber.",
+        );
+      } finally {
+        setTrustActionBusyId(null);
+      }
+    })();
+  };
+
+  const handleDemoFastForwardGreen = (agent: Agent) => {
+    if (
+      !isLocalDemo ||
+      !demoAuthenticated ||
+      agent.status !== "active" ||
+      agent.licence.level !== "AMBER"
+    )
+      return showError(
+        "The simulated Green control is available only for an active Amber agent in the local owner demo.",
+      );
+    if (trustActionBusyId || trustActionInFlight.current) return;
+    setTrustActionBusyId(agent.agent_id);
+    void (async () => {
+      try {
+        const challenge = await prepareGatewayDemoFastForwardGreen(
+          agent.agent_id,
+        );
+        if (
+          challenge.action !== "demo_fast_forward_green" ||
+          challenge.agent_id !== agent.agent_id ||
+          challenge.agent_summary.agent_id !== agent.agent_id ||
+          (challenge.agent_summary.level &&
+            challenge.agent_summary.level !== "AMBER") ||
+          !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+          Date.parse(challenge.expires_at) <= Date.now()
+        )
+          throw new Error("Demo Green challenge changed or expired.");
+        setPendingSimulation({
+          expiresAt: challenge.expires_at,
+          label: `LOCAL DEMO OVERRIDE: Simulate Green for ${agent.display_name}. Exact action hash: ${wrapHash(challenge.action_hash)}. This records a demo override only. It does not fabricate completed purchases or fire drills, raise your limits, or remove a freeze.`,
+          run: () => {
+            if (trustActionInFlight.current) return;
+            trustActionInFlight.current = true;
+            setTrustActionBusyId(agent.agent_id);
+            void (async () => {
+              try {
+                await completeSimulatedGatewayDemoFastForwardGreen(
+                  agent.agent_id,
+                  challenge,
+                );
+                await refreshGateway();
+              } catch (error) {
+                showError(
+                  error instanceof Error
+                    ? error.message
+                    : "Demo Green override failed.",
+                );
+              } finally {
+                trustActionInFlight.current = false;
+                setTrustActionBusyId(null);
+              }
+            })();
+          },
+        });
+      } catch (error) {
+        showError(
+          error instanceof Error
+            ? error.message
+            : "Could not prepare demo Green override.",
+        );
+      } finally {
+        setTrustActionBusyId(null);
+      }
+    })();
+  };
+
+  const handleDemoDrill = (action: "start" | "stop") => {
+    if (!isLocalDemo || !demoAuthenticated || demoDrillBusy) return;
+    setDemoDrillBusy(true);
+    void (async () => {
+      try {
+        const result =
+          action === "start"
+            ? await startGatewayDemoDrill()
+            : await stopGatewayDemoDrill();
+        setDemoDrill(result);
+        setDemoDrillError("");
+      } catch (error) {
+        setDemoDrillError(
+          error instanceof Error
+            ? error.message
+            : "Demo drill control unavailable.",
+        );
+      } finally {
+        setDemoDrillBusy(false);
+      }
+    })();
   };
 
   const handleDeleteAgent = (agentId: string, name: string) => {
@@ -1738,28 +2478,76 @@ export default function App() {
                     : "Read this card yourself. Agent instructions and chat messages cannot authorize this action."}
                 </Text>
               </View>
-              <View style={styles.card} testID="approval-card">
-                <View style={styles.cardTop}>
-                  <Badge>{selectedApproval.kind.toUpperCase()}</Badge>
-                  <Text style={styles.expiry}>
-                    {selectedApproval.kind === "pairing"
-                      ? "Pairing code: "
-                      : "Expires in "}
-                    {secondsRemaining(selectedApproval.expires_at, clock)}s
+              {selectedApprovalTrust ? (
+                <View style={styles.card}>
+                  <TrustLight {...selectedApprovalTrust} />
+                </View>
+              ) : selectedApproval.kind === "payment" ||
+                selectedApproval.kind === "mandate" ? (
+                <View style={styles.card}>
+                  <Text style={styles.feedback}>
+                    Trust light is unavailable. Refresh this approval before
+                    deciding.
                   </Text>
                 </View>
-                <Text style={styles.approvalTitle}>
-                  {approvalView(selectedApproval).title}
-                </Text>
-                {approvalView(selectedApproval).lines.map((line) => (
-                  <View key={line} style={styles.bulletRow}>
-                    <Text style={styles.bullet}>•</Text>
-                    <Text style={styles.bulletText}>
-                      {wrapApprovalLine(line)}
+              ) : null}
+              {compositeApprovalId ? (
+                compositeReviewReady && paymentReview ? (
+                  <PaymentReviewCard
+                    review={paymentReview}
+                    secondsLeft={secondsRemaining(
+                      selectedApproval.expires_at,
+                      clock,
+                    )}
+                  />
+                ) : (
+                  <View style={styles.card} testID="payment-review-unavailable">
+                    <Text style={styles.cardTitle}>
+                      Verified payment review required
+                    </Text>
+                    <Text style={styles.bodyText}>
+                      {paymentReviewLoading
+                        ? "Loading the locked intent and signed order from Gateway..."
+                        : paymentReviewError ||
+                          "The payment review is missing, changed, or expired. Approval is unavailable."}
+                    </Text>
+                    {!paymentReviewLoading ? (
+                      <Button
+                        tone="light"
+                        testID="retry-payment-review"
+                        onPress={() =>
+                          setPaymentReviewRetry((count) => count + 1)
+                        }
+                      >
+                        Reload verified review
+                      </Button>
+                    ) : null}
+                  </View>
+                )
+              ) : (
+                <View style={styles.card} testID="approval-card">
+                  <View style={styles.cardTop}>
+                    <Badge>{selectedApproval.kind.toUpperCase()}</Badge>
+                    <Text style={styles.expiry}>
+                      {selectedApproval.kind === "pairing"
+                        ? "Pairing code: "
+                        : "Expires in "}
+                      {secondsRemaining(selectedApproval.expires_at, clock)}s
                     </Text>
                   </View>
-                ))}
-              </View>
+                  <Text style={styles.approvalTitle}>
+                    {approvalView(selectedApproval).title}
+                  </Text>
+                  {approvalView(selectedApproval).lines.map((line) => (
+                    <View key={line} style={styles.bulletRow}>
+                      <Text style={styles.bullet}>•</Text>
+                      <Text style={styles.bulletText}>
+                        {wrapApprovalLine(line)}
+                      </Text>
+                    </View>
+                  ))}
+                </View>
+              )}
               {isLive &&
               livePairing?.approval.approval_id ===
                 selectedApproval.approval_id ? (
@@ -1772,6 +2560,10 @@ export default function App() {
                   <InfoRow
                     label="Provider"
                     value={livePairing.pairing.provider}
+                  />
+                  <PairingClientScope
+                    clientAppName={livePairing.pairing.client_app_name}
+                    publicKey={livePairing.public_key}
                   />
                   <InfoRow
                     label="Scopes"
@@ -1822,16 +2614,27 @@ export default function App() {
                   ) : null}
                 </View>
               ) : null}
+              {selectedApproval.level !== "zero_trust" && numberMessage ? (
+                <Text testID="approval-message" style={styles.feedback}>
+                  {numberMessage}
+                </Text>
+              ) : null}
               <View style={styles.actionStack}>
                 <Button
                   testID="approve-action"
                   disabled={
                     approvalBusy ||
+                    !compositeReviewReady ||
                     (isLive && (!isLocalDemo || !demoAuthenticated)) ||
                     selectedApproval.status !== "pending" ||
+                    ((selectedApproval.kind === "payment" ||
+                      selectedApproval.kind === "mandate") &&
+                      !selectedApproval.trust_light) ||
+                    selectedApproval.trust_light === "RED" ||
                     Date.parse(selectedApproval.expires_at) <= clock ||
                     (selectedApproval.kind === "pairing" &&
                       (selectedNumberExpired ||
+                        !livePairing?.pairing.client_app_name ||
                         selectedPairing?.status !== "pending")) ||
                     (selectedApproval.level === "zero_trust" &&
                       numberInput.length !== 6 &&
@@ -1936,6 +2739,17 @@ export default function App() {
                   label="Decision"
                   value={selectedPayment.status.toUpperCase()}
                 />
+                {selectedPayment.status === "paid" &&
+                selectedPayment.approvalSource ? (
+                  <InfoRow
+                    label="Approval path"
+                    value={
+                      selectedPayment.approvalSource === "auto"
+                        ? "Auto-paid under Green within your threshold"
+                        : "Approved by owner"
+                    }
+                  />
+                ) : null}
                 <InfoRow
                   label="Why"
                   value={
@@ -2273,64 +3087,94 @@ export default function App() {
                       ) : null}
                       <SectionTitle
                         kicker="MOVE MONEY"
-                        title="Fund Agent Wallet"
+                        title="Transfer between accounts"
                       />
-                      <View style={styles.card}>
-                        <Text style={styles.bodyText}>
-                          Choose an amount to move from your simulated WeBank
-                          main account into the separate Agent Wallet.
+                      <TransferControl
+                        direction={transfer.direction}
+                        amountInput={transfer.amountInput}
+                        sourceBalanceFen={
+                          liveBalanceUsable && liveHome
+                            ? transfer.direction === "fund"
+                              ? liveHome.main_account.balance.amount
+                              : liveHome.agent_wallet.available.amount
+                            : null
+                        }
+                        busy={transferActionsBlocked(
+                          fundingBusy,
+                          fundingInFlight,
+                          sweepInFlight,
+                        )}
+                        reviewDisabled={
+                          transfer.direction === "fund" && !isLocalDemo
+                        }
+                        onReverse={() => {
+                          if (
+                            transferActionsBlocked(
+                              fundingBusy,
+                              fundingInFlight,
+                              sweepInFlight,
+                            )
+                          )
+                            return;
+                          transferEditVersion.current += 1;
+                          setTransfer((current) =>
+                            reverseTransfer(
+                              current,
+                              liveBalanceUsable && liveHome
+                                ? liveHome.agent_wallet.available.amount
+                                : null,
+                            ),
+                          );
+                          setPendingSimulation((pending) =>
+                            pending?.fundingId ? null : pending,
+                          );
+                          setFundingMessage("");
+                        }}
+                        onAmountChange={(value) => {
+                          transferEditVersion.current += 1;
+                          setTransfer((current) =>
+                            editTransferAmount(current, value),
+                          );
+                          setPendingSimulation((pending) =>
+                            pending?.fundingId ? null : pending,
+                          );
+                        }}
+                        onReview={() =>
+                          transfer.direction === "fund"
+                            ? void startFundingReview()
+                            : startReturnReview()
+                        }
+                      />
+                      {!isLocalDemo && transfer.direction === "fund" ? (
+                        <Text style={styles.finePrint}>
+                          Funding requires local simulated owner confirmation. A
+                          production biometric signing key is not connected.
                         </Text>
-                        <TextInput
-                          testID="funding-amount"
-                          style={styles.input}
-                          value={fundingInput}
-                          onChangeText={(value) => {
-                            setFundingInput(value);
-                            setFundingReview(null);
-                          }}
-                          keyboardType="decimal-pad"
-                          accessibilityLabel="Transfer amount in CNY"
-                          placeholder="Amount in CNY"
-                          placeholderTextColor="#AAA5AF"
-                        />
-                        <Button
-                          testID="review-funding"
-                          disabled={
-                            !isLocalDemo ||
-                            !liveBalanceUsable ||
-                            fundingBusy ||
-                            Boolean(fundingInFlight || sweepInFlight)
-                          }
-                          onPress={() => void startFundingReview()}
-                        >
-                          Review transfer
-                        </Button>
-                        {!isLocalDemo ? (
-                          <Text style={styles.finePrint}>
-                            Funding requires the local simulated owner
-                            confirmation. A production biometric signing key is
-                            not connected.
-                          </Text>
-                        ) : null}
-                      </View>
-                      {fundingReview ? (
+                      ) : null}
+                      {transfer.direction === "fund" &&
+                      transfer.fundingReview ? (
                         <View testID="funding-review" style={styles.card}>
                           <Text style={styles.cardTitle}>Review transfer</Text>
                           <InfoRow label="From" value="WeBank main account" />
                           <InfoRow label="To" value="Agent Wallet" />
                           <Text selectable style={styles.finePrint}>
                             Destination{" "}
-                            {fundingReview.challenge.destination_address}
+                            {
+                              transfer.fundingReview.challenge
+                                .destination_address
+                            }
                           </Text>
                           <InfoRow
                             label="Amount"
-                            value={formatMoney(fundingReview.amountFen)}
+                            value={formatMoney(
+                              transfer.fundingReview.amountFen,
+                            )}
                             last
                           />
                           <Text style={styles.finePrint}>
                             This review expires{" "}
                             {new Date(
-                              fundingReview.challenge.expires_at,
+                              transfer.fundingReview.challenge.expires_at,
                             ).toLocaleTimeString()}
                             .
                           </Text>
@@ -2340,8 +3184,9 @@ export default function App() {
                               fundingBusy ||
                               !liveBalanceUsable ||
                               Boolean(fundingInFlight || sweepInFlight) ||
-                              Date.parse(fundingReview.challenge.expires_at) <=
-                                clock
+                              Date.parse(
+                                transfer.fundingReview.challenge.expires_at,
+                              ) <= clock
                             }
                             onPress={confirmFunding}
                           >
@@ -2349,7 +3194,57 @@ export default function App() {
                           </Button>
                           <Button
                             tone="ghost"
-                            onPress={() => setFundingReview(null)}
+                            onPress={() =>
+                              setTransfer((current) => ({
+                                ...current,
+                                fundingReview: null,
+                              }))
+                            }
+                          >
+                            Cancel
+                          </Button>
+                        </View>
+                      ) : null}
+                      {transfer.direction === "return" &&
+                      transfer.returnReviewFen !== null ? (
+                        <View testID="return-review" style={styles.card}>
+                          <Text style={styles.cardTitle}>Review return</Text>
+                          <InfoRow
+                            label="From"
+                            value="Agent Wallet available funds"
+                          />
+                          <InfoRow label="To" value="WeBank main account" />
+                          <InfoRow
+                            label="Amount"
+                            value={formatMoney(transfer.returnReviewFen)}
+                            last
+                          />
+                          <Text style={styles.finePrint}>
+                            This reduces the money available to agents. It uses
+                            your owner session and needs no biometric proof.
+                          </Text>
+                          <Button
+                            testID="confirm-sweep"
+                            disabled={
+                              !liveBalanceUsable ||
+                              fundingBusy ||
+                              Boolean(fundingInFlight || sweepInFlight) ||
+                              !liveHome ||
+                              transfer.returnReviewFen >
+                                liveHome.agent_wallet.available.amount
+                            }
+                            onPress={() => void confirmSweep()}
+                          >
+                            Confirm return
+                          </Button>
+                          <Button
+                            tone="ghost"
+                            onPress={() =>
+                              setTransfer((current) => ({
+                                ...current,
+                                returnReviewFen: null,
+                              }))
+                            }
                           >
                             Cancel
                           </Button>
@@ -2373,70 +3268,6 @@ export default function App() {
                           Return {sweepInFlight}: awaiting confirmed chain
                           evidence or reconciliation.
                         </Text>
-                      ) : null}
-                      {liveHome &&
-                      balanceState === "confirmed" &&
-                      liveHome.agent_wallet.available.amount > 0 ? (
-                        <View style={styles.card}>
-                          <Text style={styles.cardTitle}>
-                            Return unused funds
-                          </Text>
-                          <Text style={styles.bodyText}>
-                            Only the unreserved available balance can return to
-                            the fixed main account.
-                          </Text>
-                          {sweepReviewFen === null ? (
-                            <Button
-                              testID="review-sweep"
-                              tone="light"
-                              disabled={
-                                !liveBalanceUsable ||
-                                fundingBusy ||
-                                Boolean(fundingInFlight || sweepInFlight)
-                              }
-                              onPress={() =>
-                                setSweepReviewFen(
-                                  liveHome.agent_wallet.available.amount,
-                                )
-                              }
-                            >
-                              Review return of{" "}
-                              {formatMoney(
-                                liveHome.agent_wallet.available.amount,
-                              )}
-                            </Button>
-                          ) : (
-                            <>
-                              <InfoRow
-                                label="From"
-                                value="Agent Wallet available"
-                              />
-                              <InfoRow label="To" value="WeBank main account" />
-                              <InfoRow
-                                label="Amount"
-                                value={formatMoney(sweepReviewFen)}
-                                last
-                              />
-                              <Button
-                                testID="confirm-sweep"
-                                disabled={
-                                  !liveBalanceUsable ||
-                                  fundingBusy ||
-                                  Boolean(fundingInFlight || sweepInFlight)
-                                }
-                                onPress={() => void confirmSweep()}
-                              >
-                                Confirm return
-                              </Button>
-                              <Button
-                                tone="ghost"
-                                onPress={() => setSweepReviewFen(null)}
-                              >
-                                Cancel
-                              </Button>
-                            </>
-                          )}
-                        </View>
                       ) : null}
                       {sweepResult ? (
                         <Text style={styles.finePrint}>
@@ -2543,13 +3374,14 @@ export default function App() {
                       />
                     </View>
                   ) : (
-                    <View style={styles.notice}>
-                      <Text style={styles.noticeTitle}>POLICY LIMITS</Text>
-                      <Text style={styles.noticeText}>
-                        Policy values are unavailable in this view. Existing
-                        limits still apply to every agent request.
-                      </Text>
-                    </View>
+                    <PolicyLimitsPanel
+                      snapshot={livePolicy}
+                      error={policyError}
+                      message={policyMessage}
+                      busy={policyBusy}
+                      onRefresh={() => void refreshPolicy()}
+                      onSave={handlePolicySave}
+                    />
                   )}
                   {!isLive ? (
                     <View style={styles.twoButtons}>
@@ -2665,6 +3497,7 @@ export default function App() {
                         <Text style={styles.bodyText}>
                           {approvalView(approval).lines[0]}
                         </Text>
+                        <ApprovalTrustDisplay approval={approval} />
                         <Text style={styles.inlineAction}>
                           Review request ↗
                         </Text>
@@ -2689,6 +3522,28 @@ export default function App() {
 
               {tab === "agents" ? (
                 <>
+                  {isLive ||
+                  !agents.some((agent) => agent.agent_id === "agt_claude") ? (
+                    <Button
+                      testID="connect-agent"
+                      disabled={!isLive && (!demo.enabled || demo.frozenAll)}
+                      onPress={() => setDetail("pair")}
+                    >
+                      {isLive
+                        ? "Enter connector pairing code"
+                        : "Connect Claude - demo"}
+                    </Button>
+                  ) : null}
+                  {!demo.enabled && !isLive ? (
+                    <Text style={styles.finePrint}>
+                      Enable the Agent Wallet on Home before pairing.
+                    </Text>
+                  ) : null}
+                  {isLive ? (
+                    <Button tone="light" onPress={() => void refreshGateway()}>
+                      Refresh connected agents
+                    </Button>
+                  ) : null}
                   <View style={styles.notice}>
                     <Text style={styles.noticeTitle}>KNOW YOUR AGENT</Text>
                     <Text style={styles.noticeText}>
@@ -2696,6 +3551,72 @@ export default function App() {
                       only request actions within your wallet policy.
                     </Text>
                   </View>
+                  {isLocalDemo ? (
+                    <View style={styles.card} testID="local-demo-drill-control">
+                      <Text style={styles.cardTitle}>
+                        Local demo fire drill
+                      </Text>
+                      <Text style={styles.bodyText}>
+                        Simulated bank-owned drill. Starting it reveals the mock
+                        shop decoy; a request to that decoy is denied and moves
+                        the agent to Red.
+                      </Text>
+                      <Text
+                        style={styles.bodyText}
+                        testID="local-demo-drill-status"
+                      >
+                        {demoDrill
+                          ? demoDrill.active
+                            ? `Active drill ${demoDrill.drill_id}`
+                            : "No active drill"
+                          : "Checking drill status..."}
+                      </Text>
+                      {demoDrillError ? (
+                        <Text style={styles.feedback}>{demoDrillError}</Text>
+                      ) : null}
+                      {demoDrill ? (
+                        <Button
+                          testID={
+                            demoDrill.active
+                              ? "stop-demo-drill"
+                              : "start-demo-drill"
+                          }
+                          tone="light"
+                          disabled={demoDrillBusy}
+                          onPress={() =>
+                            handleDemoDrill(demoDrill.active ? "stop" : "start")
+                          }
+                        >
+                          {demoDrillBusy
+                            ? "Updating drill..."
+                            : demoDrill.active
+                              ? "Stop simulated drill"
+                              : "Start simulated drill"}
+                        </Button>
+                      ) : (
+                        <Button
+                          tone="light"
+                          testID="refresh-demo-drill"
+                          onPress={() => {
+                            void loadGatewayDemoDrillStatus()
+                              .then((status) => {
+                                setDemoDrill(status);
+                                setDemoDrillError("");
+                              })
+                              .catch((error) =>
+                                setDemoDrillError(
+                                  error instanceof Error
+                                    ? error.message
+                                    : "Drill status unavailable.",
+                                ),
+                              );
+                          }}
+                        >
+                          Retry drill status
+                        </Button>
+                      )}
+                    </View>
+                  ) : null}
                   {isLive && livePairings.length ? (
                     <View style={styles.card}>
                       <Text style={styles.cardTitle}>Pairing requests</Text>
@@ -2759,45 +3680,20 @@ export default function App() {
                             </Text>
                             <Text style={styles.bodyText}>
                               {agent.status === "active"
-                                ? "Connected and active"
+                                ? agent.reauthorization_required
+                                  ? "Idle re-approval required"
+                                  : "Connected and active"
                                 : agent.status === "frozen"
                                   ? "Access frozen"
                                   : "Access revoked"}
                             </Text>
                           </View>
-                          <Pressable
-                            testID={`licence-badge-${agent.agent_id}`}
-                            accessibilityRole="button"
-                            accessibilityLabel={`${agent.licence.level} licence. ${licenceExplanation(agent.licence.level)}`}
-                            accessibilityHint="Tap for licence details"
-                            onHoverIn={() =>
-                              setExpandedLicenceId(agent.agent_id)
-                            }
-                            onHoverOut={() => setExpandedLicenceId(null)}
-                            onFocus={() => setExpandedLicenceId(agent.agent_id)}
-                            onBlur={() => setExpandedLicenceId(null)}
-                            onPress={() => setExpandedLicenceId(agent.agent_id)}
-                          >
-                            <Badge
-                              tone={
-                                agent.licence.level === "L"
-                                  ? "yellow"
-                                  : agent.licence.level === "SUSPENDED"
-                                    ? "red"
-                                    : "green"
-                              }
-                            >
-                              {agent.licence.level === "SUSPENDED"
-                                ? "SUSPENDED"
-                                : `${agent.licence.level}-PLATE`}
-                            </Badge>
-                          </Pressable>
                         </View>
-                        {expandedLicenceId === agent.agent_id ? (
-                          <Text style={styles.licenceHelp}>
-                            {licenceExplanation(agent.licence.level)}
-                          </Text>
-                        ) : null}
+                        <TrustLight
+                          light={agent.licence.level}
+                          reason={agent.licence.reason}
+                          frozen={agent.status === "frozen"}
+                        />
                         <View style={styles.agentStats}>
                           <Text style={styles.statText}>
                             {agent.licence.clean_purchases} clean purchases
@@ -2805,7 +3701,23 @@ export default function App() {
                           <Text style={styles.statText}>
                             {agent.licence.drills_passed} drills passed
                           </Text>
+                          <Text style={styles.statText}>
+                            {agent.licence.flags_30d} flags in 30 days
+                          </Text>
                         </View>
+                        {isLive ? (
+                          <AgentConnectionInfo
+                            agent={agent}
+                            now={clock}
+                            busy={idleActionBusyId === agent.agent_id}
+                            renewalExpiresAt={
+                              idleRenewalWindows[agent.agent_id]
+                            }
+                            onReauthorize={() =>
+                              handleIdleReauthorization(agent)
+                            }
+                          />
+                        ) : null}
                         {agent.status === "active" ? (
                           <Button
                             testID={`freeze-agent-${agent.agent_id}`}
@@ -2826,62 +3738,65 @@ export default function App() {
                             Unfreeze this agent
                           </Button>
                         ) : null}
-                        {agent.licence.level === "SUSPENDED" ? (
+                        {isLive && agent.licence.level === "RED" ? (
+                          <>
+                            <Button
+                              testID={`review-trust-events-${agent.agent_id}`}
+                              tone="light"
+                              disabled={
+                                trustReview?.agentId === agent.agent_id &&
+                                trustReview.loading
+                              }
+                              onPress={() => handleTrustEventReview(agent)}
+                            >
+                              {trustReview?.agentId === agent.agent_id &&
+                              trustReview.loading
+                                ? "Loading trust events..."
+                                : "Review trust evidence"}
+                            </Button>
+                            {trustReview?.agentId === agent.agent_id &&
+                            trustReview.error ? (
+                              <Text style={styles.feedback}>
+                                {trustReview.error}
+                              </Text>
+                            ) : null}
+                            {trustReview?.agentId === agent.agent_id &&
+                            trustReview.evidence ? (
+                              <>
+                                <TrustEventReview
+                                  events={trustReview.evidence.items}
+                                  legacyEvidence={
+                                    trustReview.evidence.legacy_evidence
+                                  }
+                                />
+                                {!trustReview.error ? (
+                                  <Button
+                                    testID={`return-to-amber-${agent.agent_id}`}
+                                    tone="light"
+                                    disabled={
+                                      trustActionBusyId === agent.agent_id
+                                    }
+                                    onPress={() => handleReturnToAmber(agent)}
+                                  >
+                                    {trustActionBusyId === agent.agent_id
+                                      ? "Preparing owner action..."
+                                      : "Return to Amber"}
+                                  </Button>
+                                ) : null}
+                              </>
+                            ) : null}
+                          </>
+                        ) : null}
+                        {isLocalDemo &&
+                        agent.status === "active" &&
+                        agent.licence.level === "AMBER" ? (
                           <Button
-                            testID={`relicense-agent-${agent.agent_id}`}
+                            testID={`demo-fast-forward-green-${agent.agent_id}`}
                             tone="light"
-                            onPress={() => {
-                              if (!isLocalDemo)
-                                return showError(
-                                  "A registered biometric Secure Enclave key is required to re-license this agent.",
-                                );
-                              void (async () => {
-                                try {
-                                  const history = await loadGatewayAgentHistory(
-                                    agent.agent_id,
-                                  );
-                                  const recent =
-                                    history.items
-                                      .slice(-3)
-                                      .map((event) => event.summary)
-                                      .join("; ") || "No recorded events";
-                                  setPendingSimulation({
-                                    label: `Review ${agent.display_name}'s retained history: ${recent}. This simulated action starts at L and does not clear a freeze.`,
-                                    run: () => {
-                                      void (async () => {
-                                        try {
-                                          const challenge =
-                                            await prepareGatewayAgentAction(
-                                              agent.agent_id,
-                                              "relicense",
-                                            );
-                                          await completeSimulatedGatewayAgentAction(
-                                            agent.agent_id,
-                                            "relicense",
-                                            challenge,
-                                          );
-                                          await refreshGateway();
-                                        } catch (error) {
-                                          showError(
-                                            error instanceof Error
-                                              ? error.message
-                                              : "Re-license failed",
-                                          );
-                                        }
-                                      })();
-                                    },
-                                  });
-                                } catch (error) {
-                                  showError(
-                                    error instanceof Error
-                                      ? error.message
-                                      : "History unavailable",
-                                  );
-                                }
-                              })();
-                            }}
+                            disabled={trustActionBusyId === agent.agent_id}
+                            onPress={() => handleDemoFastForwardGreen(agent)}
                           >
-                            Re-license agent
+                            Local demo: simulate Green
                           </Button>
                         ) : null}
                         <Button
@@ -2907,28 +3822,6 @@ export default function App() {
                       </Text>
                     </View>
                   )}
-                  {isLive ||
-                  !agents.some((agent) => agent.agent_id === "agt_claude") ? (
-                    <Button
-                      testID="connect-agent"
-                      disabled={!isLive && (!demo.enabled || demo.frozenAll)}
-                      onPress={() => setDetail("pair")}
-                    >
-                      {isLive
-                        ? "Enter connector pairing code"
-                        : "Connect Claude - demo"}
-                    </Button>
-                  ) : null}
-                  {!demo.enabled && !isLive ? (
-                    <Text style={styles.finePrint}>
-                      Enable the Agent Wallet on Home before pairing.
-                    </Text>
-                  ) : null}
-                  {isLive ? (
-                    <Button tone="light" onPress={() => void refreshGateway()}>
-                      Refresh connected agents
-                    </Button>
-                  ) : null}
                 </>
               ) : null}
 
@@ -3013,13 +3906,28 @@ export default function App() {
               {isLocalDemo ? "LOCAL GATEWAY SIMULATION" : "WEB SIMULATION"}
             </Badge>
             <Text style={styles.modalTitle}>Simulated biometric step</Text>
-            <Text style={styles.bodyText}>{pendingSimulation.label}</Text>
+            <ScrollView style={styles.modalDetailsScroll}>
+              <Text style={styles.bodyText}>{pendingSimulation.label}</Text>
+            </ScrollView>
+            {pendingSimulation.expiresAt ? (
+              <Text
+                style={styles.bodyText}
+                testID="simulation-challenge-expiry"
+              >
+                Challenge expires in{" "}
+                {secondsRemaining(pendingSimulation.expiresAt, clock)}s
+              </Text>
+            ) : null}
             <Text style={styles.modalWarning}>
               No Face ID or Secure Enclave proof is made here. Continue only for
               the explicit local demo simulation.
             </Text>
             <Button
               testID="simulate-biometric"
+              disabled={
+                Boolean(pendingSimulation.expiresAt) &&
+                Date.parse(pendingSimulation.expiresAt ?? "") <= clock
+              }
               onPress={() => {
                 const action = pendingSimulation.run;
                 setPendingSimulation(null);
@@ -3074,7 +3982,9 @@ function PaymentRow({
         <Text style={styles.listTitle}>{payment.merchant}</Text>
         <Text style={styles.listSub}>
           {payment.status === "paid"
-            ? "Paid"
+            ? payment.approvalSource === "auto"
+              ? "Auto-paid under Green"
+              : "Paid"
             : payment.status === "denied"
               ? "Blocked"
               : "Awaiting user"}{" "}
@@ -3454,15 +4364,6 @@ const styles = StyleSheet.create({
   },
   agentAvatarText: { color: colors.white, fontSize: 23, fontWeight: "800" },
   agentText: { flex: 1 },
-  licenceHelp: {
-    color: colors.ink,
-    backgroundColor: colors.paper,
-    borderRadius: 7,
-    padding: 11,
-    marginTop: 12,
-    fontSize: 12,
-    lineHeight: 18,
-  },
   agentStats: {
     flexDirection: "row",
     justifyContent: "space-between",
@@ -3578,10 +4479,12 @@ const styles = StyleSheet.create({
   modal: {
     width: "100%",
     maxWidth: 390,
+    maxHeight: "90%",
     backgroundColor: colors.white,
     borderRadius: 12,
     padding: 23,
   },
+  modalDetailsScroll: { flexShrink: 1 },
   modalTitle: {
     color: colors.ink,
     fontSize: 23,

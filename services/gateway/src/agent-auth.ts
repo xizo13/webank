@@ -41,6 +41,9 @@ export class AgentAuth {
   }
 
   restore(value: ReturnType<AgentAuth["snapshot"]>): void {
+    this.access.clear();
+    this.refresh.clear();
+    this.nonces.clear();
     for (const [key, entry] of value.access) this.access.set(key, entry);
     for (const [key, entry] of value.refresh) this.refresh.set(key, entry);
     for (const [key, until] of value.nonces) this.nonces.set(key, until);

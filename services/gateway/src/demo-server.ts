@@ -15,6 +15,10 @@ import {
 import { createGuardianEvaluator } from "@webank/guardian";
 import { createGateway } from "./app.js";
 import { canonicalJson } from "./crypto.js";
+import {
+  requiredLoginTokenPath,
+  writePrivateLoginToken,
+} from "./private-login-token.js";
 import type { GatewayDependencies, Merchant } from "./types.js";
 
 if (
@@ -29,6 +33,7 @@ const host = "127.0.0.1";
 const port = Number(process.env.WEBANK_DEMO_PORT ?? "3002");
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid demo port");
+const tokenFile = requiredLoginTokenPath("WEBANK_DEMO_TOKEN_FILE");
 const loginToken = randomBytes(24).toString("base64url");
 const sessionToken = randomBytes(24).toString("base64url");
 const merchantKeys = generateKeyPairSync("ed25519");
@@ -60,7 +65,15 @@ const agent: Agent = {
   provider: "mock",
   public_key: "p256:demo-agent-key",
   scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
-  licence: { level: "L", points: 0, clean_purchases: 0, drills_passed: 0 },
+  licence: {
+    level: "AMBER",
+    clean_purchases: 0,
+    drills_passed: 0,
+    drills_failed: 0,
+    flags_30d: 0,
+    reason: "New agent, no history yet",
+    updated_at: new Date().toISOString(),
+  },
   status: "active",
   created_at: now.toISOString(),
   last_used_at: null,
@@ -127,6 +140,8 @@ const deps: GatewayDependencies = {
           sku,
           gtin: "6901234567001",
           merchant_id: merchant.merchant_id,
+          brand: "Nova",
+          model: "Quiet 3",
           variant: "Black",
           options: { colour: "Black", size: "One size" },
         }
@@ -138,7 +153,13 @@ const deps: GatewayDependencies = {
     signals: [],
     explanation: "Mock risk pass",
   }),
-  evaluateGuardian: createGuardianEvaluator({ apiKey: "" }),
+  evaluateGuardian: createGuardianEvaluator({
+    baseUrl: process.env.WEBANK_GUARDIAN_HERMES_URL ?? "",
+    apiKey: process.env.WEBANK_GUARDIAN_HERMES_KEY ?? "",
+    model: process.env.WEBANK_GUARDIAN_HERMES_MODEL,
+    operatorVerified:
+      process.env.WEBANK_GUARDIAN_HERMES_PROFILE_VERIFIED === "1",
+  }),
   executePayment: async () => {
     throw new Error("Mock demo listener cannot pay");
   },
@@ -225,6 +246,8 @@ const pairing = await app.inject({
   payload: {
     client_name: "Demo connector",
     provider: "mock",
+    client_app_id: `app_${createHash("sha256").update("Mock app", "utf8").digest("hex")}`,
+    client_app_name: "Mock app",
     agent_public_key: `p256:${pairingKeys.publicKey.export({ format: "der", type: "spki" }).toString("base64url")}`,
     requested_scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
   },
@@ -232,9 +255,10 @@ const pairing = await app.inject({
 if (pairing.statusCode !== 200)
   throw new Error(`Failed to seed demo pairing: ${pairing.statusCode}`);
 
+await writePrivateLoginToken(tokenFile, loginToken);
 await app.listen({ host, port });
 process.stdout.write(`Mock Gateway listening at http://${host}:${port}\n`);
-process.stdout.write(`Demo login token: ${loginToken}\n`);
+process.stdout.write("Private demo login token file created.\n");
 process.stdout.write(`Demo pairing code: ${pairing.json().user_code}\n`);
 process.stdout.write(
   "All external services and starting records are simulated; approval is disabled.\n",

@@ -34,7 +34,7 @@ describe("approval presentation", () => {
     };
     const view = presentApproval(base, payment);
     expect(view.title).toBe("Demo assistant wants to pay ¥279.00");
-    expect(view.lines[2]).toContain("Wallet policy or the agent licence");
+    expect(view.lines[2]).toContain("Wallet policy or the agent trust light");
     expect(view.lines[2]).toContain("purchase safety check");
     expect(view.lines.join(" ")).not.toMatch(/policy_licence|guardian/);
   });

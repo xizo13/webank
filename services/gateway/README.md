@@ -13,8 +13,8 @@ The package does not start a listener by itself.
 - `/v1/agent/session/revoke` revokes that key and its token grants; re-pairing creates a separate independent identity after owner approval.
 - `/v1/oauth/device_authorization/:deviceCode` and `/v1/agent/approvals/:id` long-poll for pairing or approval changes.
 - `/v1/app/pairings` lists only pairings claimed by the authenticated owner, including pending countdowns and expired attempts without device codes or request numbers.
-- Every pairing creates a fresh L-plate agent, even when same-provider prior records exist; old records and audit history stay intact.
-- The owner can prepare and simulate Unfreeze or Re-license with a single-use, session-bound action challenge in the loopback demo; production routes fail closed until the biometric Secure Enclave verifier is installed.
+- Every pairing creates a fresh Amber agent for the named client app, even when same-provider prior records exist; old records and audit history stay intact.
+- The owner can prepare and simulate Unfreeze, idle Re-approval, and Return to Amber with single-use action challenges in the loopback demo; production routes fail closed until the biometric Secure Enclave verifier is installed.
 - The owner can Delete agent access with an exact named-agent confirmation; payment and audit history remain.
 - `/v1/agent/*` requires an access token and the connector's RFC 9421 P-256 signature over method, path, content digest, and idempotency key.
 - Agent mandate, payment, status, and own-history routes enforce scope, signature time, nonce replay, mandate constraints, merchant signature, policy, licence, risk, Guardian, and approval rules.
@@ -24,13 +24,31 @@ The package does not start a listener by itself.
 The six named `Decision.checks` represent protocol checks 1 through 6.
 The seventh protocol check is the strictest-result merge into `Decision.outcome`.
 The contract wallet applies a final cap and balance check when the FISCO adapter executes payment.
-L-plate agents need app approval for mandates and every payment.
-Their first mandate and first payment require separate six-digit request numbers, and three mismatches cancel the applicable approval.
+An attended one-time mandate stays `pending_checkout` without spending authority or an approval card until a signed order is checked.
+Amber agents need one composite payment approval for every attended purchase, with a six-digit request number on the first payment.
+An upfront mandate for unattended work can require a separate creation approval before shopping.
+Eligible Green payments under the owner's threshold can be paid without an approval card only after all checks pass; Red agents cannot spend.
+Three request-number mismatches cancel the applicable zero-trust approval.
 No agent-provided description is treated as confirmed user intent.
 Gateway checks the signed checkout request against the mandate's locked amount, merchant, category, product, listing, variant, and execution window when those limits apply.
 In the local demo, Gateway also checks each signed product SKU, GTIN, variant, and options against the trusted mock catalogue before evaluating the mandate.
 Shipping is a separate signed line included in the total and caps, but excluded from product quantity and identity checks.
 Checkout cannot create or broaden a mandate.
+
+## App identity, trust, and Guardian
+
+The connector derives a separate credential namespace from the MCP host's exact self-reported `clientInfo.name`.
+The consent screen states that one app pairing covers every chat in that app; changing the app name requires a new pairing.
+Seven days without a completed payment or owner authorization pauses spending until the owner Re-approves that app and the same key renews its tokens.
+Status checks and token refreshes do not extend that deadline.
+Trust lights are Amber, Green, and Red, with owner freeze tracked separately.
+Bank-owned drill and dispute evidence can change trust; agent and public shop routes cannot promote an agent.
+The local Green fast-forward is marked as a demo override and does not invent purchases or change limits.
+Return to Amber requires owner review of trust evidence and a fresh owner action.
+The Guardian can use a dedicated local Nous Research Hermes Agent profile for one fixed, stateless review call.
+The Gateway requires local operator confirmation of tool isolation and checks the advertised API-server toolsets before each call.
+Missing configuration, uncertain isolation, invalid output, or an unavailable Hermes instance causes owner step-up.
+The [Guardian guide](../guardian/README.md) details the isolation requirements and transport limits.
 
 ## FISCO adapter
 
@@ -41,9 +59,10 @@ The adapter is injected into `createGateway`; it does not implement reservation,
 
 ## Opt-in mock app listener
 
-From the repository root, run `WEBANK_DEMO_SERVER=1 WEBANK_DEMO_APP_ORIGIN=http://127.0.0.1:8081 pnpm --filter @webank/gateway demo` to start a loopback-only fixture at port 3002.
-The process prints an ephemeral login token and pairing code.
-`POST /demo/login` with `Authorization: Bearer <printed-token>` sets an HttpOnly demo session cookie for credentialed browser requests.
+From the repository root, run `WEBANK_DEMO_TOKEN_FILE=/absolute/private/login-token WEBANK_DEMO_SERVER=1 WEBANK_DEMO_APP_ORIGIN=http://127.0.0.1:8081 pnpm --filter @webank/gateway demo` to start a loopback-only fixture at port 3002.
+Set `WEBANK_DEMO_TOKEN_FILE` to an absolute path for a new private file before starting the listener.
+The process creates that file with mode `0600` before listening and prints the pairing code without printing the login token.
+`POST /demo/login` with `Authorization: Bearer <token-from-private-file>` sets an HttpOnly demo session cookie for credentialed browser requests.
 The listener seeds one mock agent, one pending payment approval, and one pairing request so the app can exercise reads, rejection, freeze, and denied-receipt refresh.
 Its merchant, funds reservation, risk, audit anchor, and receipt key are simulated; the Guardian adapter is the real fail-closed module with no API key.
 The listener cannot approve a card or move money and refuses to start in `NODE_ENV=production`.
@@ -61,14 +80,17 @@ Load the ignored local Gateway signer environment, then start from the repositor
 set -a
 . scripts/chain/runtime/gateway.env
 set +a
-WEBANK_LOCAL_DEMO=1 WEBANK_DEMO_APPROVALS=1 SHOP_INTERNAL_TOKEN=local-demo-token corepack pnpm --filter @webank/gateway local-demo
+WEBANK_LOCAL_DEMO=1 WEBANK_DEMO_APPROVALS=1 WEBANK_LOCAL_DEMO_TOKEN_FILE=/absolute/private/login-token SHOP_INTERNAL_TOKEN=local-demo-token corepack pnpm --filter @webank/gateway local-demo
 ```
 
+Set `WEBANK_LOCAL_DEMO_TOKEN_FILE` to an absolute path for a new private file before starting this standalone listener.
+The normal `scripts/local-demo-up.sh` launcher sets that path to `scripts/local-demo-runtime/app-login-token` automatically.
 The listener verifies the shop's merchant identities against the bank-controlled manifest and the FISCO registry before accepting requests.
-It prints the local app login token for `POST /demo/login`; the response sets a local HttpOnly session cookie and explicitly says `simulated: true`.
+It creates the local app login token file with mode `0600` before listening and never prints the token.
+`POST /demo/login` with the token sets a local HttpOnly session cookie and explicitly says `simulated: true`.
 The connector uses the normal OAuth device flow and RFC 9421 P-256 signatures, and Gateway checks the shop's Ed25519-signed payment request.
 Local app approval uses the literal `simulated-local-approval` proof, records the mandate source as `demo_simulation`, and is not a biometric or bank-verifiable approval.
-The funds reservation and risk signal are local simulations; the Guardian runs in its fail-closed unavailable mode.
+The funds reservation and risk signal are local simulations; Guardian uses fail-closed owner step-up unless an operator has configured and verified the dedicated local Hermes profile.
 After FISCO returns a matching `Paid` event and the receipt audit is anchored, Gateway calls the shop's authenticated `/internal/payment-confirmed` endpoint.
 If confirmation fails, Gateway returns `503 reconciliation_required` with the verified payment transaction hash, keeps the mandate locked, and does not retry the payment through the approval endpoint.
 The shop and chain use only simulated merchants and test tokens.
@@ -98,6 +120,8 @@ Pending historical pairings lose their old replacement choice on restart and nee
 An audit anchor failure leaves pairing pending with no new agent grant; retry with a fresh idempotency key after chain recovery.
 Before accepting requests after startup, Gateway releases and durably cancels active mandates left on revoked or deleted agents; it does not release a mandate with an in-flight payment.
 If an orphan hold cannot be released, startup fails and preserves the mandate for operator recovery.
+If a state write fails after the snapshot may have been replaced, Gateway rejects new requests at ingress with `503 service_unavailable` and changes in-flight responses to the same error.
+An already admitted request may have started external work; restart reconciles state from disk before Gateway accepts requests again.
 
 ## Verification
 
@@ -117,7 +141,7 @@ The separate limited `demo` fixture keeps state in memory.
 No production biometric challenge verifier, persistent reservation hold, risk service, SSE delivery, or recovery worker is wired here yet.
 The local action verifier accepts only the explicit demo proof and is not Face ID or a bank-verifiable device signature.
 Merchant fulfillment confirmation is wired only in the opt-in loopback composition.
-The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable; no live AI call has been demonstrated here.
+The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable; three synthetic live Hermes cases have passed against the dedicated isolated profile, but the full signed shop-to-app Guardian run is not yet accepted as release evidence.
 Demo proof approval requires `demoApprovalsEnabled: true` plus either a test process or `WEBANK_DEMO_APPROVALS=1`, and the Gateway refuses demo proof mode in production.
 The app event endpoint uses JSON polling.
 The app freeze endpoint blocks future Gateway requests immediately, while on-chain freeze is a separate bank-controlled operation.

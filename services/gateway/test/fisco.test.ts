@@ -36,6 +36,9 @@ describe("FISCO Gateway adapter", () => {
         evidence = "pay";
         return tx;
       },
+      simulatePay: async (...args: unknown[]) => {
+        calls.push(args);
+      },
       anchor: async (...args: unknown[]) => {
         calls.push(args);
         evidence = "anchor";
@@ -81,16 +84,24 @@ describe("FISCO Gateway adapter", () => {
     expect(merchant?.public_key).toBe(`0x${"7".repeat(64)}`);
     expect(merchant).not.toBeNull();
     if (!merchant) throw new Error("Expected registered merchant");
-    const paymentTx = await adapter.executePayment({
+    const paymentInput = {
       paymentId: "pmt_test",
       merchant,
       mandate: {} as Parameters<typeof adapter.executePayment>[0]["mandate"],
       request: { amount: { amount: 27900, currency: "CNY" } } as Parameters<
         typeof adapter.executePayment
       >[0]["request"],
-    });
-    expect(paymentTx).toBe(tx);
+    };
+    await adapter.preflightPayment(paymentInput);
     expect(calls[1]).toEqual([
+      addresses.agentWallet,
+      paymentHash,
+      merchantHash,
+      27900n,
+    ]);
+    const paymentTx = await adapter.executePayment(paymentInput);
+    expect(paymentTx).toBe(tx);
+    expect(calls[2]).toEqual([
       addresses.agentWallet,
       paymentHash,
       merchantHash,
@@ -102,7 +113,7 @@ describe("FISCO Gateway adapter", () => {
       "payment_decision",
     );
     expect(auditTx).toBe(tx);
-    expect(calls[2]).toEqual([
+    expect(calls[3]).toEqual([
       addresses.auditAnchor,
       `0x${"8".repeat(64)}`,
       subjectHash,

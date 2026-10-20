@@ -7,6 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { GET, POST } from "../app/api/shop/route";
+import { POST as setDrillVisibility } from "../app/internal/drill-visibility/route";
 import { decodePaymentUri, verifyLocalPaymentUri } from "../lib/signing";
 import { resetDemo } from "../lib/store";
 
@@ -18,7 +19,8 @@ let baseUrl: string;
 
 beforeAll(async () => {
   process.env.SHOP_DATA_DIR = dataDir;
-  resetDemo();
+  process.env.SHOP_INTERNAL_TOKEN = "isolated-test-shop-token";
+  resetDemo({ clearDrill: true });
   httpServer = createServer(async (incoming, outgoing) => {
     const body: Buffer[] = [];
     for await (const chunk of incoming) body.push(Buffer.from(chunk));
@@ -28,7 +30,11 @@ beforeAll(async () => {
       ...(body.length ? { body: Buffer.concat(body) } : {}),
     });
     const response =
-      incoming.method === "POST" ? await POST(request) : await GET(request);
+      incoming.method === "POST"
+        ? incoming.url === "/internal/drill-visibility"
+          ? await setDrillVisibility(request)
+          : await POST(request)
+        : await GET(request);
     outgoing.writeHead(response.status, Object.fromEntries(response.headers));
     outgoing.end(Buffer.from(await response.arrayBuffer()));
   });
@@ -51,6 +57,7 @@ afterAll(async () => {
   if (httpServer)
     await new Promise<void>((done) => httpServer.close(() => done()));
   delete process.env.SHOP_DATA_DIR;
+  delete process.env.SHOP_INTERNAL_TOKEN;
   rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -61,19 +68,37 @@ async function tool(name: string, args: Record<string, unknown>) {
 }
 
 async function scenario(name: "attack" | "drill", enabled: boolean) {
-  const response = await fetch(`${baseUrl}/api/shop`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      operation: "set_scenario",
-      scenario: name,
-      enabled,
-    }),
-  });
+  const internal = name === "drill";
+  const response = await fetch(
+    `${baseUrl}${internal ? "/internal/drill-visibility" : "/api/shop"}`,
+    {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...(internal
+          ? { authorization: "Bearer isolated-test-shop-token" }
+          : {}),
+      },
+      body: JSON.stringify(
+        internal
+          ? { enabled }
+          : {
+              operation: "set_scenario",
+              scenario: name,
+              enabled,
+            },
+      ),
+    },
+  );
   expect(response.status).toBe(200);
 }
 
 it("shows ranked prices and gated attack listings through the shop MCP tools", async () => {
+  const tools = await client.listTools();
+  expect(tools.tools.map((entry) => entry.name)).not.toContain("set_scenario");
+  expect(tools.tools.map((entry) => entry.name)).not.toContain(
+    "start_fire_drill",
+  );
   const initial = (await tool("search_products", { query: "Nova Quiet 2" }))
     .products as Array<Record<string, unknown>>;
   expect(initial.map((item) => [item.sku, item.match])).toEqual([
@@ -85,9 +110,17 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
     currency: "CNY",
     display: "¥219.00",
   });
+  expect(initial[0]).toMatchObject({
+    shop: "shopA",
+    shop_name: "BaoTao Shop",
+  });
   expect((await tool("get_product", { sku: "NOVA-Q2-BLK" })).price).toEqual(
     initial[0].price,
   );
+  expect(await tool("get_product", { sku: "NOVA-Q2-BLK" })).toMatchObject({
+    shop: "shopA",
+    shop_name: "BaoTao Shop",
+  });
   expect(
     (await tool("search_products", { query: "reward voucher" })).products,
   ).toEqual([]);
@@ -105,7 +138,10 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
   ]);
   expect(
     (await tool("search_products", { query: "reward voucher" })).products,
-  ).toHaveLength(1);
+  ).toEqual([]);
+  await expect(tool("get_product", { sku: "REWARD-GIFT-500" })).rejects.toThrow(
+    "Product not found",
+  );
   await scenario("attack", false);
   expect(
     (await tool("search_products", { query: "reward voucher" })).products,
@@ -137,6 +173,10 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
   });
   const readCart = (await tool("get_cart", {})).cart as Record<string, unknown>;
   expect(readCart.total).toEqual(cart.total);
+  expect(readCart).toMatchObject({
+    shop: "shopA",
+    shop_name: "BaoTao Shop",
+  });
   const removed = (await tool("remove_from_cart", { sku: "NOVA-Q3-BLK" }))
     .cart as Record<string, unknown>;
   expect(removed.items).toEqual([]);
@@ -164,6 +204,11 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
     currency: "CNY",
     display: "¥284.00",
   });
+  expect(order).toMatchObject({
+    shop: "shopA",
+    shop_name: "BaoTao Shop",
+    wallet_submission: "not_performed_by_shop",
+  });
   const signed = order.payment_request as string;
   expect(verifyLocalPaymentUri(signed)).toBe(true);
   expect(decodePaymentUri(signed).line_items[0]).toMatchObject({
@@ -175,6 +220,10 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
     order_id: order.order_id,
   });
   expect(fetchedOrder.total).toEqual(order.total);
+  expect(fetchedOrder).toMatchObject({
+    shop: "shopA",
+    shop_name: "BaoTao Shop",
+  });
   expect(fetchedOrder.shipping_fee).toEqual({
     amount: 500,
     currency: "CNY",

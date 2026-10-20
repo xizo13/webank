@@ -1,4 +1,5 @@
 import type { Agent, Approval } from "./flow";
+import { type PaymentReview, parsePaymentReview } from "./paymentReview";
 
 export type LivePayment = {
   payment_id: string;
@@ -6,6 +7,7 @@ export type LivePayment = {
   amount: { amount: number; currency: string };
   merchant: string;
   created_at: string;
+  approval_source?: "owner" | "auto" | null;
 };
 
 export type LiveReceipt = {
@@ -52,10 +54,88 @@ export type PairingSummary = {
   user_code: string;
   client_name: string;
   provider: string;
+  client_app_id?: string | null;
+  client_app_name?: string | null;
   requested_scopes: string[];
   status: "pending" | "approved" | "rejected" | "expired";
   expires_at: string;
   request_number_expires_at: string | null;
+};
+
+export type IdleReauthorizationChallenge = {
+  action: "idle_reauthorize";
+  agent_id: string;
+  action_hash: string;
+  challenge_id: string;
+  challenge: string;
+  expires_at: string;
+  agent_summary: {
+    agent_id: string;
+    display_name: string;
+    client_app_id: string;
+    client_app_name: string;
+    public_key_preview: string;
+    scopes: string[];
+    last_used_at: string;
+    idle_expires_at: string;
+  };
+};
+
+export type TrustEvent = {
+  event_id: string;
+  agent_id: string;
+  kind:
+    | "clean_purchase"
+    | "flag"
+    | "drill_passed"
+    | "drill_failed"
+    | "dispute_reported"
+    | "dispute_upheld"
+    | "transition"
+    | "demo_override";
+  source_id: string;
+  from?: Agent["licence"]["level"];
+  to?: Agent["licence"]["level"];
+  reason: string;
+  occurred_at: string;
+  confirmed_at?: string;
+  audit_hash: string;
+  evidence_hash?: string;
+  chain_tx?: string;
+};
+
+export type LegacyRedEvidence = {
+  kind: "legacy_red";
+  reason: string;
+  created_at: string;
+  audit_ids: string[];
+};
+
+export type TrustEvidence = {
+  items: TrustEvent[];
+  legacy_evidence: LegacyRedEvidence[];
+  next_cursor: null;
+};
+
+export type TrustActionChallenge = {
+  action: "return_to_amber" | "demo_fast_forward_green";
+  agent_id: string;
+  action_hash: string;
+  challenge_id: string;
+  challenge: string;
+  expires_at: string;
+  agent_summary: {
+    agent_id: string;
+    display_name: string;
+    client_app_name?: string | null;
+    public_key_preview?: string;
+    scopes?: string[];
+    level?: Agent["licence"]["level"];
+    flags_30d?: number;
+    drills_failed?: number;
+    reason?: string;
+    latest_evidence_ids?: string[];
+  };
 };
 
 export type GatewaySnapshot = {
@@ -66,6 +146,48 @@ export type GatewaySnapshot = {
 };
 
 export type Money = { amount: number; currency: "CNY" };
+export type EditablePolicyLimits = {
+  per_payment_max: Money;
+  daily_max: Money;
+  monthly_max: Money;
+  auto_approve_below: Money;
+};
+export type OwnerPolicy = EditablePolicyLimits & {
+  schema: "policy.v1";
+  user_id: string;
+  blocked_categories: string[];
+  new_merchant_requires_tap: boolean;
+};
+export type ContractPolicyLimits = {
+  per_payment_max: Money;
+  daily_max: Money;
+  monthly_max: Money;
+  spent_today: Money;
+  spent_month: Money;
+  block_number: string;
+  observed_at: string;
+  next_daily_reset_at: string;
+  next_monthly_reset_at: string;
+};
+export type PolicySnapshot = {
+  policy: OwnerPolicy;
+  policy_hash: string;
+  contract: ContractPolicyLimits | null;
+  sync_status:
+    | "consistent"
+    | "change_pending"
+    | "mismatch"
+    | "chain_unavailable";
+};
+export type PreparedPolicyChange = {
+  change_id: string;
+  action_hash: string;
+  expires_at: string;
+  current: EditablePolicyLimits;
+  proposed: EditablePolicyLimits;
+  requires_verification: boolean;
+  simulated: true;
+};
 export type LiveHome = {
   schema: "home.v1";
   simulated: true;
@@ -349,6 +471,61 @@ export function createGatewayClient(
         );
       return home;
     },
+    policy(): Promise<PolicySnapshot> {
+      return request("/v1/app/policy");
+    },
+    preparePolicyChange(
+      snapshot: PolicySnapshot,
+      proposed: EditablePolicyLimits,
+    ): Promise<PreparedPolicyChange> {
+      if (!snapshot.contract || snapshot.sync_status !== "consistent")
+        throw new Error("Policy and contract caps must be synchronized first.");
+      return request("/v1/app/policy/prepare", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          proposed,
+          expected_policy_hash: snapshot.policy_hash,
+          expected_contract_block: snapshot.contract.block_number,
+          expected_contract_caps: {
+            per_payment_max: snapshot.contract.per_payment_max,
+            daily_max: snapshot.contract.daily_max,
+            monthly_max: snapshot.contract.monthly_max,
+          },
+        }),
+      });
+    },
+    completePolicyChange(
+      change: PreparedPolicyChange,
+      simulatedProof: boolean,
+    ): Promise<PolicySnapshot> {
+      if (simulatedProof) requireLocalDemo();
+      if (
+        !change.change_id ||
+        !/^sha256:[0-9a-fA-F]{64}$/.test(change.action_hash) ||
+        Date.parse(change.expires_at) <= Date.now() ||
+        change.requires_verification !== simulatedProof
+      )
+        throw new Error("Policy change expired or needs a fresh owner review.");
+      return request("/v1/app/policy", {
+        method: "PUT",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": `policy-change-${change.change_id}`,
+        },
+        body: JSON.stringify({
+          change_id: change.change_id,
+          ...(simulatedProof
+            ? {
+                verification: {
+                  action_hash: change.action_hash,
+                  device_signature: "simulated-local-approval",
+                },
+              }
+            : {}),
+        }),
+      });
+    },
     fundingHistory(): Promise<FundingRecord[]> {
       return request<{ items: FundingRecord[] }>(
         "/v1/app/agent-wallet/funding",
@@ -473,7 +650,7 @@ export function createGatewayClient(
         },
       );
     },
-    prepareAgentAction(agentId: string, action: "unfreeze" | "relicense") {
+    prepareAgentAction(agentId: string, action: "unfreeze") {
       return request<{
         action_hash: string;
         challenge_id: string;
@@ -488,6 +665,175 @@ export function createGatewayClient(
         body: JSON.stringify({ action }),
       });
     },
+    trustEvents(agentId: string): Promise<TrustEvidence> {
+      return request(
+        `/v1/app/agents/${encodeURIComponent(agentId)}/trust-events`,
+      );
+    },
+    prepareReturnToAmber(agentId: string): Promise<TrustActionChallenge> {
+      return request(
+        `/v1/app/agents/${encodeURIComponent(agentId)}/prepare-return-to-amber`,
+        {
+          method: "POST",
+          headers: {
+            "Idempotency-Key": mutationKey("prepare-return-to-amber"),
+          },
+        },
+      );
+    },
+    completeSimulatedReturnToAmber(
+      agentId: string,
+      challenge: TrustActionChallenge,
+    ): Promise<{ agent: Agent }> {
+      requireLocalDemo();
+      if (
+        challenge.action !== "return_to_amber" ||
+        challenge.agent_id !== agentId ||
+        challenge.agent_summary.agent_id !== agentId ||
+        !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+        Date.parse(challenge.expires_at) <= Date.now()
+      )
+        throw new Error(
+          "Return to Amber challenge changed or expired. Start again.",
+        );
+      return request(
+        `/v1/app/agents/${encodeURIComponent(agentId)}/return-to-amber`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": mutationKey("return-to-amber"),
+          },
+          body: JSON.stringify({
+            challenge_id: challenge.challenge_id,
+            verification: {
+              action_hash: challenge.action_hash,
+              device_signature: "simulated-local-approval",
+            },
+          }),
+        },
+      );
+    },
+    prepareDemoFastForwardGreen(
+      agentId: string,
+    ): Promise<TrustActionChallenge> {
+      requireLocalDemo();
+      return request(
+        `/v1/app/demo/agents/${encodeURIComponent(agentId)}/prepare-fast-forward-green`,
+        {
+          method: "POST",
+          headers: {
+            "Idempotency-Key": mutationKey("prepare-fast-forward-green"),
+          },
+        },
+      );
+    },
+    completeSimulatedDemoFastForwardGreen(
+      agentId: string,
+      challenge: TrustActionChallenge,
+    ): Promise<{ agent: Agent; trust_event: TrustEvent }> {
+      requireLocalDemo();
+      if (
+        challenge.action !== "demo_fast_forward_green" ||
+        challenge.agent_id !== agentId ||
+        challenge.agent_summary.agent_id !== agentId ||
+        !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+        Date.parse(challenge.expires_at) <= Date.now()
+      )
+        throw new Error(
+          "Demo Green challenge changed or expired. Start again.",
+        );
+      return request(
+        `/v1/app/demo/agents/${encodeURIComponent(agentId)}/fast-forward-green`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": mutationKey("fast-forward-green"),
+          },
+          body: JSON.stringify({
+            simulated: true,
+            challenge_id: challenge.challenge_id,
+            verification: {
+              action_hash: challenge.action_hash,
+              device_signature: "simulated-local-approval",
+            },
+          }),
+        },
+      );
+    },
+    startDemoDrill(): Promise<{ drill_id: string; active: true }> {
+      requireLocalDemo();
+      return request("/v1/app/demo/drills/start", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": mutationKey("demo-drill-start"),
+        },
+        body: "{}",
+      });
+    },
+    demoDrillStatus(): Promise<{ drill_id: string | null; active: boolean }> {
+      requireLocalDemo();
+      return request("/v1/app/demo/drills");
+    },
+    stopDemoDrill(): Promise<{ drill_id: string; active: false }> {
+      requireLocalDemo();
+      return request("/v1/app/demo/drills/stop", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": mutationKey("demo-drill-stop"),
+        },
+        body: "{}",
+      });
+    },
+    prepareIdleReauthorization(
+      agentId: string,
+    ): Promise<IdleReauthorizationChallenge> {
+      return request(
+        `/v1/app/agents/${encodeURIComponent(agentId)}/prepare-idle-reauthorization`,
+        {
+          method: "POST",
+          headers: {
+            "Idempotency-Key": mutationKey("prepare-idle-reauthorization"),
+          },
+        },
+      );
+    },
+    completeSimulatedIdleReauthorization(
+      agentId: string,
+      challenge: IdleReauthorizationChallenge,
+    ): Promise<{ agent: Agent; renewal_expires_at: string }> {
+      requireLocalDemo();
+      if (
+        challenge.action !== "idle_reauthorize" ||
+        challenge.agent_id !== agentId ||
+        challenge.agent_summary.agent_id !== agentId ||
+        !/^sha256:[0-9a-fA-F]{64}$/.test(challenge.action_hash) ||
+        Date.parse(challenge.expires_at) <= Date.now()
+      )
+        throw new Error(
+          "Idle re-approval challenge changed or expired. Start again.",
+        );
+      return request(
+        `/v1/app/agents/${encodeURIComponent(agentId)}/idle-reauthorize`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Idempotency-Key": mutationKey("idle-reauthorize"),
+          },
+          body: JSON.stringify({
+            challenge_id: challenge.challenge_id,
+            verification: {
+              action_hash: challenge.action_hash,
+              device_signature: "simulated-local-approval",
+            },
+          }),
+        },
+      );
+    },
     agentHistory(agentId: string) {
       return request<{
         root_agent_id: string;
@@ -496,7 +842,7 @@ export function createGatewayClient(
     },
     completeSimulatedAgentAction(
       agentId: string,
-      action: "unfreeze" | "relicense",
+      action: "unfreeze",
       challenge: { action_hash: string; challenge_id: string },
     ) {
       requireLocalDemo();
@@ -556,6 +902,13 @@ export function createGatewayClient(
     payment(paymentId: string): Promise<LivePaymentDetail> {
       return request(`/v1/app/payments/${encodeURIComponent(paymentId)}`);
     },
+    async paymentReview(approvalId: string): Promise<PaymentReview> {
+      return parsePaymentReview(
+        await request<unknown>(
+          `/v1/app/approvals/${encodeURIComponent(approvalId)}/review`,
+        ),
+      );
+    },
     async approveSimulated(
       approval: Approval,
       requestNumber?: string,
@@ -614,6 +967,15 @@ function configuredClient() {
 
 export const loadGatewaySnapshot = () => configuredClient().snapshot();
 export const loadGatewayHome = () => configuredClient().home();
+export const loadGatewayPolicy = () => configuredClient().policy();
+export const prepareGatewayPolicyChange = (
+  snapshot: PolicySnapshot,
+  proposed: EditablePolicyLimits,
+) => configuredClient().preparePolicyChange(snapshot, proposed);
+export const completeGatewayPolicyChange = (
+  change: PreparedPolicyChange,
+  simulatedProof: boolean,
+) => configuredClient().completePolicyChange(change, simulatedProof);
 export const loadGatewayFundingHistory = () =>
   configuredClient().fundingHistory();
 export const loadGatewayFunding = (id: string) =>
@@ -638,15 +1000,37 @@ export const loadHumanPayment = (id: string) =>
 export const confirmSimulatedHumanPayment = (
   review: Extract<ScanResult, { kind: "payment" }>,
 ) => configuredClient().confirmSimulatedHumanPayment(review);
-export const prepareGatewayAgentAction = (
+export const prepareGatewayAgentAction = (id: string, action: "unfreeze") =>
+  configuredClient().prepareAgentAction(id, action);
+export const loadGatewayTrustEvents = (id: string) =>
+  configuredClient().trustEvents(id);
+export const prepareGatewayReturnToAmber = (id: string) =>
+  configuredClient().prepareReturnToAmber(id);
+export const completeSimulatedGatewayReturnToAmber = (
   id: string,
-  action: "unfreeze" | "relicense",
-) => configuredClient().prepareAgentAction(id, action);
+  challenge: TrustActionChallenge,
+) => configuredClient().completeSimulatedReturnToAmber(id, challenge);
+export const prepareGatewayDemoFastForwardGreen = (id: string) =>
+  configuredClient().prepareDemoFastForwardGreen(id);
+export const completeSimulatedGatewayDemoFastForwardGreen = (
+  id: string,
+  challenge: TrustActionChallenge,
+) => configuredClient().completeSimulatedDemoFastForwardGreen(id, challenge);
+export const startGatewayDemoDrill = () => configuredClient().startDemoDrill();
+export const stopGatewayDemoDrill = () => configuredClient().stopDemoDrill();
+export const loadGatewayDemoDrillStatus = () =>
+  configuredClient().demoDrillStatus();
+export const prepareGatewayIdleReauthorization = (id: string) =>
+  configuredClient().prepareIdleReauthorization(id);
+export const completeSimulatedGatewayIdleReauthorization = (
+  id: string,
+  challenge: IdleReauthorizationChallenge,
+) => configuredClient().completeSimulatedIdleReauthorization(id, challenge);
 export const loadGatewayAgentHistory = (id: string) =>
   configuredClient().agentHistory(id);
 export const completeSimulatedGatewayAgentAction = (
   id: string,
-  action: "unfreeze" | "relicense",
+  action: "unfreeze",
   challenge: { action_hash: string; challenge_id: string },
 ) => configuredClient().completeSimulatedAgentAction(id, action, challenge);
 export const deleteGatewayAgent = (id: string) =>
@@ -659,6 +1043,8 @@ export const freezeGatewayAgent = (id: string) =>
   configuredClient().freezeAgent(id);
 export const loadGatewayPayment = (id: string) =>
   configuredClient().payment(id);
+export const loadGatewayPaymentReview = (id: string) =>
+  configuredClient().paymentReview(id);
 export const loginLocalDemo = (token: string) =>
   configuredClient().demoLogin(token);
 export const approveLocalDemo = (

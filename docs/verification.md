@@ -3,7 +3,22 @@
 This record separates the default automated gate and opt-in local FISCO evidence recorded on 2026-10-14 from the current operator limits.
 The historical results below do not constitute a fresh full workspace gate for later changes.
 
-## 2026-10-19 source publication checks
+## 2026-10-20 current draft checks
+
+The reviewed implementation source passed TypeScript and Biome checks outside this public checkout.
+Its Gateway suite passed 125 tests, including owner policy cap change cases.
+Its app suite passed 69 tests, including the transfer and policy limit controls.
+An isolated web export passed, but refreshed owner browser acceptance of the transfer and limit screens remains pending.
+The public checkout's 40 Python launcher tests passed, including private Hermes configuration isolation checks.
+Five focused Gateway token tests passed in the reviewed implementation source.
+Both standalone Gateway listeners require an absolute path for a new mode `0600` token file before listening and do not print the token.
+The public checkout has no installed workspace dependencies and has not passed its own full workspace gate or CI for this draft.
+The dedicated zero-tool Nous Research Hermes Agent profile passed a live synthetic smoke test with three decisions.
+That smoke test did not run a signed purchase from the shop through the Gateway and app, so full Guardian acceptance remains pending.
+The real local FISCO owner cap write remains pending acceptance.
+The browser app still uses simulated approval proof, and no iPhone build or on-device test is claimed.
+
+## 2026-10-19 earlier source publication checks
 
 The current product source passed Biome lint across 131 files and TypeScript checks across all 11 workspace projects with a typecheck script.
 Vitest passed 147 tests with three opt-in tests skipped when two suites that bind `127.0.0.1` were excluded.

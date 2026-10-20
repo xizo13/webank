@@ -38,13 +38,18 @@ export function checkMandate(
   request: PaymentRequest,
   merchant: Merchant,
   now: Date,
+  allowPendingCheckout = false,
 ): Check {
   const deny = (reason: string): Check => ({
     name: "mandate",
     result: "deny",
     detail: { reason },
   });
-  if (mandate.status !== "active") return deny(`mandate_${mandate.status}`);
+  if (
+    mandate.status !== "active" &&
+    !(allowPendingCheckout && mandate.status === "pending_checkout")
+  )
+    return deny(`mandate_${mandate.status}`);
   const window = mandate.constraints.find(
     (item) => item.type === "execution_window",
   );
@@ -117,13 +122,6 @@ export function checkMandate(
       productItems.some((item) => !product.skus?.includes(item.sku))
     )
       return deny("sku_mismatch");
-    if (product.brand && product.model && !product.gtin) {
-      const expected = `${product.brand} ${product.model}`.toLowerCase();
-      if (
-        productItems.some((item) => !item.name.toLowerCase().includes(expected))
-      )
-        return deny("product_model_mismatch");
-    }
   }
   return { name: "mandate", result: "pass" };
 }
@@ -151,26 +149,15 @@ export function checkPolicy(
     return deny("currency_mismatch");
   if (policy.blocked_categories.includes(merchant.category))
     return deny("blocked_category");
-  if (agent.licence.level === "SUSPENDED") return deny("licence_suspended");
-  const licenceCap =
-    agent.licence.level === "P" ? 30_000 : Number.MAX_SAFE_INTEGER;
-  const effectiveCap = Math.min(policy.per_payment_max.amount, licenceCap);
-  if (amount > effectiveCap)
-    return deny(
-      amount > policy.per_payment_max.amount
-        ? "per_payment_cap_exceeded"
-        : "licence_cap_exceeded",
-    );
+  if (agent.licence.level === "RED") return deny("licence_suspended");
+  const effectiveCap = policy.per_payment_max.amount;
+  if (amount > effectiveCap) return deny("per_payment_cap_exceeded");
   if (spentToday + amount > policy.daily_max.amount)
     return deny("daily_cap_exceeded");
   if (spentMonth + amount > policy.monthly_max.amount)
     return deny("monthly_cap_exceeded");
   const autoCap =
-    agent.licence.level === "L"
-      ? 0
-      : agent.licence.level === "P"
-        ? Math.min(policy.auto_approve_below.amount, 10_000)
-        : policy.auto_approve_below.amount;
+    agent.licence.level === "GREEN" ? policy.auto_approve_below.amount : 0;
   const requiresTap =
     autoCap === 0 ||
     amount > autoCap ||
@@ -181,8 +168,8 @@ export function checkPolicy(
     detail: {
       effective_cap: effectiveCap,
       auto_approve_cap: autoCap,
-      ...(agent.licence.level === "L"
-        ? { reason: "learner_requires_tap" }
+      ...(agent.licence.level === "AMBER"
+        ? { reason: "amber_requires_tap" }
         : {}),
     },
   };

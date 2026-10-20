@@ -3,8 +3,8 @@ import type { ReactNode } from "react";
 import "./styles.css";
 
 export const metadata = {
-  title: "BaoTaoShop | Simulated storefront",
-  description: "BaoTaoShop simulated storefront for e-CNY payment requests",
+  title: "BaoTao Shop | Simulated storefront",
+  description: "BaoTao Shop simulated storefront for e-CNY payment requests",
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
@@ -19,7 +19,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <span className="brand-mark">
               B<span>·</span>
             </span>
-            <span>BaoTaoShop</span>
+            <span>BaoTao Shop</span>
           </Link>
           <nav aria-label="Main navigation">
             <Link href="/">Shop</Link>
@@ -36,7 +36,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
             <span className="brand-mark">
               B<span>·</span>
             </span>
-            <span>BaoTaoShop</span>
+            <span>BaoTao Shop</span>
           </div>
           <span>Independent mock merchants in this storefront.</span>
           <span>© 2026 demo sandbox</span>

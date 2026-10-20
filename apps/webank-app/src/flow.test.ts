@@ -22,6 +22,27 @@ function connectedAndFunded() {
 }
 
 describe("Agent Wallet demo behavior", () => {
+  it("starts a new agent Amber and blocks Red payment requests", () => {
+    const state = connectedAndFunded();
+    expect(state.agents[0]?.licence.level).toBe("AMBER");
+    const red = {
+      ...state,
+      agents: state.agents.map((agent) => ({
+        ...agent,
+        licence: {
+          ...agent.licence,
+          level: "RED" as const,
+          reason: "Failed drill",
+        },
+      })),
+    };
+    expect(
+      queueFirstPayment(red, now + 2000).approvals.some(
+        (item) => item.kind === "payment",
+      ),
+    ).toBe(false);
+  });
+
   it("gives pairing ten minutes and payment approval three minutes", () => {
     const pairing = queuePairing(enableWallet(initialDemoState()), now);
     expect(Date.parse(pairing.approvals[0]?.expires_at ?? "") - now).toBe(
