@@ -10,6 +10,8 @@ Its Gateway suite passed 125 tests, including owner policy cap change cases.
 Its app suite passed 69 tests, including the transfer and policy limit controls.
 An isolated web export passed, but refreshed owner browser acceptance of the transfer and limit screens remains pending.
 The public checkout's 40 Python launcher tests passed, including private Hermes configuration isolation checks.
+Five focused Gateway token tests passed in the reviewed implementation source.
+Both standalone Gateway listeners require an absolute path for a new mode `0600` token file before listening and do not print the token.
 The public checkout has no installed workspace dependencies and has not passed its own full workspace gate or CI for this draft.
 The dedicated zero-tool Nous Research Hermes Agent profile passed a live synthetic smoke test with three decisions.
 That smoke test did not run a signed purchase from the shop through the Gateway and app, so full Guardian acceptance remains pending.

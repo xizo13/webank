@@ -15,6 +15,10 @@ import {
 import { createGuardianEvaluator } from "@webank/guardian";
 import { createGateway } from "./app.js";
 import { canonicalJson } from "./crypto.js";
+import {
+  requiredLoginTokenPath,
+  writePrivateLoginToken,
+} from "./private-login-token.js";
 import type { GatewayDependencies, Merchant } from "./types.js";
 
 if (
@@ -29,6 +33,7 @@ const host = "127.0.0.1";
 const port = Number(process.env.WEBANK_DEMO_PORT ?? "3002");
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid demo port");
+const tokenFile = requiredLoginTokenPath("WEBANK_DEMO_TOKEN_FILE");
 const loginToken = randomBytes(24).toString("base64url");
 const sessionToken = randomBytes(24).toString("base64url");
 const merchantKeys = generateKeyPairSync("ed25519");
@@ -241,6 +246,8 @@ const pairing = await app.inject({
   payload: {
     client_name: "Demo connector",
     provider: "mock",
+    client_app_id: `app_${createHash("sha256").update("Mock app", "utf8").digest("hex")}`,
+    client_app_name: "Mock app",
     agent_public_key: `p256:${pairingKeys.publicKey.export({ format: "der", type: "spki" }).toString("base64url")}`,
     requested_scopes: ["wallet:pay", "wallet:mandate", "wallet:history:self"],
   },
@@ -248,9 +255,10 @@ const pairing = await app.inject({
 if (pairing.statusCode !== 200)
   throw new Error(`Failed to seed demo pairing: ${pairing.statusCode}`);
 
+await writePrivateLoginToken(tokenFile, loginToken);
 await app.listen({ host, port });
 process.stdout.write(`Mock Gateway listening at http://${host}:${port}\n`);
-process.stdout.write(`Demo login token: ${loginToken}\n`);
+process.stdout.write("Private demo login token file created.\n");
 process.stdout.write(`Demo pairing code: ${pairing.json().user_code}\n`);
 process.stdout.write(
   "All external services and starting records are simulated; approval is disabled.\n",

@@ -59,9 +59,10 @@ The adapter is injected into `createGateway`; it does not implement reservation,
 
 ## Opt-in mock app listener
 
-From the repository root, run `WEBANK_DEMO_SERVER=1 WEBANK_DEMO_APP_ORIGIN=http://127.0.0.1:8081 pnpm --filter @webank/gateway demo` to start a loopback-only fixture at port 3002.
-The process prints an ephemeral login token and pairing code.
-`POST /demo/login` with `Authorization: Bearer <printed-token>` sets an HttpOnly demo session cookie for credentialed browser requests.
+From the repository root, run `WEBANK_DEMO_TOKEN_FILE=/absolute/private/login-token WEBANK_DEMO_SERVER=1 WEBANK_DEMO_APP_ORIGIN=http://127.0.0.1:8081 pnpm --filter @webank/gateway demo` to start a loopback-only fixture at port 3002.
+Set `WEBANK_DEMO_TOKEN_FILE` to an absolute path for a new private file before starting the listener.
+The process creates that file with mode `0600` before listening and prints the pairing code without printing the login token.
+`POST /demo/login` with `Authorization: Bearer <token-from-private-file>` sets an HttpOnly demo session cookie for credentialed browser requests.
 The listener seeds one mock agent, one pending payment approval, and one pairing request so the app can exercise reads, rejection, freeze, and denied-receipt refresh.
 Its merchant, funds reservation, risk, audit anchor, and receipt key are simulated; the Guardian adapter is the real fail-closed module with no API key.
 The listener cannot approve a card or move money and refuses to start in `NODE_ENV=production`.
@@ -79,11 +80,14 @@ Load the ignored local Gateway signer environment, then start from the repositor
 set -a
 . scripts/chain/runtime/gateway.env
 set +a
-WEBANK_LOCAL_DEMO=1 WEBANK_DEMO_APPROVALS=1 SHOP_INTERNAL_TOKEN=local-demo-token corepack pnpm --filter @webank/gateway local-demo
+WEBANK_LOCAL_DEMO=1 WEBANK_DEMO_APPROVALS=1 WEBANK_LOCAL_DEMO_TOKEN_FILE=/absolute/private/login-token SHOP_INTERNAL_TOKEN=local-demo-token corepack pnpm --filter @webank/gateway local-demo
 ```
 
+Set `WEBANK_LOCAL_DEMO_TOKEN_FILE` to an absolute path for a new private file before starting this standalone listener.
+The normal `scripts/local-demo-up.sh` launcher sets that path to `scripts/local-demo-runtime/app-login-token` automatically.
 The listener verifies the shop's merchant identities against the bank-controlled manifest and the FISCO registry before accepting requests.
-It prints the local app login token for `POST /demo/login`; the response sets a local HttpOnly session cookie and explicitly says `simulated: true`.
+It creates the local app login token file with mode `0600` before listening and never prints the token.
+`POST /demo/login` with the token sets a local HttpOnly session cookie and explicitly says `simulated: true`.
 The connector uses the normal OAuth device flow and RFC 9421 P-256 signatures, and Gateway checks the shop's Ed25519-signed payment request.
 Local app approval uses the literal `simulated-local-approval` proof, records the mandate source as `demo_simulation`, and is not a biometric or bank-verifiable approval.
 The funds reservation and risk signal are local simulations; Guardian uses fail-closed owner step-up unless an operator has configured and verified the dedicated local Hermes profile.

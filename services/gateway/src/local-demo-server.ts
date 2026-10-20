@@ -1,9 +1,12 @@
 import { existsSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
-import { isAbsolute } from "node:path";
+import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { type ChainAddresses, connectFisco } from "@webank/chain";
 import { createLocalDemoGateway } from "./local-demo.js";
+import {
+  requiredLoginTokenPath,
+  writePrivateLoginToken,
+} from "./private-login-token.js";
 import { installGatewayShutdown } from "./shutdown.js";
 
 if (
@@ -16,6 +19,7 @@ const host = "127.0.0.1";
 const port = Number(process.env.WEBANK_LOCAL_DEMO_PORT ?? "3002");
 if (!Number.isInteger(port) || port < 1 || port > 65535)
   throw new Error("Invalid local demo port");
+const tokenFile = requiredLoginTokenPath("WEBANK_LOCAL_DEMO_TOKEN_FILE");
 const rpcUrl = process.env.FISCO_RPC_URL ?? "http://127.0.0.1:8545";
 const rpc = new URL(rpcUrl);
 if (
@@ -77,18 +81,11 @@ const { app, loginToken } = await createLocalDemoGateway({
       ),
     ),
 });
+await writePrivateLoginToken(tokenFile, loginToken);
 await app.listen({ host, port });
 installGatewayShutdown(app);
 process.stdout.write(`SIMULATED local Gateway at http://${host}:${port}\n`);
-const tokenFile = process.env.WEBANK_LOCAL_DEMO_TOKEN_FILE;
-if (tokenFile) {
-  if (!isAbsolute(tokenFile))
-    throw new Error("WEBANK_LOCAL_DEMO_TOKEN_FILE must be absolute");
-  await writeFile(tokenFile, `${loginToken}\n`, { flag: "wx", mode: 0o600 });
-  process.stdout.write(`Private local app token file: ${tokenFile}\n`);
-} else {
-  process.stdout.write(`Private local app token: ${loginToken}\n`);
-}
+process.stdout.write("Private local app token file created.\n");
 process.stdout.write(
   "Approval proof is simulated. FISCO transactions use local test tokens only.\n",
 );
