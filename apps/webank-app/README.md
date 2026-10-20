@@ -35,6 +35,9 @@ Returning wallet balance to the main account, spending-limit changes that only l
 None of these is a bank-verifiable biometric action.
 Delete confirms the named agent and retains history.
 In Gateway mode, Home and Wallet read the simulated main-account and separate Agent Wallet balances from `GET /v1/app/home` with a chain block and observation time.
+After a fresh local deployment, Home and Wallet show the Agent Wallet as off until the signed-in owner completes its one-time enable review.
+The local web review uses a visibly simulated owner proof and does not perform Face ID or Secure Enclave signing.
+Funding, pairing, and spending remain blocked by the Gateway while the wallet is off.
 Stale or unavailable readings disable funding and sweep actions.
 The Wallet screen includes the owner's spending-limit controls, which read and change policy through the Gateway.
 Editing is available only while the saved policy and the observed contract caps agree; a mismatch, an unreadable cap, or a pending change keeps the editor locked.

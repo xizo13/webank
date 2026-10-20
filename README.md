@@ -9,9 +9,9 @@ All merchants and currency in this repository are simulated, and no real funds m
 | Area | Current behavior |
 | --- | --- |
 | Expo app | Browser walkthrough by default; explicit loopback web mode reads simulated balances and Gateway state and submits visibly simulated local approvals; an iOS development build has not been verified. |
-| Shops | Local Next.js storefront and Shop MCP tools with mock products, carts, orders, and Ed25519-signed payment requests. |
+| Shops | Local Next.js storefront and Shop MCP tools with mock products, carts, orders, Ed25519-signed payment requests, and separate authenticated operator controls. |
 | Connector | Nine stdio MCP tools with a separate self-reported client-app identity, device-code pairing, user-intent mandate proposal before shopping, local P-256 key, scoped tokens, and signed agent requests. |
-| Gateway | Fastify payment and pairing logic with scoped agent authentication, replay protection, attended purchase approval, Amber/Green/Red trust rules, optional fixed-call Guardian review, receipts, audit records, and an opt-in loopback FISCO composition. |
+| Gateway | Fastify payment and pairing logic with scoped agent authentication, replay protection, owner wallet enablement, attended purchase approval, Amber/Green/Red trust rules, optional fixed-call Guardian review, a read-only local Bank Console, receipts, audit records, and an opt-in loopback FISCO composition. |
 | Chain | Five Solidity demo contracts and a viem adapter tested against a local non-SM FISCO BCOS v3.17.1 chain. |
 | Treasurer | Separate in-memory proposal, funding, and monitor simulation; it is not connected to live bank accounts or chain settlement. |
 
@@ -21,6 +21,9 @@ The completed payment path was a CLI run, not a live Claude shopping session or 
 The separate limited Gateway fixture supports read, reject, and freeze demonstrations but cannot approve a card or move money.
 The owner transfer and policy limit controls are built in the browser app and Gateway, with simulated owner approval in the local demo.
 A real local FISCO cap write and refreshed owner browser acceptance of those controls remain pending.
+The source includes a recording-stage command and a state-changing Hermes and FISCO acceptance driver for a separate disposable stack.
+That driver completed a signed shop-to-app run: an Amber purchase showed one owner card, a Green ¥77.00 purchase settled on FISCO without a card, and Hermes denied a contradictory signed order without a wallet debit.
+The run used simulated currency, merchants, and owner approval proof, and it did not involve a live Claude shopping session.
 
 ## Current owner controls
 
@@ -33,7 +36,7 @@ Green agents can auto-pay only within the owner's threshold after every determin
 Red agents cannot spend, and a separate owner freeze overrides every trust light.
 An unattended or standing mandate can need approval when it is created.
 The local demo can use a dedicated Nous Research Hermes Agent profile for one fixed Guardian review call, with no tools or carried conversation.
-That zero-tool profile passed a live synthetic smoke test, and the full signed shop-to-app Guardian flow remains pending acceptance.
+That zero-tool profile passed a live synthetic smoke test and the signed local shop-to-app acceptance run described above.
 The path fails closed to owner review when Hermes or its isolation proof is unavailable.
 
 ## Requirements and checks
@@ -59,6 +62,7 @@ The launcher does not install dependencies or open a browser.
 The web approval is explicitly simulated, while the contract deployment and test-token payment use real transactions on the local permissioned chain.
 The loopback Gateway keeps its private session, grants, mandates, payments, and receipt identity across an ordinary restart.
 A fresh native deployment mints 866,000 fen to the simulated main account and begins with zero Agent Wallet balance, so the owner must fund the wallet in the app before creating a spending mandate.
+The fresh Agent Wallet starts disabled and requires the signed-in owner's visibly simulated enable action before pairing or funding.
 The [operator guide](scripts/local-demo-README.md) covers reset preflight, private archives, and recovery after a failed fresh start.
 
 The individual components can also be explored separately.
@@ -71,10 +75,11 @@ corepack pnpm --filter @webank/webank-app web
 Start the mock storefront on loopback:
 
 ```sh
-SHOP_INTERNAL_TOKEN=local-demo-token corepack pnpm --filter @webank/shops exec next dev --hostname 127.0.0.1 --port 3001
+SHOP_INTERNAL_TOKEN=local-demo-token SHOP_OPERATOR_TOKEN=separate-local-operator-token corepack pnpm --filter @webank/shops exec next dev --hostname 127.0.0.1 --port 3001
 ```
 
 The storefront is at `http://127.0.0.1:3001`, with local demo controls at `/demo`.
+The `/demo` price and scenario actions require the separate local operator token.
 The app's default simulation does not call this storefront or the chain.
 See the [app](apps/webank-app/README.md), [shop](apps/shops/README.md), [Gateway](services/gateway/README.md), and [connector](agents/connector-mcp/README.md) READMEs for each separate mode.
 

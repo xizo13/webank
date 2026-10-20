@@ -61,6 +61,7 @@ import {
   completeSimulatedGatewayDemoFastForwardGreen,
   completeSimulatedGatewayIdleReauthorization,
   completeSimulatedGatewayReturnToAmber,
+  completeSimulatedGatewayWalletEnable,
   confirmSimulatedHumanPayment,
   deleteGatewayAgent,
   denyGatewayPairing,
@@ -99,6 +100,7 @@ import {
   prepareGatewayIdleReauthorization,
   prepareGatewayPolicyChange,
   prepareGatewayReturnToAmber,
+  prepareGatewayWalletEnable,
   rejectGatewayApproval,
   type ScanResult,
   type SweepRecord,
@@ -338,6 +340,7 @@ export default function App() {
   const [homeError, setHomeError] = useState("");
   const [homeSyncedAt, setHomeSyncedAt] = useState<number | null>(null);
   const [homeLoading, setHomeLoading] = useState(false);
+  const [walletEnableBusy, setWalletEnableBusy] = useState(false);
   const [livePolicy, setLivePolicy] = useState<PolicySnapshot | null>(null);
   const latestPolicy = useRef<PolicySnapshot | null>(null);
   const [policyError, setPolicyError] = useState("");
@@ -554,6 +557,44 @@ export default function App() {
       // Keep uncertain sweep state until a successful history read.
     }
   }, [isLive, sweepAttemptAt, sweepInFlight]);
+
+  const beginWalletEnable = async () => {
+    if (!isLive || !isLocalDemo || !demoAuthenticated || walletEnableBusy)
+      return setHomeError("Sign in to the local demo to enable Agent Wallet.");
+    setWalletEnableBusy(true);
+    setHomeError("");
+    try {
+      const challenge = await prepareGatewayWalletEnable();
+      setPendingSimulation({
+        label:
+          "Enable Agent Wallet for this WeBank account. This local demo uses a simulated owner proof; no Face ID or Secure Enclave signing occurs.",
+        expiresAt: challenge.expires_at,
+        run: () => {
+          void (async () => {
+            setWalletEnableBusy(true);
+            try {
+              await completeSimulatedGatewayWalletEnable(challenge);
+              await refreshWallet();
+            } catch (error) {
+              setHomeError(
+                error instanceof Error
+                  ? `${error.message} Refresh the wallet state before trying again.`
+                  : "Wallet enablement was not confirmed. Refresh the wallet state.",
+              );
+            } finally {
+              setWalletEnableBusy(false);
+            }
+          })();
+        },
+      });
+    } catch (error) {
+      setHomeError(
+        error instanceof Error ? error.message : "Wallet enable review failed.",
+      );
+    } finally {
+      setWalletEnableBusy(false);
+    }
+  };
 
   const refreshPolicy = useCallback(async () => {
     if (!isLive) return;
@@ -2888,7 +2929,9 @@ export default function App() {
                     title="Agent Wallet"
                     right={
                       isLive
-                        ? balanceState.toUpperCase()
+                        ? liveHome?.agent_wallet.enabled === false
+                          ? "OFF"
+                          : balanceState.toUpperCase()
                         : demo.enabled
                           ? "ACTIVE"
                           : "SETUP"
@@ -2903,7 +2946,9 @@ export default function App() {
                         <Text style={styles.walletAmount}>
                           {walletBalance === undefined
                             ? "Unavailable"
-                            : formatMoney(walletBalance)}
+                            : isLive && liveHome?.agent_wallet.enabled === false
+                              ? "Not enabled"
+                              : formatMoney(walletBalance)}
                         </Text>
                       </View>
                       <View style={styles.purpleCircle}>
@@ -2922,7 +2967,22 @@ export default function App() {
                         available
                       </Text>
                     ) : null}
-                    {demo.enabled || isLive ? (
+                    {isLive && liveHome?.agent_wallet.enabled === false ? (
+                      <>
+                        <Button
+                          testID="enable-wallet"
+                          disabled={
+                            walletEnableBusy || Boolean(pendingSimulation)
+                          }
+                          onPress={() => void beginWalletEnable()}
+                        >
+                          Enable Agent Wallet
+                        </Button>
+                        {homeError ? (
+                          <Text style={styles.finePrint}>{homeError}</Text>
+                        ) : null}
+                      </>
+                    ) : demo.enabled || isLive ? (
                       <Button
                         testID="open-wallet"
                         onPress={() => setTab("wallet")}
@@ -3032,7 +3092,9 @@ export default function App() {
                     <Text style={styles.walletHeroAmount}>
                       {walletBalance === undefined
                         ? "Unavailable"
-                        : formatMoney(walletBalance)}
+                        : isLive && liveHome?.agent_wallet.enabled === false
+                          ? "Not enabled"
+                          : formatMoney(walletBalance)}
                     </Text>
                     <Text style={styles.walletHeroFoot}>
                       Separate from your main account
@@ -3085,197 +3147,233 @@ export default function App() {
                       {homeLoading && !liveHome ? (
                         <ActivityIndicator color={colors.purple} />
                       ) : null}
-                      <SectionTitle
-                        kicker="MOVE MONEY"
-                        title="Transfer between accounts"
-                      />
-                      <TransferControl
-                        direction={transfer.direction}
-                        amountInput={transfer.amountInput}
-                        sourceBalanceFen={
-                          liveBalanceUsable && liveHome
-                            ? transfer.direction === "fund"
-                              ? liveHome.main_account.balance.amount
-                              : liveHome.agent_wallet.available.amount
-                            : null
-                        }
-                        busy={transferActionsBlocked(
-                          fundingBusy,
-                          fundingInFlight,
-                          sweepInFlight,
-                        )}
-                        reviewDisabled={
-                          transfer.direction === "fund" && !isLocalDemo
-                        }
-                        onReverse={() => {
-                          if (
-                            transferActionsBlocked(
+                      {liveHome?.agent_wallet.enabled === false ? (
+                        <View style={styles.notice}>
+                          <Text style={styles.noticeTitle}>
+                            AGENT WALLET OFF
+                          </Text>
+                          <Text style={styles.noticeText}>
+                            Enable this separate spending pot before connecting
+                            an agent or moving money into it.
+                          </Text>
+                          <Button
+                            testID="enable-wallet-from-wallet"
+                            disabled={
+                              walletEnableBusy || Boolean(pendingSimulation)
+                            }
+                            onPress={() => void beginWalletEnable()}
+                          >
+                            Enable Agent Wallet
+                          </Button>
+                          {homeError ? (
+                            <Text style={styles.noticeText}>{homeError}</Text>
+                          ) : null}
+                        </View>
+                      ) : (
+                        <>
+                          <SectionTitle
+                            kicker="MOVE MONEY"
+                            title="Transfer between accounts"
+                          />
+                          <TransferControl
+                            direction={transfer.direction}
+                            amountInput={transfer.amountInput}
+                            sourceBalanceFen={
+                              liveBalanceUsable && liveHome
+                                ? transfer.direction === "fund"
+                                  ? liveHome.main_account.balance.amount
+                                  : liveHome.agent_wallet.available.amount
+                                : null
+                            }
+                            busy={transferActionsBlocked(
                               fundingBusy,
                               fundingInFlight,
                               sweepInFlight,
-                            )
-                          )
-                            return;
-                          transferEditVersion.current += 1;
-                          setTransfer((current) =>
-                            reverseTransfer(
-                              current,
-                              liveBalanceUsable && liveHome
-                                ? liveHome.agent_wallet.available.amount
-                                : null,
-                            ),
-                          );
-                          setPendingSimulation((pending) =>
-                            pending?.fundingId ? null : pending,
-                          );
-                          setFundingMessage("");
-                        }}
-                        onAmountChange={(value) => {
-                          transferEditVersion.current += 1;
-                          setTransfer((current) =>
-                            editTransferAmount(current, value),
-                          );
-                          setPendingSimulation((pending) =>
-                            pending?.fundingId ? null : pending,
-                          );
-                        }}
-                        onReview={() =>
-                          transfer.direction === "fund"
-                            ? void startFundingReview()
-                            : startReturnReview()
-                        }
-                      />
-                      {!isLocalDemo && transfer.direction === "fund" ? (
-                        <Text style={styles.finePrint}>
-                          Funding requires local simulated owner confirmation. A
-                          production biometric signing key is not connected.
-                        </Text>
-                      ) : null}
-                      {transfer.direction === "fund" &&
-                      transfer.fundingReview ? (
-                        <View testID="funding-review" style={styles.card}>
-                          <Text style={styles.cardTitle}>Review transfer</Text>
-                          <InfoRow label="From" value="WeBank main account" />
-                          <InfoRow label="To" value="Agent Wallet" />
-                          <Text selectable style={styles.finePrint}>
-                            Destination{" "}
-                            {
-                              transfer.fundingReview.challenge
-                                .destination_address
-                            }
-                          </Text>
-                          <InfoRow
-                            label="Amount"
-                            value={formatMoney(
-                              transfer.fundingReview.amountFen,
                             )}
-                            last
+                            reviewDisabled={
+                              transfer.direction === "fund" && !isLocalDemo
+                            }
+                            onReverse={() => {
+                              if (
+                                transferActionsBlocked(
+                                  fundingBusy,
+                                  fundingInFlight,
+                                  sweepInFlight,
+                                )
+                              )
+                                return;
+                              transferEditVersion.current += 1;
+                              setTransfer((current) =>
+                                reverseTransfer(
+                                  current,
+                                  liveBalanceUsable && liveHome
+                                    ? liveHome.agent_wallet.available.amount
+                                    : null,
+                                ),
+                              );
+                              setPendingSimulation((pending) =>
+                                pending?.fundingId ? null : pending,
+                              );
+                              setFundingMessage("");
+                            }}
+                            onAmountChange={(value) => {
+                              transferEditVersion.current += 1;
+                              setTransfer((current) =>
+                                editTransferAmount(current, value),
+                              );
+                              setPendingSimulation((pending) =>
+                                pending?.fundingId ? null : pending,
+                              );
+                            }}
+                            onReview={() =>
+                              transfer.direction === "fund"
+                                ? void startFundingReview()
+                                : startReturnReview()
+                            }
                           />
-                          <Text style={styles.finePrint}>
-                            This review expires{" "}
-                            {new Date(
-                              transfer.fundingReview.challenge.expires_at,
-                            ).toLocaleTimeString()}
-                            .
-                          </Text>
-                          <Button
-                            testID="confirm-funding"
-                            disabled={
-                              fundingBusy ||
-                              !liveBalanceUsable ||
-                              Boolean(fundingInFlight || sweepInFlight) ||
-                              Date.parse(
-                                transfer.fundingReview.challenge.expires_at,
-                              ) <= clock
-                            }
-                            onPress={confirmFunding}
-                          >
-                            Confirm with simulated biometric
-                          </Button>
-                          <Button
-                            tone="ghost"
-                            onPress={() =>
-                              setTransfer((current) => ({
-                                ...current,
-                                fundingReview: null,
-                              }))
-                            }
-                          >
-                            Cancel
-                          </Button>
-                        </View>
-                      ) : null}
-                      {transfer.direction === "return" &&
-                      transfer.returnReviewFen !== null ? (
-                        <View testID="return-review" style={styles.card}>
-                          <Text style={styles.cardTitle}>Review return</Text>
-                          <InfoRow
-                            label="From"
-                            value="Agent Wallet available funds"
-                          />
-                          <InfoRow label="To" value="WeBank main account" />
-                          <InfoRow
-                            label="Amount"
-                            value={formatMoney(transfer.returnReviewFen)}
-                            last
-                          />
-                          <Text style={styles.finePrint}>
-                            This reduces the money available to agents. It uses
-                            your owner session and needs no biometric proof.
-                          </Text>
-                          <Button
-                            testID="confirm-sweep"
-                            disabled={
-                              !liveBalanceUsable ||
-                              fundingBusy ||
-                              Boolean(fundingInFlight || sweepInFlight) ||
-                              !liveHome ||
-                              transfer.returnReviewFen >
-                                liveHome.agent_wallet.available.amount
-                            }
-                            onPress={() => void confirmSweep()}
-                          >
-                            Confirm return
-                          </Button>
-                          <Button
-                            tone="ghost"
-                            onPress={() =>
-                              setTransfer((current) => ({
-                                ...current,
-                                returnReviewFen: null,
-                              }))
-                            }
-                          >
-                            Cancel
-                          </Button>
-                        </View>
-                      ) : null}
-                      {fundingMessage ? (
-                        <View style={styles.notice}>
-                          <Text style={styles.noticeText}>
-                            {fundingMessage}
-                          </Text>
-                        </View>
-                      ) : null}
-                      {fundingInFlight ? (
-                        <Text style={styles.finePrint}>
-                          Funding {fundingInFlight}: awaiting confirmed chain
-                          evidence or reconciliation.
-                        </Text>
-                      ) : null}
-                      {sweepInFlight ? (
-                        <Text style={styles.finePrint}>
-                          Return {sweepInFlight}: awaiting confirmed chain
-                          evidence or reconciliation.
-                        </Text>
-                      ) : null}
-                      {sweepResult ? (
-                        <Text style={styles.finePrint}>
-                          Return {sweepResult.sweep_id}: {sweepResult.status}.{" "}
-                          {sweepResult.chain.tx_hash ??
-                            "Awaiting chain evidence"}
-                        </Text>
-                      ) : null}
+                          {!isLocalDemo && transfer.direction === "fund" ? (
+                            <Text style={styles.finePrint}>
+                              Funding requires local simulated owner
+                              confirmation. A production biometric signing key
+                              is not connected.
+                            </Text>
+                          ) : null}
+                          {transfer.direction === "fund" &&
+                          transfer.fundingReview ? (
+                            <View testID="funding-review" style={styles.card}>
+                              <Text style={styles.cardTitle}>
+                                Review transfer
+                              </Text>
+                              <InfoRow
+                                label="From"
+                                value="WeBank main account"
+                              />
+                              <InfoRow label="To" value="Agent Wallet" />
+                              <Text selectable style={styles.finePrint}>
+                                Destination{" "}
+                                {
+                                  transfer.fundingReview.challenge
+                                    .destination_address
+                                }
+                              </Text>
+                              <InfoRow
+                                label="Amount"
+                                value={formatMoney(
+                                  transfer.fundingReview.amountFen,
+                                )}
+                                last
+                              />
+                              <Text style={styles.finePrint}>
+                                This review expires{" "}
+                                {new Date(
+                                  transfer.fundingReview.challenge.expires_at,
+                                ).toLocaleTimeString()}
+                                .
+                              </Text>
+                              <Button
+                                testID="confirm-funding"
+                                disabled={
+                                  fundingBusy ||
+                                  !liveBalanceUsable ||
+                                  Boolean(fundingInFlight || sweepInFlight) ||
+                                  Date.parse(
+                                    transfer.fundingReview.challenge.expires_at,
+                                  ) <= clock
+                                }
+                                onPress={confirmFunding}
+                              >
+                                Confirm with simulated biometric
+                              </Button>
+                              <Button
+                                tone="ghost"
+                                onPress={() =>
+                                  setTransfer((current) => ({
+                                    ...current,
+                                    fundingReview: null,
+                                  }))
+                                }
+                              >
+                                Cancel
+                              </Button>
+                            </View>
+                          ) : null}
+                          {transfer.direction === "return" &&
+                          transfer.returnReviewFen !== null ? (
+                            <View testID="return-review" style={styles.card}>
+                              <Text style={styles.cardTitle}>
+                                Review return
+                              </Text>
+                              <InfoRow
+                                label="From"
+                                value="Agent Wallet available funds"
+                              />
+                              <InfoRow label="To" value="WeBank main account" />
+                              <InfoRow
+                                label="Amount"
+                                value={formatMoney(transfer.returnReviewFen)}
+                                last
+                              />
+                              <Text style={styles.finePrint}>
+                                This reduces the money available to agents. It
+                                uses your owner session and needs no biometric
+                                proof.
+                              </Text>
+                              <Button
+                                testID="confirm-sweep"
+                                disabled={
+                                  !liveBalanceUsable ||
+                                  fundingBusy ||
+                                  Boolean(fundingInFlight || sweepInFlight) ||
+                                  !liveHome ||
+                                  transfer.returnReviewFen >
+                                    liveHome.agent_wallet.available.amount
+                                }
+                                onPress={() => void confirmSweep()}
+                              >
+                                Confirm return
+                              </Button>
+                              <Button
+                                tone="ghost"
+                                onPress={() =>
+                                  setTransfer((current) => ({
+                                    ...current,
+                                    returnReviewFen: null,
+                                  }))
+                                }
+                              >
+                                Cancel
+                              </Button>
+                            </View>
+                          ) : null}
+                          {fundingMessage ? (
+                            <View style={styles.notice}>
+                              <Text style={styles.noticeText}>
+                                {fundingMessage}
+                              </Text>
+                            </View>
+                          ) : null}
+                          {fundingInFlight ? (
+                            <Text style={styles.finePrint}>
+                              Funding {fundingInFlight}: awaiting confirmed
+                              chain evidence or reconciliation.
+                            </Text>
+                          ) : null}
+                          {sweepInFlight ? (
+                            <Text style={styles.finePrint}>
+                              Return {sweepInFlight}: awaiting confirmed chain
+                              evidence or reconciliation.
+                            </Text>
+                          ) : null}
+                          {sweepResult ? (
+                            <Text style={styles.finePrint}>
+                              Return {sweepResult.sweep_id}:{" "}
+                              {sweepResult.status}.{" "}
+                              {sweepResult.chain.tx_hash ??
+                                "Awaiting chain evidence"}
+                            </Text>
+                          ) : null}
+                        </>
+                      )}
                       <SectionTitle
                         kicker="VERIFIED TRANSFERS"
                         title="Funding history"

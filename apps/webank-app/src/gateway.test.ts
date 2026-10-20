@@ -14,6 +14,43 @@ const json = (value: unknown, status = 200) =>
   });
 
 describe("Gateway app client", () => {
+  it("uses an exact short owner challenge for local wallet enablement", async () => {
+    const challenge = {
+      challenge_id: "wch_one",
+      action_hash: `sha256:${"a".repeat(64)}`,
+      expires_at: new Date(Date.now() + 60_000).toISOString(),
+      simulated: true,
+    };
+    const calls: Array<{ path: string; init: RequestInit }> = [];
+    const fetcher = vi.fn(
+      async (input: string | URL | Request, init: RequestInit = {}) => {
+        const path = new URL(String(input)).pathname;
+        calls.push({ path, init });
+        if (path.endsWith("/prepare")) return json(challenge);
+        if (path.endsWith("/enable"))
+          return json({ enabled: true, simulated: true });
+        throw new Error(`Unexpected ${path}`);
+      },
+    ) as unknown as typeof fetch;
+    const client = createGatewayClient("http://127.0.0.1:3002", fetcher, true);
+    const prepared = await client.prepareWalletEnable();
+    await client.completeWalletEnable(prepared);
+    expect(calls.map((item) => item.path)).toEqual([
+      "/v1/app/agent-wallet/enable/prepare",
+      "/v1/app/agent-wallet/enable",
+    ]);
+    expect(calls[1]?.init.headers).toMatchObject({
+      "Idempotency-Key": "wallet-enable-wch_one",
+    });
+    expect(JSON.parse(String(calls[1]?.init.body))).toEqual({
+      challenge_id: "wch_one",
+      verification: {
+        action_hash: challenge.action_hash,
+        device_signature: "simulated-local-wallet-enable",
+      },
+    });
+  });
+
   const approval = (kind: Approval["kind"] = "payment"): Approval => ({
     approval_id: "apr_local",
     kind,
@@ -604,6 +641,7 @@ describe("Gateway app client", () => {
             simulated: true,
             main_account: { balance: { amount: 866000, currency: "CNY" } },
             agent_wallet: {
+              enabled: true,
               balance: { amount: 0, currency: "CNY" },
               reserved: { amount: 0, currency: "CNY" },
               available: { amount: 0, currency: "CNY" },
@@ -729,6 +767,7 @@ describe("Gateway app client", () => {
           simulated: true,
           main_account: { balance: { amount: 866000, currency: "CNY" } },
           agent_wallet: {
+            enabled: true,
             balance: { amount: 0, currency: "CNY" },
             reserved: { amount: 0, currency: "CNY" },
             available: { amount: 0, currency: "CNY" },

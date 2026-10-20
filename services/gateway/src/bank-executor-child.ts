@@ -22,6 +22,7 @@ import {
   applyAuditedPolicyCaps,
   assertAuditedPolicyIntent,
 } from "./bank-policy-intent.js";
+import { isActiveFundedDeployment } from "./funded-deployment.js";
 import { trustOrdinal } from "./trust-light.js";
 
 const expectedState = fileURLToPath(
@@ -76,11 +77,13 @@ const addresses = JSON.parse(readFileSync(addressesPath, "utf8")) as {
   licenceRegistry: `0x${string}`;
   auditAnchor: `0x${string}`;
   migration?: { state: string };
+  deploymentFingerprint?: string;
+  txHashes?: Record<string, string>;
 };
 if (
   addresses.chainId !== 20200 ||
   addresses.rpcUrl !== "http://127.0.0.1:8545" ||
-  addresses.migration?.state !== "active"
+  !isActiveFundedDeployment(addresses)
 )
   throw new Error("Funding deployment is not active");
 const expectedDeployment = JSON.stringify({

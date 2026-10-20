@@ -3,7 +3,23 @@
 This record separates the default automated gate and opt-in local FISCO evidence recorded on 2026-10-14 from the current operator limits.
 The historical results below do not constitute a fresh full workspace gate for later changes.
 
-## 2026-10-20 current draft checks
+## 2026-10-20 section-6 review branch checks
+
+The public review branch passed 62 Python launcher tests, including recording-stage preflight, chain-readback retry, and state isolation cases.
+The copied shop source passed its TypeScript check and 20 tests in the implementation workspace; three of those tests validate the Hermes acceptance driver's configuration without running its state-changing flow.
+The copied browser app source passed its TypeScript check and 70 tests in the implementation workspace.
+The updated connector mandate-flow fixture passed two tests in the implementation workspace.
+The copied Gateway source passed its TypeScript check and 160 tests in the implementation workspace, with the opt-in live FISCO test skipped.
+The copied Guardian source passed its TypeScript check and 28 focused tests, including six red-team cases, in the implementation workspace.
+The copied shared contracts passed their TypeScript check and 16 tests in the implementation workspace.
+The signed shop-to-app acceptance driver passed on a separate local FISCO stack with a live zero-tool Hermes profile.
+The run showed one Amber owner card, a Green ¥77.00 auto-payment with a verified FISCO transaction and no card, and a contradictory signed order denied by Hermes without a wallet debit.
+The Bank Console, shop order, Gateway status, and wallet readings agreed for that run.
+That acceptance used simulated currency, merchants, and owner proof; it did not test a live Claude shopping session or native biometric signing.
+This review branch has not passed a fresh dependency install, full workspace gate, or CI.
+No iPhone build or bank-verifiable biometric approval is claimed.
+
+## 2026-10-20 earlier owner-control checks
 
 The reviewed implementation source passed TypeScript and Biome checks outside this public checkout.
 Its Gateway suite passed 125 tests, including owner policy cap change cases.
@@ -13,8 +29,8 @@ The public checkout's 40 Python launcher tests passed, including private Hermes 
 Five focused Gateway token tests passed in the reviewed implementation source.
 Both standalone Gateway listeners require an absolute path for a new mode `0600` token file before listening and do not print the token.
 The public checkout has no installed workspace dependencies and has not passed its own full workspace gate or CI for this draft.
-The dedicated zero-tool Nous Research Hermes Agent profile passed a live synthetic smoke test with three decisions.
-That smoke test did not run a signed purchase from the shop through the Gateway and app, so full Guardian acceptance remains pending.
+At that earlier checkpoint, the dedicated zero-tool Nous Research Hermes Agent profile had passed a live synthetic smoke test with three decisions.
+The later signed shop-to-app acceptance above supersedes that earlier gap.
 The real local FISCO owner cap write remains pending acceptance.
 The browser app still uses simulated approval proof, and no iPhone build or on-device test is claimed.
 

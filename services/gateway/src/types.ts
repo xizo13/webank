@@ -115,6 +115,14 @@ export interface GatewayDependencies {
   authenticateBankOperator?(request: FastifyRequest): Promise<boolean>;
   demoTrustControlsEnabled?: true;
   walletFunding?: WalletFundingRail;
+  /** Fresh local demo owner state starts disabled; old snapshots remain enabled. */
+  initialWalletEnabled?: boolean;
+  /** Registered owner proof verifier; local loopback demo labels its proof simulated. */
+  verifyWalletEnableProof?(
+    actionHash: string,
+    verification: unknown,
+    userId: string,
+  ): Promise<boolean>;
   /** Production must provide a bank-backed proof verifier; local demo uses an explicit simulated proof. */
   verifyFundingProof?(
     actionHash: string,
@@ -161,6 +169,13 @@ export interface GatewayDependencies {
     ownerAutoApproveBelow: number;
   }): Promise<RiskAssessment>;
   evaluateGuardian(input: GuardianInput): Promise<GuardianVerdict>;
+  /** Named only when the configured evaluator actually uses Hermes. */
+  guardianSource?: "Hermes";
+  /** Read a verified payment receipt's exact block for the local display. */
+  getPaymentBlock?(paymentTx: `0x${string}`): Promise<bigint>;
+  /** Read-only recording display is opt-in and never grants authority. */
+  bankConsoleEnabled?: true;
+  consoleSimulationPath?: string;
   /** Read-only simulation of the exact wallet payment before creating a composite card. */
   preflightPayment?(input: {
     paymentId: string;

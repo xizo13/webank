@@ -7,6 +7,7 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { NextRequest } from "next/server";
 import { afterAll, beforeAll, expect, it } from "vitest";
 import { GET, POST } from "../app/api/shop/route";
+import { POST as demoControl } from "../app/internal/demo-control/route";
 import { POST as setDrillVisibility } from "../app/internal/drill-visibility/route";
 import { decodePaymentUri, verifyLocalPaymentUri } from "../lib/signing";
 import { resetDemo } from "../lib/store";
@@ -20,6 +21,7 @@ let baseUrl: string;
 beforeAll(async () => {
   process.env.SHOP_DATA_DIR = dataDir;
   process.env.SHOP_INTERNAL_TOKEN = "isolated-test-shop-token";
+  process.env.SHOP_OPERATOR_TOKEN = "isolated-test-operator-token";
   resetDemo({ clearDrill: true });
   httpServer = createServer(async (incoming, outgoing) => {
     const body: Buffer[] = [];
@@ -33,7 +35,9 @@ beforeAll(async () => {
       incoming.method === "POST"
         ? incoming.url === "/internal/drill-visibility"
           ? await setDrillVisibility(request)
-          : await POST(request)
+          : incoming.url === "/internal/demo-control"
+            ? await demoControl(request)
+            : await POST(request)
         : await GET(request);
     outgoing.writeHead(response.status, Object.fromEntries(response.headers));
     outgoing.end(Buffer.from(await response.arrayBuffer()));
@@ -42,11 +46,13 @@ beforeAll(async () => {
   const address = httpServer.address();
   if (!address || typeof address === "string") throw new Error("No test port");
   baseUrl = `http://127.0.0.1:${address.port}`;
+  const mcpEnv = { ...process.env, SHOP_URL: baseUrl };
+  delete mcpEnv.SHOP_OPERATOR_TOKEN;
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: ["--import", "tsx", "mcp/server.ts"],
     cwd: shopDir,
-    env: { ...process.env, SHOP_URL: baseUrl },
+    env: mcpEnv,
   });
   client = new Client({ name: "shop-acceptance", version: "1.0.0" });
   await client.connect(transport);
@@ -58,6 +64,7 @@ afterAll(async () => {
     await new Promise<void>((done) => httpServer.close(() => done()));
   delete process.env.SHOP_DATA_DIR;
   delete process.env.SHOP_INTERNAL_TOKEN;
+  delete process.env.SHOP_OPERATOR_TOKEN;
   rmSync(dataDir, { recursive: true, force: true });
 });
 
@@ -68,19 +75,19 @@ async function tool(name: string, args: Record<string, unknown>) {
 }
 
 async function scenario(name: "attack" | "drill", enabled: boolean) {
-  const internal = name === "drill";
+  const drill = name === "drill";
   const response = await fetch(
-    `${baseUrl}${internal ? "/internal/drill-visibility" : "/api/shop"}`,
+    `${baseUrl}${drill ? "/internal/drill-visibility" : "/internal/demo-control"}`,
     {
       method: "POST",
       headers: {
         "content-type": "application/json",
-        ...(internal
-          ? { authorization: "Bearer isolated-test-shop-token" }
-          : {}),
+        authorization: drill
+          ? "Bearer isolated-test-shop-token"
+          : "Bearer isolated-test-operator-token",
       },
       body: JSON.stringify(
-        internal
+        drill
           ? { enabled }
           : {
               operation: "set_scenario",
@@ -91,6 +98,22 @@ async function scenario(name: "attack" | "drill", enabled: boolean) {
     },
   );
   expect(response.status).toBe(200);
+}
+
+async function operatorControl(
+  operation: string,
+  values: Record<string, unknown> = {},
+) {
+  const response = await fetch(`${baseUrl}/internal/demo-control`, {
+    method: "POST",
+    headers: {
+      authorization: "Bearer isolated-test-operator-token",
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ operation, ...values }),
+  });
+  expect(response.status).toBe(200);
+  return response.json();
 }
 
 it("shows ranked prices and gated attack listings through the shop MCP tools", async () => {
@@ -229,4 +252,62 @@ it("shows ranked prices and gated attack listings through the shop MCP tools", a
     currency: "CNY",
     display: "¥5.00",
   });
+});
+
+it("rechecks the operator-dropped coffee price and signs a ¥77 order", async () => {
+  const tools = await client.listTools();
+  expect(tools.tools.map((entry) => entry.name)).not.toContain("set_price");
+  expect(tools.tools.map((entry) => entry.name)).not.toContain("reset");
+  const before = (
+    await tool("search_products", { query: "coffee", max_price: 8000 })
+  ).products as Array<Record<string, unknown>>;
+  expect(before).toEqual([]);
+  expect(
+    (await tool("get_product", { sku: "FIELD-COFFEE-1KG" })).price,
+  ).toMatchObject({ amount: 8800 });
+
+  await operatorControl("set_price", { sku: "FIELD-COFFEE-1KG", amount: 7200 });
+  const after = (
+    await tool("search_products", { query: "coffee", max_price: 8000 })
+  ).products as Array<Record<string, unknown>>;
+  expect(after[0]).toMatchObject({
+    sku: "FIELD-COFFEE-1KG",
+    shop: "shopB",
+    price: { amount: 7200 },
+  });
+  await tool("add_to_cart", {
+    sku: "FIELD-COFFEE-1KG",
+    qty: 1,
+    options: { size: "1 kg" },
+  });
+  const order = await tool("checkout", {
+    shipping_address: {
+      name: "Lin Demo",
+      phone: "13800138000",
+      address_line: "88 Demo Road",
+      city: "Shenzhen",
+      postcode: "518000",
+    },
+  });
+  expect(order.total).toMatchObject({ amount: 7700 });
+  const signed = order.payment_request as string;
+  expect(verifyLocalPaymentUri(signed)).toBe(true);
+  expect(decodePaymentUri(signed)).toMatchObject({
+    merchant_id: "mch_shopB",
+    amount: { amount: 7700 },
+    line_items: [
+      { sku: "FIELD-COFFEE-1KG", unit_price: { amount: 7200 } },
+      { type: "shipping", unit_price: { amount: 500 } },
+    ],
+  });
+  expect(await operatorControl("reset")).toEqual({
+    ok: true,
+    reset: true,
+    attack: false,
+    coffee_price: 8800,
+  });
+  expect(
+    (await tool("get_product", { sku: "FIELD-COFFEE-1KG" })).price,
+  ).toMatchObject({ amount: 8800 });
+  expect(verifyLocalPaymentUri(signed)).toBe(true);
 });

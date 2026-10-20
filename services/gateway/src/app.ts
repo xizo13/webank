@@ -51,6 +51,8 @@ import {
 import Fastify, { type FastifyRequest } from "fastify";
 import { keccak256, stringToHex } from "viem";
 import { AgentAuth } from "./agent-auth.js";
+import { BankConsoleTape, isLoopbackConsoleRequest } from "./bank-console.js";
+import { bankConsoleHtml } from "./bank-console-page.js";
 import { canonicalJson, sha256, verifyMerchantSignature } from "./crypto.js";
 import {
   budgetOf,
@@ -230,8 +232,21 @@ type IdleRenewal = {
   expiresAt: number;
   consumed: boolean;
 };
+type WalletEnableChallenge = {
+  challengeId: string;
+  userId: string;
+  actionHash: string;
+  sessionBinding: string;
+  deployment: string;
+  expiresAt: number;
+  used: boolean;
+  idempotencyKey?: string;
+  bodyHash?: string;
+};
 type GatewayState = {
   context: string;
+  walletEnabled?: Array<[string, boolean]>;
+  walletEnableChallenges?: WalletEnableChallenge[];
   trustEvents?: TrustEvent[];
   trustPending?: TrustIntent[];
   activeDrill?: { drillId: string; startedAt: string } | null;
@@ -356,6 +371,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   );
   const agentAuth = new AgentAuth();
   const now = deps.now ?? (() => new Date());
+  const bankConsole =
+    deps.bankConsoleEnabled === true
+      ? new BankConsoleTape(deps.consoleSimulationPath)
+      : null;
   const demoProofAvailable =
     deps.demoApprovalsEnabled === true &&
     typeof deps.demoApprovalVerifier === "function" &&
@@ -417,6 +436,15 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   >();
   const idleChallenges = new Map<string, IdleChallenge>();
   const idleRenewals = new Map<string, IdleRenewal>();
+  const walletEnabled = new Map<string, boolean>(
+    [...policies.keys()].map((userId) => [
+      userId,
+      deps.initialWalletEnabled !== false,
+    ]),
+  );
+  const walletEnableChallenges = new Map<string, WalletEnableChallenge>();
+  const isWalletEnabled = (userId: string) =>
+    walletEnabled.get(userId) ?? deps.initialWalletEnabled !== false;
   const payments = new Map<string, StoredPayment>();
   async function spentInPolicyWindows(userId: string) {
     if (deps.policyCaps) {
@@ -511,6 +539,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           !Array.isArray(restored.idleChallenges)) ||
         (restored.idleRenewals !== undefined &&
           !Array.isArray(restored.idleRenewals)) ||
+        (restored.walletEnabled !== undefined &&
+          !Array.isArray(restored.walletEnabled)) ||
+        (restored.walletEnableChallenges !== undefined &&
+          !Array.isArray(restored.walletEnableChallenges)) ||
         !restored.auth ||
         !Array.isArray(restored.auth.access) ||
         !Array.isArray(restored.auth.refresh) ||
@@ -526,6 +558,42 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       for (const value of restored.policies) {
         const item = PolicySchema.parse(value);
         policies.set(item.user_id, item);
+      }
+      walletEnabled.clear();
+      for (const userId of policies.keys()) walletEnabled.set(userId, true);
+      const restoredWalletOwners = new Set<string>();
+      for (const item of restored.walletEnabled ?? []) {
+        if (!Array.isArray(item) || item.length !== 2)
+          throw new Error("Gateway wallet enabled state is incompatible");
+        const [userId, enabled] = item;
+        if (
+          typeof userId !== "string" ||
+          !policies.has(userId) ||
+          restoredWalletOwners.has(userId) ||
+          typeof enabled !== "boolean"
+        )
+          throw new Error("Gateway wallet enabled state is incompatible");
+        restoredWalletOwners.add(userId);
+        walletEnabled.set(userId, enabled);
+      }
+      if (
+        restored.walletEnabled !== undefined &&
+        restoredWalletOwners.size !== policies.size
+      )
+        throw new Error("Gateway wallet enabled state is incomplete");
+      for (const value of restored.walletEnableChallenges ?? []) {
+        if (
+          !value ||
+          typeof value.challengeId !== "string" ||
+          !policies.has(value.userId) ||
+          typeof value.actionHash !== "string" ||
+          typeof value.sessionBinding !== "string" ||
+          typeof value.deployment !== "string" ||
+          !Number.isSafeInteger(value.expiresAt) ||
+          typeof value.used !== "boolean"
+        )
+          throw new Error("Gateway wallet enable challenge is incompatible");
+        walletEnableChallenges.set(value.challengeId, value);
       }
       mandates.clear();
       for (const value of restored.mandates) {
@@ -686,6 +754,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   function snapshot(): GatewayState {
     return {
       context: deps.stateContext ?? "test",
+      walletEnabled: [...walletEnabled],
+      walletEnableChallenges: [...walletEnableChallenges.values()],
       trustEvents,
       trustPending: [...trustPending.values()],
       activeDrill,
@@ -741,7 +811,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       if (stateStore.isAmbiguous)
         return reply.code(503).send(error("service_unavailable", 503).body);
     });
-    app.addHook("onSend", async (_request, reply, payload) => {
+    app.addHook("onSend", async (request, reply, payload) => {
+      if (
+        request.url === "/demo/console" ||
+        request.url.startsWith("/v1/demo/console/events")
+      )
+        return payload;
       if (!stateStore.isAmbiguous) {
         try {
           persist();
@@ -752,6 +827,51 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       }
       reply.code(503).type("application/json; charset=utf-8");
       return JSON.stringify(error("service_unavailable", 503).body);
+    });
+  }
+  if (bankConsole) {
+    app.get("/demo/console", async (request, reply) => {
+      if (
+        !isLoopbackConsoleRequest(
+          request.ip,
+          request.headers.host,
+          request.headers.origin,
+        )
+      )
+        return reply.code(403).send({ error: "local_only" });
+      return reply
+        .header("Cache-Control", "no-store")
+        .header("Referrer-Policy", "no-referrer")
+        .header("X-Content-Type-Options", "nosniff")
+        .header(
+          "Content-Security-Policy",
+          "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+        )
+        .type("text/html; charset=utf-8")
+        .send(bankConsoleHtml);
+    });
+    app.get("/v1/demo/console/events", async (request, reply) => {
+      if (
+        !isLoopbackConsoleRequest(
+          request.ip,
+          request.headers.host,
+          request.headers.origin,
+        )
+      )
+        return reply.code(403).send({ error: "local_only" });
+      const raw = (request.query as { after?: unknown }).after;
+      if (
+        raw !== undefined &&
+        (typeof raw !== "string" || !/^(0|[1-9]\d{0,14})$/.test(raw))
+      )
+        return reply.code(400).send({ error: "invalid_cursor" });
+      const after = raw === undefined ? 0 : Number(raw);
+      if (!Number.isSafeInteger(after))
+        return reply.code(400).send({ error: "invalid_cursor" });
+      return reply
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .send(bankConsole.feed(after));
     });
   }
   const expiryTimers = new Set<ReturnType<typeof setTimeout>>();
@@ -2388,6 +2508,22 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       }
       payment.status = outcome === "APPROVED" ? "paid" : "denied";
       if (outcome === "APPROVED") payment.paidAt = now().toISOString();
+      let confirmedBlock: bigint | null = null;
+      if (outcome === "APPROVED" && paymentTx && deps.getPaymentBlock) {
+        try {
+          confirmedBlock = await deps.getPaymentBlock(paymentTx);
+        } catch {
+          // Console metadata cannot change a verified settlement result.
+        }
+      }
+      bankConsole?.recordSettlement({
+        paymentId: payment.paymentId,
+        status: outcome === "APPROVED" ? "paid" : "denied",
+        approvalSource: payment.approvalSource ?? null,
+        tx: paymentTx,
+        blockNumber: confirmedBlock,
+        at: now().toISOString(),
+      });
       emitEvent(
         payment.userId,
         outcome === "APPROVED" ? "payment.completed" : "payment.denied",
@@ -2518,6 +2654,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           payment.status = "denied";
           mandate.in_flight_payment_id = null;
           if (payment.review) mandate.status = "cancelled";
+          bankConsole?.recordSettlement({
+            paymentId: payment.paymentId,
+            status: "denied",
+            at: now().toISOString(),
+          });
           persist();
           return {
             statusCode: 403,
@@ -2534,6 +2675,11 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         }
       }
       payment.status = "reconciliation_required";
+      bankConsole?.recordSettlement({
+        paymentId: payment.paymentId,
+        status: "reconciliation_required",
+        at: now().toISOString(),
+      });
       emitEvent(payment.userId, "payment.reconciliation_required", {
         payment_id: payment.paymentId,
         ...(payment.settlementTx ? { payment_tx: payment.settlementTx } : {}),
@@ -2604,6 +2750,13 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       subjectId: decisionId,
       summary: `DENIED before a verified payment request: ${code}`,
       data,
+    });
+    bankConsole?.recordEarlyDenial({
+      decisionId,
+      code,
+      merchantId:
+        typeof data.merchant_id === "string" ? data.merchant_id : undefined,
+      at: now().toISOString(),
     });
     if (
       typeof data.merchant_id === "string" &&
@@ -2938,6 +3091,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       checks.push(riskCheck);
       let guardianCheck: Check = { name: "guardian", result: "skipped" };
       let guardianExplanation = "All verified checks passed.";
+      let guardianElapsedMs: number | null = null;
       if (!checks.some((check) => check.result === "deny")) {
         const shouldRun =
           composite ||
@@ -2946,30 +3100,32 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           riskCheck.result === "step_up" ||
           riskSignals.length > 0;
         if (shouldRun) {
-          const input = GuardianInputSchema.parse({
-            mandate: {
-              intent_level: mandate.intent_level,
-              description: mandate.description,
-              user_text: mandate.user_text,
-              user_text_source: mandate.user_text_source,
-              constraints: mandate.constraints,
-            },
-            merchant_verified: {
-              name: merchant.name,
-              category: merchant.category,
-              first_seen: merchant.first_seen,
-            },
-            signed_line_items: paymentRequest.line_items,
-            deterministic_results: checks,
-            untrusted: {
-              cart_claim: body.cart_claim ?? [],
-              rationale: body.rationale,
-              price_evidence: body.price_evidence,
-            },
-            risk_signals: riskSignals,
-          });
+          const guardianStartedAt = performance.now();
           let timer: ReturnType<typeof setTimeout> | undefined;
           try {
+            const input = GuardianInputSchema.parse({
+              mandate: {
+                intent_level: mandate.intent_level,
+                description: mandate.description,
+                user_text: mandate.user_text,
+                user_text_source: mandate.user_text_source,
+                constraints: mandate.constraints,
+              },
+              merchant_verified: {
+                merchant_id: merchant.merchant_id,
+                name: merchant.name,
+                category: merchant.category,
+                first_seen: merchant.first_seen,
+              },
+              signed_line_items: paymentRequest.line_items,
+              deterministic_results: checks,
+              untrusted: {
+                cart_claim: body.cart_claim ?? [],
+                rationale: body.rationale,
+                price_evidence: body.price_evidence,
+              },
+              risk_signals: riskSignals,
+            });
             const result = await Promise.race([
               deps.evaluateGuardian(input),
               new Promise<never>((_resolve, reject) => {
@@ -3017,6 +3173,10 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
               "We could not confirm the purchase intent. Please review it.";
           } finally {
             if (timer) clearTimeout(timer);
+            guardianElapsedMs = Math.max(
+              0,
+              Math.round(performance.now() - guardianStartedAt),
+            );
           }
         }
       }
@@ -3119,6 +3279,20 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         createdAt: now().toISOString(),
       };
       payments.set(paymentId, payment);
+      bankConsole?.recordPaymentDecision({
+        paymentId,
+        mandate,
+        merchantId: merchant.merchant_id,
+        amountFen: paymentRequest.amount.amount,
+        light: agent.licence.level,
+        decision,
+        guardianElapsedMs,
+        guardianSource:
+          guardianCheck.result === "skipped" ||
+          guardianCheck.detail?.reason === "guardian_unavailable"
+            ? null
+            : (deps.guardianSource ?? null),
+      });
       if (outcome === "DENIED") {
         const denied = await settle(payment, "DENIED", explanation);
         if (composite && denied.statusCode < 500) mandate.status = "cancelled";
@@ -3338,6 +3512,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     const mandate = mandateResult.data;
     if (approvalTiming === "payment") {
       mandates.set(mandateId, mandate);
+      bankConsole?.recordMandate(mandate);
       return {
         statusCode: 201,
         body: CreateMandateResponseSchema.parse({ mandate }),
@@ -3364,6 +3539,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         return error("policy_denied", 503);
       }
       mandates.set(mandateId, mandate);
+      bankConsole?.recordMandate(mandate);
       return {
         statusCode: 201,
         body: CreateMandateResponseSchema.parse({ mandate }),
@@ -3402,6 +3578,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       },
     );
     mandates.set(mandateId, mandate);
+    bankConsole?.recordMandate(mandate);
     storeApproval({
       card,
       userId: agent.user_id,
@@ -3793,6 +3970,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       }
       entry.card.status = "approved";
       payment.approvalSource = "owner";
+      bankConsole?.recordOwnerApproval({
+        paymentId: payment.paymentId,
+        requestNumberMatched: entry.card.level === "zero_trust",
+        simulated: verifiedBy === "demo_simulation",
+        at: now().toISOString(),
+      });
       const response = await settle(
         payment,
         "APPROVED",
@@ -3821,6 +4004,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
   }
 
   app.post("/v1/oauth/device_authorization", async (request, reply) => {
+    if ([...walletEnabled.values()].some((enabled) => !enabled))
+      return send(reply, error("wallet_disabled", 403));
     const parsed = DeviceAuthorizationRequestSchema.safeParse(request.body);
     if (!parsed.success)
       return reply.code(400).send({ error: "invalid_request" });
@@ -4236,6 +4421,8 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     async (request, reply) => {
       const userId = await appUser(request);
       if (!userId) return send(reply, error("bad_signature", 401));
+      if (!isWalletEnabled(userId))
+        return send(reply, error("wallet_disabled", 403));
       return send(
         reply,
         await idem(userId, request, async () => {
@@ -4399,6 +4586,12 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
           riskHistoryKnownAgents.add(record.agent_id);
           pairing.status = "approved";
           pairing.card.status = "approved";
+          bankConsole?.recordPairing({
+            agentId: record.agent_id,
+            clientAppName: pairing.clientAppName,
+            simulated: verified === "demo_simulation",
+            at: now().toISOString(),
+          });
           emitEvent(userId, "approval.resolved", {
             approval_id: pairing.card.approval_id,
             status: "approved",
@@ -4443,7 +4636,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       reply,
       await idem(auth.agent.agent_id, request, () =>
         serializePaymentSubmission(auth.agent.user_id, () =>
-          createMandate(auth.agent, request.body),
+          isWalletEnabled(auth.agent.user_id)
+            ? createMandate(auth.agent, request.body)
+            : Promise.resolve(error("wallet_disabled", 403)),
         ),
       ),
     );
@@ -4479,7 +4674,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       reply,
       await idem(auth.agent.agent_id, request, () =>
         serializePaymentSubmission(auth.agent.user_id, () =>
-          submitPayment(auth.agent, request.body, request),
+          isWalletEnabled(auth.agent.user_id)
+            ? submitPayment(auth.agent, request.body, request)
+            : Promise.resolve(error("wallet_disabled", 403)),
         ),
       ),
     );
@@ -5075,6 +5272,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         simulated: true,
         main_account: { balance: walletMoney(safeFen(snapshot.mainBalance)) },
         agent_wallet: {
+          enabled: isWalletEnabled(userId),
           balance: walletMoney(safeFen(snapshot.walletBalance)),
           reserved: walletMoney(reserved),
           available: walletMoney(
@@ -5090,6 +5288,149 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     } catch {
       return send(reply, error("chain_unavailable", 503));
     }
+  });
+
+  app.post("/v1/app/agent-wallet/enable/prepare", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        if (isWalletEnabled(userId)) return error("action_changed", 409);
+        if (
+          !deps.walletFunding ||
+          !walletDeployment ||
+          !deps.verifyWalletEnableProof
+        )
+          return error("chain_unavailable", 503);
+        const challengeId = id("wch");
+        const expiresAt = now().getTime() + 60_000;
+        const expiresAtIso = new Date(expiresAt).toISOString();
+        const actionHash = sha256({
+          schema: "wallet_enable.v1",
+          user_id: userId,
+          agent_wallet_address: deps.walletFunding.deployment.wallet,
+          expected_enabled: false,
+          session_binding: appSessionBinding(request),
+          challenge_id: challengeId,
+          expires_at: expiresAtIso,
+        });
+        walletEnableChallenges.set(challengeId, {
+          challengeId,
+          userId,
+          actionHash,
+          sessionBinding: appSessionBinding(request),
+          deployment: walletDeployment,
+          expiresAt,
+          used: false,
+        });
+        try {
+          persist();
+        } catch {
+          walletEnableChallenges.delete(challengeId);
+          return error("service_unavailable", 503);
+        }
+        return {
+          statusCode: 200,
+          body: {
+            challenge_id: challengeId,
+            action_hash: actionHash,
+            expires_at: expiresAtIso,
+            simulated: true,
+          },
+        };
+      }),
+    );
+  });
+
+  app.post("/v1/app/agent-wallet/enable", async (request, reply) => {
+    const userId = await appUser(request);
+    if (!userId) return send(reply, error("bad_signature", 401));
+    const key = request.headers["idempotency-key"];
+    if (typeof key !== "string" || key.length < 1 || key.length > 255)
+      return send(reply, error("idempotency_conflict", 409));
+    const body = request.body as {
+      challenge_id?: unknown;
+      verification?: { action_hash?: unknown; device_signature?: unknown };
+    } | null;
+    if (
+      typeof body?.challenge_id !== "string" ||
+      typeof body.verification?.action_hash !== "string" ||
+      typeof body.verification.device_signature !== "string"
+    )
+      return send(reply, error("invalid_request", 400));
+    const bodyHash = sha256(body);
+    return send(
+      reply,
+      await serializePaymentSubmission(userId, async () => {
+        const challenge = walletEnableChallenges.get(
+          body.challenge_id as string,
+        );
+        if (!challenge || challenge.userId !== userId)
+          return error("action_changed", 409);
+        if (challenge.used)
+          return challenge.idempotencyKey === key &&
+            challenge.bodyHash === bodyHash &&
+            isWalletEnabled(userId)
+            ? { statusCode: 200, body: { enabled: true, simulated: true } }
+            : error("action_changed", 409);
+        if (
+          isWalletEnabled(userId) ||
+          challenge.expiresAt <= now().getTime() ||
+          challenge.sessionBinding !== appSessionBinding(request) ||
+          challenge.deployment !== walletDeployment ||
+          body.verification?.action_hash !== challenge.actionHash ||
+          !deps.walletFunding ||
+          !deps.verifyWalletEnableProof
+        )
+          return error("action_changed", 409);
+        let proofValid = false;
+        try {
+          proofValid = await deps.verifyWalletEnableProof(
+            challenge.actionHash,
+            body.verification,
+            userId,
+          );
+        } catch {
+          return error("service_unavailable", 503);
+        }
+        if (!proofValid) return error("bad_signature", 401);
+        try {
+          await writeAudit({
+            kind: "policy_change",
+            actor: userId,
+            subjectId: challenge.challengeId,
+            summary: "Owner enabled Agent Wallet in the local simulation",
+            data: {
+              schema: "wallet_enable.v1",
+              user_id: userId,
+              agent_wallet_address: deps.walletFunding.deployment.wallet,
+              expected_enabled: false,
+              session_binding: challenge.sessionBinding,
+              challenge_id: challenge.challengeId,
+              expires_at: new Date(challenge.expiresAt).toISOString(),
+              action_hash: challenge.actionHash,
+              deployment: challenge.deployment,
+            },
+          });
+          walletEnabled.set(userId, true);
+          challenge.used = true;
+          challenge.idempotencyKey = key;
+          challenge.bodyHash = bodyHash;
+          persist();
+        } catch {
+          walletEnabled.set(userId, false);
+          challenge.used = false;
+          challenge.idempotencyKey = undefined;
+          challenge.bodyHash = undefined;
+          return error("service_unavailable", 503);
+        }
+        return {
+          statusCode: 200,
+          body: { enabled: true, simulated: true },
+        };
+      }),
+    );
   });
 
   async function reconcileHumanPayment(
@@ -5423,6 +5764,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return send(
       reply,
       await serializePaymentSubmission(userId, async () => {
+        if (!isWalletEnabled(userId)) return error("wallet_disabled", 403);
         if (balanceChangePending(userId))
           return error("reconciliation_required", 503);
         let snapshot: WalletSnapshot;
@@ -5516,6 +5858,7 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
     return send(
       reply,
       await serializePaymentSubmission(userId, async () => {
+        if (!isWalletEnabled(userId)) return error("wallet_disabled", 403);
         const existing = fundingKeys.get(keyId);
         if (existing) {
           if (existing.bodyHash !== bodyHash)
@@ -6670,7 +7013,9 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
         reply,
         await idem(userId, request, () =>
           serializePaymentSubmission(userId, () =>
-            decideApproval(userId, request.params.id, request.body),
+            isWalletEnabled(userId)
+              ? decideApproval(userId, request.params.id, request.body)
+              : Promise.resolve(error("wallet_disabled", 403)),
           ),
         ),
       );
