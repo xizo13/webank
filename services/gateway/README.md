@@ -139,7 +139,7 @@ The separate limited `demo` fixture keeps state in memory.
 No production biometric challenge verifier, persistent reservation hold, risk service, SSE delivery, or recovery worker is wired here yet.
 The local action verifier accepts only the explicit demo proof and is not Face ID or a bank-verifiable device signature.
 Merchant fulfillment confirmation is wired only in the opt-in loopback composition.
-The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable; a live isolated Hermes decision has not been accepted as release evidence yet.
+The Guardian module is integrated as an injectable dependency and fails closed to step-up when unavailable; three synthetic live Hermes cases have passed against the dedicated isolated profile, but the full signed shop-to-app Guardian run is not yet accepted as release evidence.
 Demo proof approval requires `demoApprovalsEnabled: true` plus either a test process or `WEBANK_DEMO_APPROVALS=1`, and the Gateway refuses demo proof mode in production.
 The app event endpoint uses JSON polling.
 The app freeze endpoint blocks future Gateway requests immediately, while on-chain freeze is a separate bank-controlled operation.

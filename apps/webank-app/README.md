@@ -4,7 +4,8 @@ Expo React Native source for the Agent Wallet demonstration.
 The verified interactive target is a browser web export.
 The iOS configuration is present, but an iOS development build and on-device behavior have not been verified for this release.
 It uses a local simulation by default.
-No real money moves and no chain transaction is created by the demo controls.
+No real money moves and the default in-memory simulation creates no chain transaction.
+In the opt-in loopback composition, the Gateway can submit test-token transactions to a local permissioned chain; those are still not real money.
 
 ## Run
 
@@ -27,11 +28,13 @@ Each approved pairing creates a new independent Amber agent identity for the MCP
 The consent card explains that the grant covers every chat in that app and shows the provider, scopes, pairing-code deadline, and shorter request-number deadline.
 The Agents screen shows Amber, Green, or Red trust with a reason, plus a separate owner freeze state.
 It offers Freeze, Unfreeze, Re-approve connection after seven days idle, Return to Amber after reviewing trust evidence, and Delete agent controls.
-The owner can use a clearly labelled local demo control to simulate Green without fabricating a clean purchase history.
-These owner actions use explicit local simulated verification; they are not bank-verifiable biometric actions.
+The owner can use a clearly labelled local demo control that fast-forwards an agent to Green.
+This is a simulated override, not an earned qualification, and it does not fabricate a clean purchase history.
+Owner actions in the loopback demo use explicit local simulated verification; they are not bank-verifiable biometric actions.
 Delete confirms the named agent and retains history.
 In Gateway mode, Home and Wallet read the simulated main-account and separate Agent Wallet balances from `GET /v1/app/home` with a chain block and observation time.
-Stale or unavailable readings disable funding and sweep actions; policy values remain unavailable in this view.
+Stale or unavailable readings disable funding and sweep actions.
+The Wallet screen includes the owner's spending-limit controls, which read and change policy through the Gateway.
 In explicit loopback demo mode, the owner can enter an exact CNY amount, review the fixed source and destination, and perform a visibly simulated biometric confirmation before submitting the action-bound funding challenge.
 Funding history displays only the Gateway's verified completed transaction hash and block; uncertain transfers remain pending for reconciliation and are not retried with a new funding ID.
 The owner can return only the Gateway-reported available wallet balance to the fixed main account.
@@ -48,7 +51,8 @@ Amber agents need owner approval for every purchase, with a request number on th
 Eligible Green purchases within the owner's threshold can proceed after all checks without a card; larger or uncertain purchases require the owner.
 Red agents cannot spend until the owner reviews their trust events and returns them to Amber.
 An upfront mandate for an unattended task can require its own approval when created.
-The local demo uses simulated approval proof for all owner actions.
+The local demo uses simulated approval proof for the owner approvals and trust actions it exposes, and none of it is a bank-verifiable biometric signature.
+The local composition can reveal a decoy listing and turn an agent Red, but it has no authenticated drill-pass service, so earned promotion from Amber to Green cannot be demonstrated end to end locally.
 
 ## Demo path
 
