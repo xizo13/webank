@@ -62,6 +62,7 @@ describe("WeBank MCP connector", () => {
     let publicKey = "";
     let replay: { url: URL; init: RequestInit } | undefined;
     let refreshed = 0;
+    let currentNumber = "123456";
 
     const gatewayFetch = async (
       input: URL | RequestInfo,
@@ -93,6 +94,18 @@ describe("WeBank MCP connector", () => {
           request_number: "123456",
           expires_in: 600,
           interval: 3,
+        });
+      }
+      if (
+        url.pathname === "/v1/oauth/device_authorization/secret-device-code"
+      ) {
+        return reply(200, {
+          status: "pending",
+          expires_at: new Date(Date.now() + 600_000).toISOString(),
+          request_number: currentNumber,
+          request_number_expires_at: new Date(
+            Date.now() + 180_000,
+          ).toISOString(),
         });
       }
       if (url.pathname === "/v1/oauth/token") {
@@ -319,6 +332,14 @@ describe("WeBank MCP connector", () => {
     expect(pairing.request_number).toBe("123456");
     expect(JSON.stringify(pairing)).not.toContain("secret-device-code");
     expect(notifications).toContain("Request number 123456");
+    currentNumber = "777777";
+    const rotated = await call("connect_webank", {});
+    expect(rotated.status).toBe("awaiting_user");
+    expect(rotated.user_code).toBe(pairing.user_code);
+    expect(rotated.request_number).toBe("777777");
+    expect(notifications).toContain("Request number 777777");
+    expect((await store.load())?.pending?.requestNumber).toBe("777777");
+    expect((await store.load())?.publicKey).toBe(publicKey);
     approved = true;
     const connected = await call("connect_webank", {});
     expect(connected).toEqual({ status: "connected", agent_id: "agt_test" });

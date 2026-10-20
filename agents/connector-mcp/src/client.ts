@@ -481,6 +481,21 @@ export class WeBankConnector {
       await this.store.save(current);
     }
     const pending = current.pending;
+    const refreshed = await this.pairingWait(current, 0);
+    if (refreshed.status === "expired" || refreshed.status === "rejected") {
+      await this.store.save({ ...current, pending: undefined });
+      return refreshed.status === "expired"
+        ? {
+            status: "pairing_expired",
+            message:
+              "The pairing code expired. Call connect_webank again for a fresh code.",
+          }
+        : {
+            status: "not_paired",
+            message:
+              "The user rejected this pairing. Start a new pairing only if requested.",
+          };
+    }
     let notificationDelivered = true;
     try {
       await this.notify(
@@ -530,6 +545,7 @@ export class WeBankConnector {
         setTimeout(resolve, pending.interval * 1000),
       );
     } while (this.now() < until);
+    await this.pairingWait(current, 0);
     return {
       status: "awaiting_user",
       user_code: pending.userCode,
