@@ -1823,23 +1823,34 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       audit_hash: pending.auditHash,
       ...(chainTx ? { chain_tx: chainTx } : {}),
     });
+    const priorLicence = { ...agent.licence };
     trustEvents.push(event);
-    agent.licence.level = nextLight;
-    agent.licence.reason = reason;
-    if (nextLight !== oldLight || pending.forceChain)
-      agent.licence.updated_at = confirmedAt;
-    agent.licence.flags_30d = flagsInWindow(agent.agent_id);
-    if (kind === "clean_purchase")
-      agent.licence.clean_purchases = Math.max(
-        agent.licence.clean_purchases,
-        trustEvents.filter(
-          (item) =>
-            item.agent_id === agent.agent_id && item.kind === "clean_purchase",
-        ).length,
-      );
-    if (kind === "drill_passed") agent.licence.drills_passed++;
-    if (kind === "drill_failed") agent.licence.drills_failed++;
-    trustPending.delete(agent.agent_id);
+    try {
+      agent.licence.level = nextLight;
+      agent.licence.reason = reason;
+      if (nextLight !== oldLight || pending.forceChain)
+        agent.licence.updated_at = confirmedAt;
+      agent.licence.flags_30d = flagsInWindow(agent.agent_id);
+      if (kind === "clean_purchase")
+        agent.licence.clean_purchases = Math.max(
+          agent.licence.clean_purchases,
+          trustEvents.filter(
+            (item) =>
+              item.agent_id === agent.agent_id &&
+              item.kind === "clean_purchase",
+          ).length,
+        );
+      if (kind === "drill_passed") agent.licence.drills_passed++;
+      if (kind === "drill_failed") agent.licence.drills_failed++;
+      trustPending.delete(agent.agent_id);
+      persist();
+    } catch (failure) {
+      const at = trustEvents.lastIndexOf(event);
+      if (at >= 0) trustEvents.splice(at, 1);
+      Object.assign(agent.licence, priorLicence);
+      trustPending.set(agent.agent_id, pending);
+      throw failure;
+    }
     emitEvent(agent.user_id, "agent.licence_changed", {
       agent_id: agent.agent_id,
       from: oldLight,
@@ -1847,7 +1858,6 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
       reason,
       trust_event_id: event.event_id,
     });
-    persist();
     return event;
   }
 
@@ -5009,8 +5019,14 @@ export function createGateway(deps: GatewayDependencies, seed: GatewaySeed) {
                 summary: `Owner ${action === "start" ? "started" : "stopped"} local demo fire drill`,
                 data: { action, prior: activeDrill, next },
               });
+              const prior = activeDrill;
               activeDrill = next;
-              persist();
+              try {
+                persist();
+              } catch (failure) {
+                activeDrill = prior;
+                throw failure;
+              }
             } catch {
               try {
                 await synchronizeVisibility(activeDrill !== null);

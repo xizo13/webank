@@ -1858,6 +1858,90 @@ describe("Gateway HTTP decision slice", () => {
     );
   });
 
+  it("restores drill state and bank visibility when the owner drill start cannot be saved", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-drill-save-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    const visibility: boolean[] = [];
+    const { app } = fixture({
+      statePath,
+      demoTrustControlsEnabled: true,
+      setDrillVisibility: async (enabled) => {
+        visibility.push(enabled);
+        if (enabled)
+          writeFileSync(
+            join(directory, `.gateway.json.${process.pid}.tmp`),
+            "",
+          );
+        else
+          rmSync(join(directory, `.gateway.json.${process.pid}.tmp`), {
+            force: true,
+          });
+      },
+    });
+    openApps.push(app);
+    const started = await app.inject({
+      method: "POST",
+      url: "/v1/app/demo/drills/start",
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "start-unsaved-drill",
+      },
+      payload: {},
+    });
+    expect(started.statusCode).toBeGreaterThanOrEqual(500);
+    expect(visibility).toEqual([true, false]);
+    const status = await app.inject({
+      method: "GET",
+      url: "/v1/app/demo/drills",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(status.json()).toEqual({ active: false, drill_id: null });
+  });
+
+  it("keeps the prior licence and no trust event when the final trust save fails", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "webank-trust-save-"));
+    temporaryDirs.push(directory);
+    const statePath = join(directory, "gateway.json");
+    const fence = join(directory, `.gateway.json.${process.pid}.tmp`);
+    const decoy = { ...merchant, honeypot: true };
+    const { app } = fixture({
+      statePath,
+      seedMandate: activeMandate(),
+      merchant: decoy,
+      demoTrustControlsEnabled: true,
+      setDrillVisibility: async () => {},
+      setTrustLight: async () => {
+        writeFileSync(fence, "");
+        return `0x${"b".repeat(64)}`;
+      },
+    });
+    openApps.push(app);
+    await app.inject({
+      method: "POST",
+      url: "/v1/app/demo/drills/start",
+      headers: {
+        authorization: "Bearer test-app",
+        "idempotency-key": "start-trust-drill",
+      },
+      payload: {},
+    });
+    await payment(app, "mdt_seed", signedPayreq(), "unsaved-trust");
+    rmSync(fence, { force: true });
+    const agents = await app.inject({
+      method: "GET",
+      url: "/v1/app/agents",
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(agents.json().items[0].licence.level).toBe("AMBER");
+    const history = await app.inject({
+      method: "GET",
+      url: `/v1/app/agents/${agent.agent_id}/trust-events`,
+      headers: { authorization: "Bearer test-app" },
+    });
+    expect(history.json().items).toEqual([]);
+  });
+
   it("requires an owner-active drill before a verified decoy attempt turns Red, then returns only to Amber", async () => {
     const decoy = { ...merchant, honeypot: true };
     const inactive = fixture({
