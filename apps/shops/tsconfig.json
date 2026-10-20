@@ -7,6 +7,7 @@
     "moduleResolution": "Bundler",
     "jsx": "preserve",
     "noEmit": true,
+    "declaration": false,
     "isolatedModules": true,
     "incremental": true,
     "plugins": [{ "name": "next" }]

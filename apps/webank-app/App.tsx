@@ -3637,84 +3637,6 @@ export default function App() {
                       Enable the Agent Wallet on Home before pairing.
                     </Text>
                   ) : null}
-                  {isLive ? (
-                    <Button tone="light" onPress={() => void refreshGateway()}>
-                      Refresh connected agents
-                    </Button>
-                  ) : null}
-                  <View style={styles.notice}>
-                    <Text style={styles.noticeTitle}>KNOW YOUR AGENT</Text>
-                    <Text style={styles.noticeText}>
-                      Each connected assistant gets its own identity and can
-                      only request actions within your wallet policy.
-                    </Text>
-                  </View>
-                  {isLocalDemo ? (
-                    <View style={styles.card} testID="local-demo-drill-control">
-                      <Text style={styles.cardTitle}>
-                        Local demo fire drill
-                      </Text>
-                      <Text style={styles.bodyText}>
-                        Simulated bank-owned drill. Starting it reveals the mock
-                        shop decoy; a request to that decoy is denied and moves
-                        the agent to Red.
-                      </Text>
-                      <Text
-                        style={styles.bodyText}
-                        testID="local-demo-drill-status"
-                      >
-                        {demoDrill
-                          ? demoDrill.active
-                            ? `Active drill ${demoDrill.drill_id}`
-                            : "No active drill"
-                          : "Checking drill status..."}
-                      </Text>
-                      {demoDrillError ? (
-                        <Text style={styles.feedback}>{demoDrillError}</Text>
-                      ) : null}
-                      {demoDrill ? (
-                        <Button
-                          testID={
-                            demoDrill.active
-                              ? "stop-demo-drill"
-                              : "start-demo-drill"
-                          }
-                          tone="light"
-                          disabled={demoDrillBusy}
-                          onPress={() =>
-                            handleDemoDrill(demoDrill.active ? "stop" : "start")
-                          }
-                        >
-                          {demoDrillBusy
-                            ? "Updating drill..."
-                            : demoDrill.active
-                              ? "Stop simulated drill"
-                              : "Start simulated drill"}
-                        </Button>
-                      ) : (
-                        <Button
-                          tone="light"
-                          testID="refresh-demo-drill"
-                          onPress={() => {
-                            void loadGatewayDemoDrillStatus()
-                              .then((status) => {
-                                setDemoDrill(status);
-                                setDemoDrillError("");
-                              })
-                              .catch((error) =>
-                                setDemoDrillError(
-                                  error instanceof Error
-                                    ? error.message
-                                    : "Drill status unavailable.",
-                                ),
-                              );
-                          }}
-                        >
-                          Retry drill status
-                        </Button>
-                      )}
-                    </View>
-                  ) : null}
                   {isLive && livePairings.length ? (
                     <View style={styles.card}>
                       <Text style={styles.cardTitle}>Pairing requests</Text>
@@ -3920,6 +3842,72 @@ export default function App() {
                       </Text>
                     </View>
                   )}
+                  {isLocalDemo ? (
+                    <View style={styles.card} testID="local-demo-drill-control">
+                      <Text style={styles.cardTitle}>
+                        Local demo fire drill
+                      </Text>
+                      <Text style={styles.bodyText}>
+                        Simulated bank-owned drill. Starting it reveals the mock
+                        shop decoy; a request to that decoy is denied and moves
+                        the agent to Red.
+                      </Text>
+                      <Text
+                        style={styles.bodyText}
+                        testID="local-demo-drill-status"
+                      >
+                        {demoDrill
+                          ? demoDrill.active
+                            ? `Active drill ${demoDrill.drill_id}`
+                            : "No active drill"
+                          : "Checking drill status..."}
+                      </Text>
+                      {demoDrillError ? (
+                        <Text style={styles.feedback}>{demoDrillError}</Text>
+                      ) : null}
+                      {demoDrill ? (
+                        <Button
+                          testID={
+                            demoDrill.active
+                              ? "stop-demo-drill"
+                              : "start-demo-drill"
+                          }
+                          tone="light"
+                          disabled={demoDrillBusy}
+                          onPress={() =>
+                            handleDemoDrill(demoDrill.active ? "stop" : "start")
+                          }
+                        >
+                          {demoDrillBusy
+                            ? "Updating drill..."
+                            : demoDrill.active
+                              ? "Stop simulated drill"
+                              : "Start simulated drill"}
+                        </Button>
+                      ) : (
+                        <Button
+                          tone="light"
+                          testID="refresh-demo-drill"
+                          onPress={() => {
+                            void loadGatewayDemoDrillStatus()
+                              .then((status) => {
+                                setDemoDrill(status);
+                                setDemoDrillError("");
+                              })
+                              .catch((error) =>
+                                setDemoDrillError(
+                                  error instanceof Error
+                                    ? error.message
+                                    : "Drill status unavailable.",
+                                ),
+                              );
+                          }}
+                        >
+                          Retry drill status
+                        </Button>
+                      )}
+                    </View>
+                  ) : null}
                 </>
               ) : null}
 
