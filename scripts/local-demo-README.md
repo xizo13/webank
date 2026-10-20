@@ -6,6 +6,22 @@ Run from the repository root after the pinned workspace dependencies and FISCO r
 ./scripts/local-demo-up.sh
 ```
 
+On Windows, use Ubuntu x86_64 under WSL2 from a checkout in the Linux filesystem, such as `~/webank`.
+Native Windows is not supported.
+The Linux chain artifacts are pinned and selected automatically, but the complete WSL2 recording flow still needs teammate end-to-end verification.
+For a first local setup in WSL2, install Node 22, Corepack, Python 3, `curl`, and `lsof`, then prepare the pinned workspace and chain before the launcher:
+
+```sh
+corepack pnpm install --frozen-lockfile
+./scripts/chain-up.sh
+./scripts/chain-down.sh
+./scripts/local-demo-up.sh
+```
+
+Run these commands in Ubuntu, not PowerShell.
+The first chain run creates local signer files and node state; the final launcher starts the shop, seeds merchants, and starts the same chain again.
+Do not copy the owner's runtime directory, tokens, signer files, or Hermes credentials to another machine.
+
 The app is served at `http://127.0.0.1:8081` from a static Expo web export.
 The simulated shop uses `127.0.0.1:3001`, the strict local-demo Gateway uses `127.0.0.1:3002`, and the four-node non-SM FISCO BCOS chain exposes Web3 RPC at `127.0.0.1:8545`.
 The read-only Bank Console is at `http://127.0.0.1:3002/demo/console` and accepts only local loopback requests.

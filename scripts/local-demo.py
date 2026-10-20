@@ -7,6 +7,7 @@ import fcntl
 import hashlib
 import json
 import os
+import platform
 import re
 import secrets
 import shutil
@@ -41,6 +42,24 @@ NATIVE_FUNDED_TXS = {"deployECnySim", "deployMerchantRegistry", "deployLicenceRe
 SHOP_KEYS = SHOP / ".shop-local/merchant-keys.json"
 SHOP_STATE = SHOP / ".shop-local/state.json"
 FRESH_RESET = RUNTIME / "fresh-reset.json"
+
+
+def chain_artifact_paths() -> dict[str, Path]:
+    host = (platform.system(), platform.machine())
+    if host == ("Darwin", "arm64"):
+        archive = "fisco-bcos-v3.17.1-macOS-arm.tar.gz"
+    elif host == ("Linux", "x86_64"):
+        archive = "fisco-bcos-linux-x86_64.tar.gz"
+    else:
+        fail(f"Unsupported local FISCO host {host[0]} {host[1]}; use macOS arm64 or Linux x86_64")
+    return {
+        "FISCO_ARCHIVE_FILE": CHAIN / archive,
+        "FISCO_BUILDER_FILE": CHAIN / "build_chain.sh",
+        "FISCO_TASSL_BINARY": CHAIN / "home/.fisco/tassl-1.1.1b",
+        "FISCO_ACCOUNT_HELPER_FILE": CHAIN / "home/.fisco/get_account.sh",
+    }
+
+
 def project_node() -> str | None:
     explicit = os.environ.get("WEBANK_NODE_BINARY")
     directories = os.environ.get("PATH", "").split(os.pathsep)
@@ -893,12 +912,7 @@ def up(fresh: bool) -> None:
         fail("Node 22 and Corepack are required; no dependency install will be attempted")
     if not (ROOT / "onchain/node_modules/solc").exists():
         fail("Pinned onchain dependencies are missing; refusing automatic install")
-    local_chain_artifacts = {
-        "FISCO_ARCHIVE_FILE": CHAIN / "fisco-bcos-v3.17.1-macOS-arm.tar.gz",
-        "FISCO_BUILDER_FILE": CHAIN / "build_chain.sh",
-        "FISCO_TASSL_BINARY": CHAIN / "home/.fisco/tassl-1.1.1b",
-        "FISCO_ACCOUNT_HELPER_FILE": CHAIN / "home/.fisco/get_account.sh",
-    }
+    local_chain_artifacts = chain_artifact_paths()
     if any(not path.is_file() for path in local_chain_artifacts.values()) or not (CHAIN / "nodes").is_dir():
         fail("Pinned FISCO runtime is incomplete; refusing a download")
     if not (SHOP / "node_modules/next/dist/bin/next").is_file() or not (APP / "node_modules/expo/bin/cli").is_file():

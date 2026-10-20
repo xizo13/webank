@@ -43,7 +43,40 @@ ARCHIVE_URL = "https://github.com/FISCO-BCOS/FISCO-BCOS/releases/download/v3.17.
 BUILDER_URL = "https://raw.githubusercontent.com/FISCO-BCOS/FISCO-BCOS/v3.17.1/tools/BcosAirBuilder/build_chain.sh"
 TASSL_URL = "https://github.com/FISCO-BCOS/TASSL/releases/download/V_1.4/tassl-1.1.1b-macOS-aarch64.tar.gz"
 ACCOUNT_HELPER_URL = "https://raw.githubusercontent.com/FISCO-BCOS/console/master/tools/get_account.sh"
+LINUX_ARCHIVE_SHA256 = "28eb054bb222b805e116bf7d2462709f99d1f460a732e978555abe61973b3cbb"
+LINUX_BINARY_SHA256 = "e67cd8f869264cbf78e7b2155a420dd7b71ec747bdb9b1fbf7d464484a070541"
+LINUX_TASSL_ARCHIVE_SHA256 = "97700126df491b4ae15afae1bad99979390ded5d7d1655632e00b40003a9a9e8"
+LINUX_TASSL_SHA256 = "1e10d865dc741489d5c6a9bf440eb4f7592d10d4722db6b450a895f44c0ed0dc"
 PORTS = (30300, 30301, 30302, 30303, 20200, 20201, 20202, 20203, 8545)
+
+
+def platform_release() -> dict[str, str]:
+    host = (platform.system(), platform.machine())
+    if host == ("Darwin", "arm64"):
+        return {
+            "archive_name": "fisco-bcos-v3.17.1-macOS-arm.tar.gz",
+            "archive_sha256": ARCHIVE_SHA256,
+            "archive_url": ARCHIVE_URL,
+            "binary_sha256": BINARY_SHA256,
+            "tassl_archive_name": "tassl-1.1.1b-macOS-aarch64.tar.gz",
+            "tassl_archive_sha256": "",
+            "tassl_member": "tassl-1.1.1b-macOS-aarch64",
+            "tassl_sha256": TASSL_SHA256,
+            "tassl_url": TASSL_URL,
+        }
+    if host == ("Linux", "x86_64"):
+        return {
+            "archive_name": "fisco-bcos-linux-x86_64.tar.gz",
+            "archive_sha256": LINUX_ARCHIVE_SHA256,
+            "archive_url": "https://github.com/FISCO-BCOS/FISCO-BCOS/releases/download/v3.17.1/fisco-bcos-linux-x86_64.tar.gz",
+            "binary_sha256": LINUX_BINARY_SHA256,
+            "tassl_archive_name": "tassl-1.1.1b-linux-x86_64.tar.gz",
+            "tassl_archive_sha256": LINUX_TASSL_ARCHIVE_SHA256,
+            "tassl_member": "tassl-1.1.1b-linux-x86_64",
+            "tassl_sha256": LINUX_TASSL_SHA256,
+            "tassl_url": "https://github.com/FISCO-BCOS/TASSL/releases/download/V_1.4/tassl-1.1.1b-linux-x86_64.tar.gz",
+        }
+    fail(f"Unsupported local FISCO host {host[0]} {host[1]}; use macOS arm64 or Linux x86_64")
 
 
 def say(message: str) -> None:
@@ -103,28 +136,27 @@ def extract_verified_member(archive: Path, member_name: str, destination: Path, 
 
 
 def prepare_builder() -> tuple[Path, Path]:
-    if platform.system() != "Darwin" or platform.machine() != "arm64":
-        fail("This pinned FISCO v3.17.1 runner supports macOS arm64 only")
+    release = platform_release()
     RUNTIME.mkdir(mode=0o700, parents=True, exist_ok=True)
     RUNTIME.chmod(0o700)
     helper_home = RUNTIME / "home" / ".fisco"
     helper_home.mkdir(mode=0o700, parents=True, exist_ok=True)
     helper_home.chmod(0o700)
-    archive = RUNTIME / "fisco-bcos-v3.17.1-macOS-arm.tar.gz"
+    archive = RUNTIME / release["archive_name"]
     binary = RUNTIME / "fisco-bcos"
     builder = RUNTIME / "build_chain.sh"
     tassl = RUNTIME / "home" / ".fisco" / "tassl-1.1.1b"
     account_helper = RUNTIME / "home" / ".fisco" / "get_account.sh"
-    verified_copy_or_download(archive, ARCHIVE_SHA256, ARCHIVE_URL, "FISCO_ARCHIVE_FILE")
-    if not binary.is_file() or sha256(binary) != BINARY_SHA256:
-        extract_verified_member(archive, "fisco-bcos", binary, BINARY_SHA256)
+    verified_copy_or_download(archive, release["archive_sha256"], release["archive_url"], "FISCO_ARCHIVE_FILE")
+    if not binary.is_file() or sha256(binary) != release["binary_sha256"]:
+        extract_verified_member(archive, "fisco-bcos", binary, release["binary_sha256"])
     verified_copy_or_download(builder, BUILDER_SHA256, BUILDER_URL, "FISCO_BUILDER_FILE")
-    if not tassl.is_file() or sha256(tassl) != TASSL_SHA256:
-        tassl_archive = RUNTIME / "tassl-1.1.1b-macOS-aarch64.tar.gz"
+    if not tassl.is_file() or sha256(tassl) != release["tassl_sha256"]:
+        tassl_archive = RUNTIME / release["tassl_archive_name"]
         supplied = os.environ.get("FISCO_TASSL_BINARY")
         if supplied:
             candidate = Path(supplied).expanduser().resolve()
-            if not candidate.is_file() or sha256(candidate) != TASSL_SHA256:
+            if not candidate.is_file() or sha256(candidate) != release["tassl_sha256"]:
                 fail("FISCO_TASSL_BINARY is missing or failed SHA-256 verification")
             shutil.copyfile(candidate, tassl)
             tassl.chmod(0o700)
@@ -132,10 +164,13 @@ def prepare_builder() -> tuple[Path, Path]:
             # The tagged Air builder otherwise downloads this helper itself.
             say("Downloading the pinned TASSL helper")
             subprocess.run(
-                ["curl", "-fL", "--retry", "3", "--connect-timeout", "20", "--max-time", "180", "-o", str(tassl_archive), TASSL_URL],
+                ["curl", "-fL", "--retry", "3", "--connect-timeout", "20", "--max-time", "180", "-o", str(tassl_archive), release["tassl_url"]],
                 check=True,
             )
-            extract_verified_member(tassl_archive, "tassl-1.1.1b-macOS-aarch64", tassl, TASSL_SHA256)
+            if release["tassl_archive_sha256"] and sha256(tassl_archive) != release["tassl_archive_sha256"]:
+                tassl_archive.unlink(missing_ok=True)
+                fail("SHA-256 mismatch for pinned TASSL archive")
+            extract_verified_member(tassl_archive, release["tassl_member"], tassl, release["tassl_sha256"])
     verified_copy_or_download(
         account_helper,
         ACCOUNT_HELPER_SHA256,
@@ -201,7 +236,7 @@ def build_nodes(binary: Path, builder: Path) -> None:
             fail(f"node{number} has unexpected Web3 chain ID")
         rewrite_ini(node / "config.ini", number)
     copied_binary = built / "fisco-bcos"
-    if sha256(copied_binary) != BINARY_SHA256:
+    if sha256(copied_binary) != platform_release()["binary_sha256"]:
         fail("Node binary differs from pinned FISCO release")
     output.rename(RUNTIME / "nodes")
 
@@ -314,7 +349,7 @@ def start_nodes() -> dict[str, int]:
     if busy:
         fail(f"FISCO ports are already in use: {busy}")
     binary = NODES / "fisco-bcos"
-    if sha256(binary) != BINARY_SHA256:
+    if sha256(binary) != platform_release()["binary_sha256"]:
         fail("Node binary differs from pinned FISCO release")
     pids: dict[str, int] = {}
     try:

@@ -6,6 +6,7 @@ import importlib.util
 import io
 import json
 import os
+import platform
 import tempfile
 import types
 import unittest
@@ -47,6 +48,33 @@ def receipt(hash_value: str, *, to=None, deployed=None, logs=None) -> dict:
 
 
 class LauncherProcessIdentityTests(unittest.TestCase):
+    def test_local_chain_artifacts_select_linux_x86_64_without_mac_archive(self):
+        with mock.patch.object(platform, "system", return_value="Linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"):
+            artifacts = local_demo.chain_artifact_paths()
+        self.assertEqual(artifacts["FISCO_ARCHIVE_FILE"].name, "fisco-bcos-linux-x86_64.tar.gz")
+        self.assertEqual(artifacts["FISCO_TASSL_BINARY"].name, "tassl-1.1.1b")
+
+    def test_pinned_linux_release_is_distinct_from_mac_release(self):
+        with mock.patch.object(platform, "system", return_value="Linux"), \
+             mock.patch.object(platform, "machine", return_value="x86_64"):
+            linux = chain_manage.platform_release()
+        with mock.patch.object(platform, "system", return_value="Darwin"), \
+             mock.patch.object(platform, "machine", return_value="arm64"):
+            mac = chain_manage.platform_release()
+        self.assertEqual(linux["archive_name"], "fisco-bcos-linux-x86_64.tar.gz")
+        self.assertEqual(linux["tassl_member"], "tassl-1.1.1b-linux-x86_64")
+        self.assertNotEqual(linux["binary_sha256"], mac["binary_sha256"])
+        self.assertEqual(mac["archive_name"], "fisco-bcos-v3.17.1-macOS-arm.tar.gz")
+
+    def test_unsupported_native_windows_host_fails_before_artifact_selection(self):
+        with mock.patch.object(platform, "system", return_value="Windows"), \
+             mock.patch.object(platform, "machine", return_value="AMD64"):
+            with self.assertRaisesRegex(RuntimeError, "Unsupported local FISCO host"):
+                chain_manage.platform_release()
+            with self.assertRaisesRegex(RuntimeError, "Unsupported local FISCO host"):
+                local_demo.chain_artifact_paths()
+
     def test_launcher_selects_node_22_and_places_it_before_other_nodes(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

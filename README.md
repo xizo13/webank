@@ -55,7 +55,9 @@ See [verification and known limits](docs/verification.md) for the latest recorde
 
 ## Local demonstrations
 
-For the integrated loopback demonstration on macOS arm64, use the [local demo operator guide](scripts/local-demo-README.md).
+For the integrated loopback demonstration on macOS arm64 or Linux x86_64, use the [local demo operator guide](scripts/local-demo-README.md).
+The Linux path is unit verified and still needs a teammate's full WSL2 rehearsal before we call it end-to-end verified.
+Native Windows is not a supported local-chain host.
 With the pinned dependencies and local FISCO runtime already present, `./scripts/local-demo-up.sh` starts the static Expo web export, mock shop, strict local Gateway, and four-node chain on loopback.
 `./scripts/local-demo-down.sh` stops only the processes recorded by the operator.
 The launcher does not install dependencies or open a browser.
@@ -83,7 +85,7 @@ The `/demo` price and scenario actions require the separate local operator token
 The app's default simulation does not call this storefront or the chain.
 See the [app](apps/webank-app/README.md), [shop](apps/shops/README.md), [Gateway](services/gateway/README.md), and [connector](agents/connector-mcp/README.md) READMEs for each separate mode.
 
-On macOS arm64, `./scripts/chain-up.sh` starts a local four-node non-SM FISCO chain, downloads pinned official tooling on first use, and deploys the demo contracts.
+On macOS arm64 or Linux x86_64, `./scripts/chain-up.sh` starts a local four-node non-SM FISCO chain, downloads pinned official tooling for that host on first use, and deploys the demo contracts.
 `./scripts/chain-down.sh` stops the chain processes started by that operator.
 The chain is optional for the default app and shop demonstrations; see the [chain operator guide](scripts/chain/README.md) before running it.
 
